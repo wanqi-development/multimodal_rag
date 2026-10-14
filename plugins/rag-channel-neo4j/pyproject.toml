@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-channel-neo4j"
+version = "0.1.0"
+description = "multimodal_rag 的 Neo4j 通道插件：给检索装配提供 `type: neo4j`"
+requires-python = ">=3.11"
+# **故意不写 `dependencies = ["rag"]`**：核心包没发布到 PyPI，写了它会去网上找、白白失败。
+# 前提是同一个环境里已经装了 multimodal_rag（本地 `pip install -e .`）。
+
+# 这一行就是"服务发现"：装了这个包，核心按 type 名就能找到我们的工厂。
+# 等价于 Java 驱动包里的 `META-INF/services/java.sql.Driver`。
+[project.entry-points."rag.channels"]
+neo4j = "rag_channel_neo4j:build"
+
+# 命令也是插件：核心按这个名字把 `rag graph …` 挂上去（见核心 `cli/main.py` 的
+# `_mount_plugin_commands`）。**核心不认识 Neo4j**，`rag graph` 完全来自这个包。
+[project.entry-points."rag.cli"]
+graph = "rag_channel_neo4j.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

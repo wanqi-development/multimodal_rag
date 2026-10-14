@@ -1,0 +1,81 @@
+"""纯协议层：跨层数据模型 + 组件协议 + 插件注册表。
+
+这一层不 import langchain / langgraph / milvus，只依赖 pydantic。
+"""
+
+from rag.contracts.document import (
+    DOC_STAGES,
+    AssembledContext,
+    ChannelStats,
+    Chunk,
+    Citation,
+    DocRecord,
+    Document,
+    Embeddings,
+    ImageAsset,
+    Position,
+    RetrievalResult,
+    ScoredChunk,
+    format_sources,
+    reached,
+    stage_rank,
+)
+from rag.contracts.protocols import (
+    Chunker,
+    Embedder,
+    Generator,
+    Index,
+    Parser,
+    Reranker,
+    Retriever,
+)
+from rag.contracts.registry import (
+    CHANNEL_TYPES,
+    CHUNKERS,
+    EMBEDDERS,
+    PARSERS,
+    RERANKERS,
+    Registry,
+    register_channel_type,
+    register_chunker,
+    register_embedder,
+    register_parser,
+    register_reranker,
+)
+
+__all__ = [
+    "CHANNEL_TYPES",
+    "CHUNKERS",
+    "DOC_STAGES",
+    "EMBEDDERS",
+    "PARSERS",
+    "RERANKERS",
+    "AssembledContext",
+    "ChannelStats",
+    "Chunk",
+    "Chunker",
+    "Citation",
+    "DocRecord",
+    "Document",
+    "Embedder",
+    "Embeddings",
+    "Generator",
+    "ImageAsset",
+    "Index",
+    "Position",
+    "Parser",
+    "Registry",
+    "Reranker",
+    "RetrievalResult",
+    "Retriever",
+    "ScoredChunk",
+    # 答案末尾那段来源清单：CLI 与界面必须给同一份，所以放在协议层共用
+    "format_sources",
+    "reached",
+    "register_chunker",
+    "register_embedder",
+    "register_parser",
+    "register_reranker",
+    "register_channel_type",
+    "stage_rank",
+]

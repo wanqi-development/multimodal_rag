@@ -1,0 +1,49 @@
+/* 设计 token：一处定义，所有页面共用（"共用一套" 的落点就在这个文件）。
+   颜色用 light-dark() —— 跟随系统/浏览器的 color-scheme，浅色深色都不用再写一遍。
+   改风格只需要动这里：换主色、圆角、行高、间距，全站跟着变。 */
+:root {
+  color-scheme: light dark;
+
+  --bg: light-dark(#f6f7f9, #0d1117);
+  --surface: light-dark(#ffffff, #161b22);
+  --surface-2: light-dark(#f9fafb, #1b2230);
+  --surface-3: light-dark(#eef1f5, #202836);
+  --text: light-dark(#101828, #e6edf3);
+  --muted: light-dark(#667085, #8b949e);
+  --border: light-dark(#e4e7ec, #262d38);
+  --border-strong: light-dark(#c9ced9, #38414f);
+
+  --accent: #2f6feb;
+  --accent-weak: light-dark(#eaf1ff, #16273f);
+  --ok: light-dark(#067647, #3fb950);
+  --ok-weak: light-dark(#e7f6ec, #10251a);
+  --warn: light-dark(#b54708, #d29922);
+  --warn-weak: light-dark(#fffaf0, #2a1f0a);
+  --warn-border: light-dark(#f3d08a, #664d03);
+  --danger: light-dark(#b42318, #f85149);
+  --danger-weak: light-dark(#fef3f2, #2d1414);
+
+  --r: 10px;
+  --r-sm: 6px;
+  --row: 1.55;
+  --pad: 12px;
+  --gap: 8px;
+  --rail: 176px;
+  --detail: 380px;
+  --shadow: 0 1px 2px light-dark(rgba(16, 24, 40, .06), rgba(0, 0, 0, .4));
+  --font: 13px/var(--row) -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: 12px/1.6 ui-monospace, "Cascadia Mono", "JetBrains Mono", monospace;
+}
+
+/* 手动覆盖（rail 底部的 自动/浅/深）：设置 <html data-theme>，color-scheme 一变，
+   上面所有 light-dark() 自动跟着切。 */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: var(--font); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}

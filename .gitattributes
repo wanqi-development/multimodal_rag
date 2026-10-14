@@ -1,0 +1,31 @@
+# 换行与二进制的统一约定（2026-10-12 加）。
+#
+# 之前没有这份文件，行为完全依赖每个人的 `core.autocrlf`：本机是 true（索引存 LF、
+# 工作区 CRLF），而 Linux / CI 上默认是 false —— 谁要是在那种环境里改了文件再提交，
+# **整个文件**都会变成 diff（内容一个字没改，行尾全变了）。`text=auto` 把这个决定
+# 从"每个人各自的配置"挪到仓库里：进索引一律归一成 LF，检出时再按属性还原。
+#
+# 刻意**不写** `eol=lf`：本机是 Windows、工作区一直用 CRLF，全局改成 LF 会让下次
+# checkout 把整棵树重写一遍（一次没有意义的 churn）。要的是"索引里是 LF"，不是
+# "每个人的工作区长一样"。
+* text=auto
+
+# Windows 脚本按 CRLF 检出：cmd.exe 对 LF 结尾的批处理不可靠，PowerShell 5.1 也
+# 一贯按 CRLF 写。注意 start.ps1 另有一条独立约束 —— 必须存成 **UTF-8 with BOM**，
+# 否则 PS 5.1 按系统 ANSI(GBK) 读中文注释会把引号吃掉（见 docs/architecture.md §12.7）。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制：别让 Git 去猜，也别做任何换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.onnx binary
+*.bin binary
+*.safetensors binary

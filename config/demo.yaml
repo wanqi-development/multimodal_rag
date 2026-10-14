@@ -1,0 +1,77 @@
+# demo 档：给「60 秒 demo」用的一个**不花钱、独立 collection、不污染别的档**的档位。
+#
+#   RAG_PROFILE=demo rag ingest demo/corpus
+#
+# 每一次覆盖都是为了同一件事：**跑一遍不花一分钱，也别碰你现有的数据**。
+# 注意档位只认真实环境变量，`.env` 里的 RAG_PROFILE 是不生效的（见 docs/architecture.md
+# 与 backlog 里那条）；脚本已经替你设好了。
+#
+# Milvus 是**共用**的（地址来自 .env 的 MILVUS_URI）—— demo 只是换一个 collection 名。
+
+indexing:
+  vector:
+    # 名字带指纹（embedding + 块表结构）。本地 Qwen3-Embedding-0.6B 是 1024 维，与 dev 档
+    # 那条线上 qwen3-vl 的 2560 维不是一套，所以必须另起一个名字
+    # （Milvus 建好表就改不了维度，见 docs/architecture.md §8.3）。
+    collection: rag_demo_qwen3_v1
+
+providers:
+  embedding:
+    # 这一段**写死、不吃 ${} 插值**：demo 的底线是"一分钱不花"，不能因为本机 .env 里恰好
+    # 把 EMBEDDING_BACKEND 指到了线上（dev 档就是这么用的）就悄悄变成按量计费。
+    # 三个值必须自洽：Qwen3-Embedding-0.6B 就是 1024 维，权重在 .models/ 下（README 有下载方式）。
+    backend: sentence-transformers
+    model: .models/Qwen3-Embedding-0.6B
+    dim: 1024
+
+storage:
+  # 上传件 / 中间产物 / 原始资产三个域的 backend 默认写 auto = 听这里。钉成 local 是为了
+  # 不依赖 MinIO —— .env 里 RAG_STORAGE_BACKEND=minio 是给多 worker 用的，跑 demo 的机器
+  # 多半没有那个桶（本机实测也没起）。
+  backend: local
+
+persistence:
+  # demo 不用 PG：文档注册表 / 上传件台账 / 模型选型都走单机 SQLite。
+  backend: sqlite
+  postgres:
+    # 写死空串 = 不配 PG。上面那行只管那三份关系型数据，**LangGraph 的 checkpointer 是另一条路**
+    # （它只有 PG 一个实现，由这个 url 决定）—— 一并清掉才叫真的零依赖。
+    url: ""
+
+documents:
+  # 落自己的文件。默认那个 data/documents.sqlite3 是单机模式下的"真实注册表"，
+  # demo 不该往里塞三行。（上传件台账与它同文件，见 persistence/uploads.py。）
+  backend: sqlite
+  sqlite_path: ./data/demo/documents.sqlite3
+
+models:
+  backend: sqlite
+  sqlite_path: ./data/demo/model_settings.sqlite3
+
+ingest:
+  images:
+    # 与 base.yaml 的默认值一致，这里显式写一遍，因为它就是"不花钱"那条底线：
+    # 打开它 = 每张图一次 VLM 调用，按量计费。demo 语料是纯文本，本来也没有图。
+    describe: false
+  # 三个落点全部挪到 data/demo/ 下：这样"清掉 demo"= 删 collection + 删这一个目录，
+  # 与你自己的 data/stages、data/assets、data/uploads 一个字节都不重叠。
+  uploads:
+    dir: ./data/demo/uploads
+  stages:
+    dir: ./data/demo/stages
+  assets:
+    dir: ./data/demo/assets
+
+retrieval:
+  channels:
+    # 与 dev 档一致：语义与关键词**同在 milvus 这一路里**（服务端 dense + 内建 BM25 融合）。
+    # 显式列出来是为了 demo 的稳定性 —— base.yaml 以后多出别的通道，demo 也不会跟着变。
+    # 图谱那一路要 Neo4j，demo 不带。
+    - name: milvus
+      type: milvus
+      enabled: true
+
+observability:
+  # demo 不往上送任何数据
+  langsmith: false
+  project: multimodal_rag-demo

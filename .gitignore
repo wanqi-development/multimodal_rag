@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version.bak
+
+# uv（已改用 conda 管理环境；uv.lock 暂留待定去留，先别删）
+# uv.lock 若保留就要提交：这是应用而非库，锁文件保证可复现构建
+
+# 配置与机密
+.env
+.env.*
+!.env.example
+
+# 数据与产物
+data/
+deploy/volumes/
+eval/reports/
+
+# 工具
+.pytest_cache/
+.pytest-tmp*/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+# Claude Code 的本地设置（每人一份，不进库）
+.claude/
+
+# 只在本机维护、不发布的两份文档（使用者 2026-10-10 定）：
+#   AGENTS.md   给 AI 助手的协作约定
+#   CHANGELOG.md 逐阶段的变更记录（很长，且含本地数据/路径细节）
+#   docs/backlog.md 待办与已知问题（同样是内部笔记：使用者口吻 + 内网地址 + 待办细节）
+AGENTS.md
+CHANGELOG.md
+docs/backlog.md
+# 本地产线（paddlex --serve）的运行日志
+.paddlex_serve.*.log
+# 语义切分用的本地 embedding 模型（Qwen3-Embedding-0.6B，1.2GB）
+.models/
+
+# dots.ocr 跑出来的产物：整本页图 + 逐页 json/md（8.1MB），是运行输出不是源码
+src/rag/ingest/dots_ocr/output/
+
+# HuggingFace Hub 风格的分片缓存（sha256 命名的 blob），不是源码
+blobs/
+
+# 前端：依赖与构建产物都不进库（源码在 web/src）
+web/node_modules/
+web/dist/
+
+# IDE
+.idea/
+.vscode/

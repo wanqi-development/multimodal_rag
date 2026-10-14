@@ -1,0 +1,108 @@
+[project]
+name = "multimodal_rag"
+version = "0.1.0"
+description = "Multi-modal RAG: multi-modal ingestion and storage over hybrid dense+sparse text retrieval"
+readme = "README.md"
+# 见 docs/architecture.md ADR #9：langgraph 官方声明封顶 3.13，核心框架不跑在未声明版本上
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    # 编排与 agent
+    "langchain>=1.4,<2",
+    "langchain-core>=1.6,<2",
+    "langchain-classic>=1.0,<2",
+    "langchain-text-splitters>=1.1,<2",
+    "langgraph>=1.2,<2",
+    "deepagents>=0.7,<0.8",
+    # agent 的 web 搜索工具（使用者自研）用智谱的 zai-sdk。**懒导入**：没装时
+    # `web_search_tool` 只返回一句「请安装」，不影响任何别的路。
+    "zai-sdk>=0.2,<1",
+    # provider 适配
+    "langchain-openai>=1.6,<2",
+    # 索引与检索
+    "pymilvus>=3.0,<4",
+    "fastembed>=0.8,<0.9",
+    # 默认 embedding 后端（providers.embedding.backend=sentence-transformers）。
+    # 它会带 torch 进来 —— 比 ONNX 重得多，但换来 32768 的窗口，
+    # 否则 chunk 一大就被 bge-small-zh 的 512 窗口静默截断。
+    "sentence-transformers>=6,<7",
+    "flashrank>=0.2,<0.3",
+    # 接入
+    "pymupdf>=1.28,<2",
+    # docx / html / xlsx 走代码解析（结构明确写在文件里，不该送去 OCR）：
+    #   python-docx 解标题样式与表格；openpyxl 逐行读工作表；bs4 解 HTML 标签。
+    # 注意不用 pandas —— 它被本机的应用控制策略挡着，且这里用不上它的分析能力。
+    "python-docx>=1.1,<2",
+    "openpyxl>=3.1,<4",
+    "beautifulsoup4>=4.12,<5",
+    # ingest/ocr.py 直接 import httpx 打 PaddleOCR-VL 产线服务，需显式声明
+    # （别指望它只是别人的传递依赖就一直带着，见下面 python-dotenv 那条）
+    "httpx>=0.28,<1",
+    # 服务
+    "fastapi>=0.141,<1",
+    "uvicorn>=0.53,<1",
+    # FastAPI 收 multipart 上传（页面的「上传文档」那一步）必须显式装它 ——
+    # 不装时 File/UploadFile 端点直接报错，而不是「少个功能」。见 api/uploads.py
+    "python-multipart>=0.0.9,<1",
+    # API 的限流计数与任务状态（走 SSH 隧道那台 Redis）。
+    # **可选**：`api.redis.url` 留空、或这个包不在，代码就退回进程内实现（见 api/redis_backend.py）。
+    "redis>=6,<7",
+    # LangGraph 的 PG 持久化：checkpointer（会话与 HITL 中断）+ store（跨会话记忆）。
+    # 一个包同时提供两者（已从 wheel 内容确认），配 psycopg3 驱动与连接池。
+    # **可选**：`persistence.postgres.url` 留空就退回进程内实现。
+    "langgraph-checkpoint-postgres>=3,<4",
+    "psycopg[binary,pool]>=3.3,<4",
+    "typer>=0.27,<1",
+    "pydantic-settings>=2.15,<3",
+    "pyyaml>=6,<7",
+    # config/settings.py 直接 import dotenv_values，需显式声明（别只靠 pydantic-settings 传递带入）
+    "python-dotenv>=1,<2",
+    # 对象存储（多 worker 模式：上传件 / 产物 / 图片 / 会话图片放 MinIO 桶，
+    # 单机仍走本地盘）。**可选**：`ingest.uploads.backend=local`（默认）时不 import 它，
+    # 见 storage.py 的 MinioBlobStore —— 只有真切到 minio 才需要这个包。
+    "minio>=7,<8",
+    # 观测
+    "langsmith>=0.13,<1",
+]
+
+[project.optional-dependencies]
+eval = ["ragas>=0.4,<0.5"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1",
+    "ruff>=0.15",
+]
+
+[project.scripts]
+rag = "rag.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rag"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+# docs/ 里是文档示例代码，不是可运行代码：别让 linter 去改文档排版、也别报里面的未定义名
+# ingest/dots_ocr/ 是从 dots.ocr 官方仓库整包拿过来的样例代码（含它自己的工具与
+# 演示脚本、以及一堆它自己的风格问题）。它是**外部代码**，我们不按本仓库的风格去改它 ——
+# 只通过 ingest/dots.py 这个薄客户端调用它。
+# .models/ 是从 ModelScope 下下来的模型本体（含它自己的 README），不是我们的代码 ——
+# ruff 0.15 起会格式化 markdown 里的代码块，不加这条会把下载下来的文件也「改一遍」。
+extend-exclude = ["docs", "src/rag/ingest/dots_ocr", ".models"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    # B008：Typer 就是在参数默认值里调 Option/Argument，这是框架规定用法，不是误写
+    "B008",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

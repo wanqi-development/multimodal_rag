@@ -1,0 +1,78 @@
+# CI（2026-10-12 加）。在此之前 915 个用例与 ruff 全靠人手动跑 —— "干净"没有第二个人
+# 能验证，也没人会在改完之后真的去跑一遍。
+#
+# 只跑不需要外部服务的那部分：需要真 Milvus / 真 OCR 产线的 20 条集成用例由
+# tests/test_milvus_index.py 与 tests/test_ocr_service.py 里的 pytestmark 跳过
+# （RAG_TEST_MILVUS / RAG_TEST_OCR 不设即为关）。这里**显式**写出来，是为了不依赖
+# "默认值恰好是关" —— 哪天默认值变了，CI 该跳的还得跳。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支连推两次时，取消还在跑的那一次（省 runner 时间，也让状态栏只反映最新提交）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    # 锁 24.04 而不是 ubuntu-latest：GitHub 已公告 ubuntu-latest 会在 2026-10-19 迁到
+    # Ubuntu 26（注解里发的那条 notice）。让基础镜像自己换掉、CI 哪天突然红，不值当 ——
+    # 要换版本就显式改这一行。
+    runs-on: ubuntu-24.04
+    env:
+      RAG_TEST_MILVUS: "0"
+      RAG_TEST_OCR: "0"
+    steps:
+      # checkout v7 / setup-python v7：v4 / v5 的目标还是 Node 20，GitHub 会对每次运行
+      # 发一条弃用警告（注解里能看见）。两者都仍然支持下面用到的输入（已核对 action.yml）。
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # pyproject.toml 锁了 >=3.13,<3.14（langgraph 官方声明封顶 3.13）
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # `--group dev` 是 PEP 735 依赖组，要 pip ≥ 25.1（上面那行就是为它升的）
+          pip install -e . --group dev
+          # 插件包也在仓库里，顺手装上：不装的话 tests/test_graph_store.py 与
+          # tests/test_graph_extract.py 整个模块会被 importorskip 跳过 ——
+          # 等于 CI 从来没验证过「装了插件配置里就能用」这条主线。
+          # 它自己**零运行时依赖**（neo4j 驱动是函数内懒导入），装上不增加下载。
+          pip install -e plugins/rag-channel-neo4j
+
+      - name: ruff check
+        run: python -m ruff check
+
+      - name: ruff format --check
+        run: python -m ruff format --check
+
+      - name: pytest
+        shell: bash
+        run: |
+          # 失败时把「挂掉的用例」打成 GitHub 注解：运行页上直接看得见是哪几条，
+          # 不必再去下载日志包 —— 那个接口要鉴权（未鉴权实测 403），而注解接口是公开的。
+          # `::error::` 每步最多展示 10 条，所以优先挑 -rfE 的汇总行，挑不到才退回日志尾部。
+          #
+          # 注意 `shell: bash` 在 GitHub 上等价于 `bash -eo pipefail`：所以失败要用
+          # `|| status=$?` 接住，不能靠 `if` 去判断 —— 否则脚本在管道那一步就被 -e 干掉了。
+          status=0
+          python -m pytest -q -rfE 2>&1 | tee pytest.log || status=$?
+          if [ "$status" -ne 0 ]; then
+            summary=$(grep -E '^(FAILED|ERROR)' pytest.log | head -10 || true)
+            if [ -z "$summary" ]; then
+              summary=$(tail -10 pytest.log)
+            fi
+            printf '%s\n' "$summary" | while IFS= read -r line; do
+              echo "::error title=pytest::${line}"
+            done
+            exit 1
+          fi
