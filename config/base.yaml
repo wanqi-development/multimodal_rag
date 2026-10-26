@@ -1,0 +1,530 @@
+# 默认配置。用 config/dev.yaml 或 config/prod.yaml 覆盖（见 RAG_PROFILE）。
+# 支持 ${VAR:-default} 插值。机密不要写在这里，放环境变量或 .env。
+
+storage:
+  # **文件落在哪**（2026-10-10 统一成一个开关）。值放 .env，这里只声明。
+  #   local（默认）—— 本地盘：单机部署不装 MinIO 也能跑，行为与从前逐字节一致。
+  #   minio       —— 进桶（S3 兼容）：多 worker 下 worker A 上传的文件 worker B 读得到。
+  # 管哪四个域：上传件（ingest.uploads）、中间产物（ingest.stages）、原始资产（ingest.assets）、
+  #   会话图片（api.media）。那四个域的 `backend` 默认写 auto = 听这里；
+  #   想把某一个域单独钉死（比如产物进桶、上传件留本地盘），把它改回 local / minio 即可。
+  #   优先级：域显式写的 > 这里 > local（唯一实现在 rag/storage.py 的 resolve_storage_backend）。
+  backend: ${RAG_STORAGE_BACKEND:-local}
+  # 下面这一段只有选了 minio 才用得上；密钥在 .env：MINIO_ACCESS_KEY / MINIO_SECRET_KEY。
+  # 地址与桶名不是机密，写这里。
+  minio:
+    # 默认按「本机装了一个」写；真实部署多半在别的机器上，用 .env 的 MINIO_ENDPOINT 覆盖
+    endpoint: ${MINIO_ENDPOINT:-localhost:9000}
+    bucket: ${MINIO_BUCKET:-rag}
+    # 自建 MinIO 多半是 http；走 https 才改 true
+    secure: false
+    region: ""
+    # 只认 Path 的消费方（loader / PyMuPDF / OCR）的读穿透缓存：桶是真相，这里是副本
+    cache_dir: ${RAG_BLOB_CACHE:-./data/cache/blobs}
+
+providers:
+  # 按名字分组，"多供应商可切换" = 换一组 .env，不用改代码。
+  #
+  # 每个供应商在 .env 里配三件套，变量名由供应商名大写拼后缀而来：
+  #   <PROVIDER>_API_KEY    机密，只从环境变量读，绝不进本文件
+  #   <PROVIDER>_BASE_URL   -> 下面的 base_url（换成自建网关 / 代理只改 .env）
+  #   <PROVIDER>_MODEL_NAME -> 下面的 model（模型名一律不硬编码，按账号改 .env）
+  # 下面写的默认值只在 .env 没给时兜底；走 OpenAI 兼容通道的供应商必须有 base_url，
+  # 缺了 build_chat 会直接抛错而不是等远端超时。原生集成的留空即用官方地址。
+  chat:
+    default:
+      provider: deepseek
+      # 模型名必须是账下真实存在的：写错要到第一次 rag ask 才以远端 400 暴露，
+      # 那时不容易联想到是配置写错了 —— 所以这个值按账号在 .env 里核对
+      model: ${DEEPSEEK_MODEL_NAME:-deepseek-chat}
+      base_url: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+    openai:
+      provider: openai
+      model: ${OPENAI_MODEL_NAME:-gpt-4o-mini}
+      base_url: ${OPENAI_BASE_URL:-}
+    dashscope:
+      provider: dashscope
+      model: ${DASHSCOPE_MODEL_NAME:-qwen-plus}
+      base_url: ${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+    zhipuai:
+      provider: zhipuai
+      model: ${ZHIPUAI_MODEL_NAME:-glm-4-flash}
+      base_url: ${ZHIPUAI_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+    moonshot:
+      provider: moonshot
+      model: ${MOONSHOT_MODEL_NAME:-moonshot-v1-8k}
+      base_url: ${MOONSHOT_BASE_URL:-https://api.moonshot.cn/v1}
+  embedding:
+    # 两种向量化方式，二选一（见 providers/embedding.py 的对比表）：
+    #   sentence-transformers（默认）—— **纯文本**。图片先由 VLM 写成描述，
+    #     再和正文一样进同一个文本向量空间（图本身不参与编码）。
+    #   qwen3-vl —— **图 + 文同一个空间**（线上 DashScope 原生 multimodal-embedding）。
+    #     图片块把「图片本体 + 描述文字」放进同一个内容项，服务端融合成**一个向量**；
+    #     正文块只送文字，但走**同一个模型**，所以两边可比 —— 这是以图搜图的地基。
+    # 换到 qwen3-vl 必须同步改两处：dim 1024 -> 2560，以及**换 collection 名**
+    # （Milvus 建好表就改不了维度，upsert 时才发现就白花了一遍 embedding 的钱）。
+    # 另：qwen3-vl 走线上、按量计费，且 chunk 阶段的语义兜底也会用它算句向量。
+    backend: ${EMBEDDING_BACKEND:-sentence-transformers}
+    # Qwen3-Embedding-0.6B：1024 维、窗口 32768 token。
+    # 用它换掉 bge-small-zh（512 token 窗口）—— 块一超窗口就被静默截断，
+    # 后半截根本不进向量。窗口大了 chunk 才谈得上按语义放宽。
+    # 值给的是**本地路径**：hf-mirror 拉这个模型会卡在 0 字节，实测走 ModelScope
+    # 下到 .models/ 才可靠。要换成 HF id，设 EMBEDDING_MODEL 覆盖。
+    # 切到 qwen3-vl 时，这个值就是**线上模型名**（qwen3-vl-embedding）。
+    model: ${EMBEDDING_MODEL:-.models/Qwen3-Embedding-0.6B}
+    # 只有 qwen3-vl 用得上：供应商名决定 key 取 `.env` 里哪个变量（同 vision 的约定）
+    provider: ${EMBEDDING_PROVIDER:-dashscope}
+    # qwen3-vl 那个**原生**端点。不是 OpenAI 兼容通道 —— 实测兼容通道对这个模型 404。
+    endpoint: ${EMBEDDING_ENDPOINT:-https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding}
+    # dense 维度的唯一来源：Milvus collection 的 dim 由它推导
+    # （sentence-transformers 用 1024；qwen3-vl 用 2560）
+    dim: ${EMBEDDING_DIM:-1024}
+    batch_size: 32
+    # huggingface.co 直连不通，必须走镜像；镜像不支持 Xet 存储接口，要一并关掉
+    # 用插值是为了留出覆盖口子：网络能直连 HF 的机器上设 HF_ENDPOINT 即可
+    hf_endpoint: ${HF_ENDPOINT:-https://hf-mirror.com}
+    hf_disable_xet: true
+  rerank:
+    # 重排模型（本地跑，两个 backend 见 providers/rerank.py 的对比）：
+    #   sentence-transformers —— CrossEncoder（**默认**）。bge-reranker-base 中英都行，
+    #                           实测（2026-10-03）区分度干净：相关 0.99 / 沾边 0.85 / 无关 0.0000。
+    #                           模型走 ModelScope 下到 .models/bge-reranker-base（约 1.1GB 权重）。
+    #   flashrank            —— ONNX，依赖已在，但**本机拿不到它的模型**：它硬编码直连
+    #                           huggingface.co、不看 HF_ENDPOINT，而镜像只做 302 跳回去、
+    #                           那边匿名 401（ModelScope 也没这个仓库）。有 HF token 才谈得上用它。
+    # 首次使用要下模型，所以缓存目录指到项目内（flashrank 默认写 /tmp，重启就没）。
+    backend: ${RAG_RERANK_BACKEND:-sentence-transformers}
+    model: ${RAG_RERANK_MODEL:-.models/bge-reranker-base}
+    cache_dir: ${RAG_RERANK_CACHE:-.models/flashrank}
+    # CrossEncoder 的输入上限（query + 正文）。chunk ≤1000 字 ≈ 700 token，
+    # 而 MiniLM 系只有 512 窗口 —— 超了会被静默截断，所以显式给一个数。
+    max_length: 512
+    hf_endpoint: ${HF_ENDPOINT:-https://hf-mirror.com}
+    hf_disable_xet: true
+  # 看图说话的模型（VLM）。**与 chat 是两套模型**：chat 那几家多半不能看图
+  # （qwen-plus 不认识 image_url）。用的是同一套三件套约定，变量名带 VL 后缀：
+  #   DASHSCOPE_VL_API_KEY   留空则回退到 DASHSCOPE_API_KEY（同一个账号同一把 key）
+  #   DASHSCOPE_VL_BASE_URL  留空则回退到 DASHSCOPE_BASE_URL
+  #   DASHSCOPE_VL_MODEL_NAME
+  # 只在 ingest.images.describe 打开时才会被 build_vision 建起来 —— 一次都不用就一次不花钱。
+  vision:
+    provider: dashscope
+    model: ${DASHSCOPE_VL_MODEL_NAME:-qwen-vl-max}
+    # 不写嵌套插值：settings._ENV_REF 的正则不支持嵌套，写 `${A:-${B:-c}}` 会得到
+    # 一串带 `$` 的字面量。换网关时 VL 也要一起改（DASHSCOPE_VL_BASE_URL）。
+    base_url: ${DASHSCOPE_VL_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+    # 一张图一次调用，比 chat 慢得多，也给足余量
+    timeout_s: 120.0
+    max_retries: 2
+
+  # 语音转文字（ASR）：对话页输入框那个麦克风。key/base_url/model 三件套与 vision 同一约定，
+  # 但**端点不是同一个**：ASR 走 DashScope **原生**的
+  #   /api/v1/services/aigc/multimodal-generation/generation
+  # （vision 走 OpenAI 兼容的 /compatible-mode/v1/chat/completions）。所以 base_url 填**根域**，
+  # 路径由客户端拼。照兼容通道抄过一次，上游回 {"message":"format is empty"} —— 兼容通道读
+  # input_audio.format，原生端点把 format/sample_rate 放在 parameters 里。这是官方样例的形状。
+  #
+  # 账号若走百炼工作空间域名，把 DASHSCOPE_ASR_BASE_URL 设成
+  #   https://<workspace-id>.cn-beijing.maas.aliyuncs.com
+  #
+  #   DASHSCOPE_ASR_API_KEY   留空则回退到 DASHSCOPE_API_KEY（同一个账号同一把 key）
+  #   DASHSCOPE_ASR_MODEL_NAME 默认 qwen-audio-3.0-asr-flash（查过账号里的模型清单）
+  #
+  # **不能用 qwen-vl-max**：它看图不看音频。要「边说边出字」得换成 *-realtime-* 那族，
+  # 现在选的是一次性识别（录完再转）。只用一次花一次的钱，不满 1 秒也按调用计。
+  asr:
+    provider: dashscope
+    model: ${DASHSCOPE_ASR_MODEL_NAME:-qwen-audio-3.0-asr-flash}
+    base_url: ${DASHSCOPE_ASR_BASE_URL:-https://dashscope.aliyuncs.com}
+    timeout_s: 120.0
+    # 识别失败多半是格式/时长的问题，重试只会把钱花三遍
+    max_retries: 0
+
+ingest:
+  pdf:
+    # dots（默认）| paddleocr | mineru | pymupdf（**老名字 `ocr` 仍然认**，会被归一化成 paddleocr）
+    #
+    # dots：**所有 PDF 统一整份送 dots.ocr**（vLLM，默认 127.0.0.1:6006）。它是端到端的
+    #   版面模型，Section-header 块直接给出 `#`/`##`/`###`，还带 bbox —— 标题层级
+    #   这一条只有它给得对（产线的 relevelTitles 实测在这些教材上不可用）。
+    # paddleocr：PaddleOCR 产线。不再探测是不是扫描件 —— 数字版 PDF 走
+    #   pymupdf 只能拿到纯文本，没有标题层级、没有表格、没有图片，下游的
+    #   markdown 切分与图片描述都是空转（实测：同一份数字版 PDF，pymupdf 路径
+    #   0/20 个块带标题路径、0 个图片标记；OCR 路径 8/8、9 个标记）。
+    # pymupdf：有损降级 —— 产线挂了、或要拿它做对照时用。标题/表格/图片全会丢。
+    parser: ${RAG_PDF_PARSER:-dots}
+  dots:
+    # dots.ocr 的 vLLM 服务。**不是产线**：它就是一个 OpenAI 兼容的 /v1/chat/completions，
+    # 一页一次调用、页之间并发（见 ingest/dots.py）。
+    base_url: ${DOTS_OCR_BASE_URL:-http://127.0.0.1:6006}
+    model: ${DOTS_OCR_MODEL_NAME:-dots_ocr}
+    # 页面渲染 DPI：200 是样例默认值，再高对识别帮助不大、传输量却翻倍
+    dpi: 200
+    # 页间并发。一页一次调用，串行会把几十页的 PDF 拖成十几分钟
+    num_thread: 16
+    # 单页失败重试几次。长文档必需：几百页里一页失败，整份就白跑了
+    max_retries: 2
+    # 版面 + 识别 + 层级，样例里的默认模式
+    prompt_mode: prompt_layout_all_en
+    temperature: 0.1
+    top_p: 1.0
+    max_completion_tokens: 16384
+  mineru:
+    # MinerU 的**远程 API**（MinerU API v1.0.0）。它和 dots.ocr 都在 6006 上用过 ——
+    # **谁在跑由部署决定**，这里的 parser 要跟着改（`RAG_PDF_PARSER=mineru|dots|paddleocr`）。
+    # 三家 client 的出口是同一种格式（每页 markdown + 图片），所以换家下游不用动。
+    base_url: ${MINERU_BASE_URL:-http://127.0.0.1:6006}
+    # 本地部署留空；网关/云端才填（空 = 不发 Authorization 头）
+    # 带引号：不带引号时 `${VAR:-}` 会被 YAML 解析成 None，而这两个字段是 str
+    api_key: "${MINERU_API_KEY:-}"
+    # flash（最快，只用文字层）| basic（轻量本地模型）| standard（默认 VLM）| advanced
+    tier: ${MINERU_TIER:-standard}
+    # auto（自动判断文字层）| txt（只用文字层）| ocr（强制 OCR）
+    ocr_mode: auto
+    # 只解析这些页（1 起，如 "1-5,8"；空 = 整份）。standard 档约 27 秒/页，大文档靠它控代价
+    page_range: "${MINERU_PAGE_RANGE:-}"
+    timeout_s: 3600.0
+    poll_interval_s: 3.0
+    max_retries: 2
+  ocr:
+    # PaddleOCR-VL **产线服务**地址，默认端口 8080。
+    # 别填 8118：那是 vLLM 托管的 PaddleOCR-VL 模型，只是产线的下游，
+    # 单独打它拿不到版面分析与阅读顺序。
+    # 留空 = 不启用 OCR：这条链路上不会有任何网络请求，扫描件照旧计入 skipped。
+    # 没部署 GPU 服务的机器靠这个默认值也能把整条链路跑通。
+    base_url: ${PADDLEOCR_BASE_URL:-}
+    # 整份 PDF 走一次 OCR 比单页慢得多，别沿用 chat 那个 120s
+    timeout_s: 600.0
+    max_retries: 1
+    # 产线不可用时**先原地重试**几次再考虑云端兜底：实测那条转发在真实负载下 28% 失败，
+    # 一个 502 就把整份文档推给按量计费的云端不值得。0 = 不重试。
+    retry_primary: 1
+    # 跨页重构三件套：只开 merge_tables / relevel_titles 而不开 restructure_pages
+    # 是不生效的，所以三个一组默认全开。开着的意义就是「整份走 OCR」的主要理由：
+    # 跨页表格合并 + 把版面标题块重建成 #/##/###，正好喂给 markdown chunker。
+    restructure_pages: true
+    merge_tables: true
+    relevel_titles: true
+    # 让产线把图片内联进 markdown（<img src="imgs/…">，位置就是原图在文中的位置），
+    # 并在响应的 markdown.images 里回图片数据。关掉的话图片既不进正文也拿不到本体，
+    # 后面就没法给它挂描述。代价是响应大很多（11 页实测 949KB，几乎全是 base64）。
+    return_images: true
+    # 本地产线**不可用时**的兜底：PaddleOCR 云端 API（paddleocr 自带的 SDK）。
+    # 默认关闭 —— 它按量计费，打开是个花钱的决定，不该悄悄发生。
+    # 打开前先在 .env 里填 PADDLEOCR_ACCESS_TOKEN（AI Studio 平台申请）；
+    # 开了却没填 token 会直接报错，而不是默默退回「没有兜底」。
+    cloud_fallback:
+      enabled: true
+      model: PaddleOCR-VL-1.6
+      base_url: ${PADDLEOCR_CLOUD_BASE_URL:-https://paddleocr.aistudio-app.com}
+      request_timeout_s: 300.0
+      poll_timeout_s: 900.0
+  assets:
+    # 原始资产（目前只有图片）落在哪。图片本体放这里，正文里只留
+    # `![image](asset:<doc_id>/p0003_01.jpg)` 这样的短标记。
+    # auto（默认）= 听统一开关 `storage.backend`；要单独钉死这个域就写 local / minio
+    # （进桶时键 = assets/<doc_id>/<名>，正文标记两种后端都一样）。
+    backend: ${ASSETS_BACKEND:-auto}
+    prefix: assets
+    dir: ${RAG_ASSETS_DIR:-./data/assets}
+  images:
+    # 给每张图问一次 VLM、写一条 `modality=image` 的描述块。
+    # **默认关闭**：按量计费（一张图一次调用），打开它是个花钱的决定，
+    # 不该在一份默认配置里悄悄发生 —— 与 cloud_fallback 同一个立场。
+    # 打开前先在 .env 里配好 DASHSCOPE_VL_* 那三件套。
+    describe: false
+    # 上下文各取多少字符（上边一段的尾巴 / 下边一段的开头）。
+    # 太长会把图片本身的信号稀释掉，两张加起来还会挤占 VLM 的注意力。
+    context_chars: 600
+    # 单次最多描述几张图，0 = 不限制。**先花几毛钱看效果**的口子：
+    # 打开 describe 之前先用它跑几张，确认提示词与模型对路再全量。
+    max_images: 0
+    # 描述缓存。键 = 图片内容哈希 + 模型 + 提示词版本：
+    # 改一段正文不该让几十张图全部重问一遍（见 docs/milvus-schema-design.md §4.4）
+    cache_path: ${RAG_VISION_CACHE:-./data/cache/image_descriptions.json}
+  stages:
+    # 三段流水线的中间产物：data/stages/<doc_id>/{document,chunks}.json + .md
+    #   document.* 阶段1（解析文件）的结果；chunks.* 阶段2（切分+图片描述）的结果
+    # 用处一：*.md 是人读版，解析/切分对不对可以人工核对（页码行号、章节路径、块边界都带着）
+    # 用处二：阶段1、2 不碰 Milvus —— 可以在 Milvus 挂掉时先跑，或等机器空闲再灌库
+    # 这是缓存：删掉只会让下次 ingest 重跑一遍，不影响已入库的数据
+    # auto（默认）= 听统一开关 `storage.backend`；要单独钉死这个域就写 local / minio。见 storage.py。
+    backend: ${STAGES_BACKEND:-auto}
+    prefix: stages
+    dir: ${RAG_STAGES_DIR:-./data/stages}
+  # 页面上传的落点：**只放上传件、不放产物**（产物在 stages）。先落本地盘、保留不删；
+  # 将来换成文件服务器时改 `api/uploads.py` 的 UploadStore 实现（多 worker 也接得上）。
+  # 扁平存 `<dir>/<真名>-<sha1 前 16 位><扩展名>`：哈希与「解析产物是否过期」用的是同一个，
+  # 所以同名同内容 = 同一个 doc_id = 原地 upsert；同名不同内容 = 两份文件，
+  # 页面会问「覆盖更新还是保留两份」。真名与来源 URL 记在 `<dir>/_index.json`。
+  uploads:
+    # auto（默认）= 听统一开关 `storage.backend`；要单独钉死这个域就写 local / minio。见 storage.py。
+    backend: ${UPLOADS_BACKEND:-auto}
+    prefix: uploads
+    dir: ${RAG_UPLOADS_DIR:-./data/uploads}
+    max_mb: 64
+    # 「从链接导入」：抓取本身不花钱，但抓回来是 PDF / 图片就会走 OCR（那一步可能按量计费）。
+    fetch:
+      timeout_s: 15
+      max_redirects: 5
+      # 默认关：开了等于允许后端去抓内网地址（自建文档站才需要）
+      allow_private_hosts: false
+      # 抓 HTML 时连页面里的图一起抓：每张图都要过一次 VLM 描述（**按量计费**），
+      # 所以这两个是钱的口子，默认值故意保守（正文里的图通常远少于 20 张）
+      max_images: 20
+      max_image_mb: 8
+      # 网页用谁来抓：
+      #   http（默认）—— 本机抓、自己抽正文；不花钱，但导航/页脚/"Copy page" 这类
+      #     chrome 得靠我们的规则剔（现代前端的导航常常不是 `<nav>`）。
+      #   firecrawl —— 交给 Firecrawl 的 /scrape（onlyMainContent），正文干净得多。
+      #     **按量计费**，所以默认不切；key 在 .env 的 FIRECRAWL_API_KEY（只从环境读）。
+      #   **只管网页**：PDF / 图片 / 附件一律仍走本机（那几条路要的是原件：版面模型给
+      #   标题层级、抽图、页码行号，只给 markdown 会把这些全丢掉）。
+      backend: ${RAG_FETCH_BACKEND:-http}
+      # 云端接口；自建部署改成自己的地址（路径仍是 /v2/scrape）。不是机密
+      firecrawl_api_url: ${FIRECRAWL_API_URL:-https://api.firecrawl.dev}
+      only_main_content: true
+      firecrawl_timeout_s: 60
+indexing:
+  vector:
+    backend: milvus
+    # 默认值保持通用：机器相关的地址放 .env（已被 gitignore），不要写进要提交的配置
+    uri: ${MILVUS_URI:-http://localhost:19530}
+    # 开工前探活的超时（秒）。Milvus 停掉时 pymilvus 的重连会空转很久（实测三十几分钟），
+    # 探活接不住就立刻退出，别让人对着不动的终端猜。
+    probe_timeout_s: ${RAG_MILVUS_PROBE_TIMEOUT_S:-5}
+    # **collection 名带指纹**：换 embedding、或换块表结构，都必须换名字重新灌 ——
+    # Milvus 的 schema 建好就不能改，就地改字段是做不到的。
+    #   v1：512 维的 bge-small 时代
+    #   v2：1024 维的 Qwen3 + 8 个新字段（doc_type/modality/heading_path/...）
+    # 另有一个注册表 collection，名字是本名加 `_docs`（见 schema.registry_collection）
+    collection: rag_qwen3_v2
+    indexes:
+      dense:
+        type: IVF_FLAT
+        metric: COSINE
+      sparse:
+        type: SPARSE_INVERTED_INDEX
+        metric: BM25 # 内建 BM25 要求 metric 为 BM25（不是 IP）
+    bm25:
+      enabled: true
+      input_field: text
+      output_field: sparse
+      analyzer: chinese # 服务端中文分词，绕开 fastembed 只有英文 sparse 模型的限制
+  # 切块参数。size 是字符数：中文 1 字≈1 token，而 bge-small-zh-v1.5 窗口只有 512，
+  # 块超窗会被模型静默截断（不报错，但后半截检不出来），所以留足余量
+  chunk:
+    # recursive | markdown | markdown-semantic
+    #   markdown-semantic：header 切 → 递归切（\n\n / \n / 。）→ 语义兜底 → 按大小硬切
+    strategy: markdown-semantic
+    # 字符数。换成 Qwen3-Embedding（窗口 32768）之后不再是贴着窗口的紧张值，
+    # 按「一个小节大致多大才不丢上下文」来定。
+    size: 1000
+    overlap: 60
+    # 语义兜底那一步的参数（只对 markdown-semantic 生效）
+    semantic:
+      # 小于它就不切 —— 断点太密时宁可块大一点，也不要 3 个字的微块
+      min_size: 80
+      # 相邻句余弦距离超过这个分位数就算断点
+      percentile: 90.0
+
+retrieval:
+  # **通道 = 数据源**（2026-10-08 定）：这张表就是全部通道，装配按它来。
+  #   name  —— 这一路的身份（日志、通道账本、`--channel` 都用它，不能重名）
+  #   type  —— 用哪个适配器：内置 milvus / neo4j；也可以是装好的插件包的 entry point 名
+  #            （组名 rag.channels），或开发期直接写点路径 `包.模块:build`
+  #   enabled / complement_only / top_k / options —— 见 docs/architecture.md §9.2
+  # 语义与关键词**同在 milvus 那一路里**（dense + 内建 BM25，服务端融合），不拆成两路。
+  channels:
+    - name: milvus
+      type: milvus
+      enabled: true
+    # 图谱（Neo4j）：要用它参与检索就打开这一项（参数在下面的 graph 块）
+    # - name: kg
+    #   type: neo4j
+    #   enabled: false
+    #   complement_only: true   # 只补位：与别的路重复的候选丢掉，只贡献新块
+    #   top_k: 10              # 这一路的候选数（默认用 fusion.candidates_per_channel）
+  # milvus 那一路自己的参数：dense / sparse 两条腿的上限 + 服务端融合策略（L1）
+  hybrid:
+    dense:
+      field: dense
+      limit: 20
+      weight: 1.0
+    sparse:
+      field: sparse
+      limit: 20
+      weight: 1.0
+    fusion:
+      strategy: rrf
+      k: 60
+  # 图谱那一项的适配器参数（M6，Neo4j）。**参不参与检索由上面 `channels` 里有没有它决定**
+  # （`type: neo4j`），这里没有第二个开关。地址走 .env 的 NEO4J_URI（默认 SSH 隧道到 7687）。
+  graph:
+    uri: ${NEO4J_URI:-bolt://127.0.0.1:7687}
+    user: ${NEO4J_USER:-neo4j}
+    hops: 2 # 最多两跳：一跳是邻居关系，两跳是「邻居的邻居」
+    max_entities: 8 # 问句里最多认几个实体（不设上限会被热门实体淹掉）
+    edges_per_entity: 50
+    timeout_s: 10.0
+  # **L2 跨通道融合**（客户端）：主通道与上面那些可选通道怎么并成一张榜。
+  # 与 hybrid.fusion 不是一回事 —— 那个是 **L1**（Milvus 服务端融 dense+sparse）。
+  # 都是 RRF 所以参数一样：k 越大越平坦（名次靠前的优势被削平）。
+  fusion:
+    strategy: rrf
+    k: 60
+    # 每一路要多少条候选（**所有通道用同一个数**）。取 max(top_k, 这个值)：
+    # 给得多的那一路会在融合里拿到更多票（实测踩过：hybrid 5 条 vs bm25 20 条），
+    # 而池子同时是下一层 rerank 的输入 —— 精排得有得挑。
+    # 10 而不是 20：重排一次 26 条要 6–8 秒，池子减半耗时基本减半（2026-10-03 定）。
+    candidates_per_channel: 10
+  transform:
+    multi_query: 0 # 0 表示关闭
+    hyde: false
+  rerank:
+    # 精排：把融合后的 20 条候选按「查询 ↔ 正文」重排，再按调用方要的条数交货
+    # （交几条由 -k 决定，这里**没有 top_n**）。开关走插值，临时跑一次可以设环境变量：
+    #   PowerShell:  $env:RAG_RERANK="false"   # 临时关掉（做 A/B 对比时用）
+    # 默认 **true**：实测 bge 重排真能挑出东西（同一查询，关着时正确答案不在前 5，
+    # 开了升到 #2）。代价是每次查询多 6–8 秒，池子调到 10 之后大约减半。
+    enabled: ${RAG_RERANK:-true}
+  assemble:
+    max_tokens: 6000
+
+graph:
+  # 编排总开关：关掉走 M2 那条直线（retrieve → assemble → generate）。
+  # 打开后 ask 多两次 LLM 调用（plan + grade），每次多 1–3 秒。
+  enabled: ${RAG_GRAPH:-false}
+  max_corrective_rounds: 2
+  relevance_threshold: 0.5
+  # IndexGraph 同时在跑的文件数：每个文件都可能调 OCR / VLM / 线上 embedding，
+  # 默认 1（= 以前串行的行为）。想快就往上加，但要跟上游承载能力匹配。
+  index_concurrency: 1
+
+api:
+  # FastAPI 服务（`rag serve`）。默认只听本机，要对外就改 RAG_API_HOST。
+  host: ${RAG_API_HOST:-127.0.0.1}
+  port: ${RAG_API_PORT:-8000}
+  # 每分钟每个 key/IP 的请求上限（0 = 不限）。有 Redis 时是**跨 worker 共享**的计数，
+  # 没有就退回进程内（那种情况下每个 worker 各算各的）。
+  rate_limit_per_min: ${RAG_API_RATE_LIMIT:-60}
+  # 同时在跑的 ingest 任务数：重活（OCR/VLM/重排）与检索同进程争资源，默认只让一个跑
+  max_concurrent_ingest: 1
+  # 对话页输入框能收的媒体上限（MB）。音频：前端录的是 16kHz 单声道 wav（≈32KB/s），
+  # 10MB ≈ 5 分钟；图片 5MB 是给手机直出照片留的余量（转 base64 之后还要 +33%）。
+  # 超了当场 413，不往上打 —— 打上去就是一次按量的调用费。
+  media_max_audio_mb: 10
+  media_max_image_mb: 5
+  # 对话 / 检索用的图片落点。**不能指到 ingest.uploads.dir**：那是文档语料根，
+  # 而 .png/.jpg 就在 loader 注册表里 —— 丢进去会被当成一份文档列出来、走完五步流程。
+  media_dir: ./data/chat/media
+  # 会话图片（语音不落盘：ASR 在内存里转完就丢）。
+  # auto（默认）= 听统一开关 `storage.backend`；要单独钉死这个域就写 local / minio。
+  media_backend: ${MEDIA_BACKEND:-auto}
+  media_prefix: media
+  # 勾了「已核对」提交之后，**直接排切分 + 入库**（页面第三步提交即往下走）。
+  # 为什么：四步流程里最后那次点击没有新决策 —— 切分只认核对过的清单，而它刚被核对完。
+  # 改成 false 就回到「手动点拆分并入库」。
+  # **注意代价**：切分要给每张图问 VLM、入库要算 embedding，都是按量计费的动作；
+  # 所以只有真的勾了「已核对」才会触发。
+  index_after_review: true
+  redis:
+    # 走 SSH 隧道连虚拟机那台。**留空 = 退回进程内**（限流各 worker 各算、
+    # 任务状态只在内存里）。密码在 .env 的 RAG_REDIS_PASSWORD，不写进这里。
+    # ⚠️ 这两个**必须加引号**：插值是在 yaml 解析**之前**做的文本替换，而
+    #   `key_prefix: rag:` 里那个冒号结尾会被 yaml 当成映射语法（实测报
+    #   `mapping values are not allowed here`）。凡是可能以冒号结尾的插值都要这么写。
+    url: "${RAG_REDIS_URL:-}"
+    key_prefix: "${RAG_REDIS_KEY_PREFIX:-rag:}"
+    timeout_s: ${RAG_REDIS_TIMEOUT_S:-2}
+
+persistence:
+  # **关系型数据落哪个库**（2026-10-10 统一成一个开关）。值放 .env，这里只声明。
+  #   auto（默认）—— 配了 RAG_PG_URL 就用 postgres，否则 sqlite（与从前逐字一致）
+  #   postgres    —— 用 PostgreSQL（要配 RAG_PG_URL，缺了当场报错，不静默退）
+  #   sqlite      —— 用单机文件（data/documents.sqlite3 / data/model_settings.sqlite3）
+  # 管哪三份：文档注册表 + 上传件台账（documents.backend 那一组）、模型选型（models.backend）、
+  #   日志索引（observability.logging.postgres；选了 sqlite 就不写库，日志只落文件）。
+  # **不管** LangGraph 的会话状态 / HITL 中断 —— 它只有 PG 一个实现，由下面的 url 决定；
+  #   要彻底单机就把 RAG_PG_URL 也清掉（那样它会退回进程内，重启即丢，见 docs/architecture.md）。
+  backend: ${RAG_DB_BACKEND:-auto}
+  # LangGraph 的持久化（M5 用）：checkpointer 存会话状态与 **HITL 中断**
+  # （落库的意义是「重启后等人批准的那个中断还在」），store 存跨会话记忆。
+  # 密码在 .env 的 RAG_PG_PASSWORD，不写进这里；url 留空 = 退回进程内。
+  postgres:
+    url: "${RAG_PG_URL:-}"
+    # 独立 schema：库只建表、不建 schema（setup() 里只有 CREATE TABLE IF NOT EXISTS），
+    # 而它不认 schema 参数 —— 隔离靠连接串里的 options=-c search_path=<schema>。
+    # 字段名叫 schema_name 而不是 schema：后者撞 pydantic 的保留属性名（会报 warning）。
+    schema_name: "${RAG_PG_SCHEMA:-rag}"
+    # saver 与 store **共用一个池**，别开两个
+    pool_min: ${RAG_PG_POOL_MIN:-1}
+    pool_max: ${RAG_PG_POOL_MAX:-5}
+    timeout_s: ${RAG_PG_TIMEOUT_S:-10}
+
+agent:
+  # agent 用哪家 chat 供应商 —— 填 providers.chat 里的**键名**，不是 "provider:model" 字符串。
+  # 指向哪家，就用哪家的三件套（_API_KEY / _BASE_URL / _MODEL_NAME，全在 .env）。
+  # 写字符串会绕开三件套：deepseek / zhipuai 这类没有独立 LangChain 集成包，
+  # "deepseek:deepseek-chat" 会要求额外装 langchain-deepseek。
+  chat: ${AGENT_CHAT:-default}
+  subagents: []
+  workspace_dir: ./data/workspace
+  # agent 能不能把文件写到 workspace_dir（写类工具一律先过 HITL，人批准才落盘）。
+  # false 就退回只读：写只落在内存 state 里，磁盘一个字不动。
+  workspace_writes: ${RAG_AGENT_WRITES:-true}
+  # 网络搜索闸门：语料检索的**最高分**低于它就认为「语料里没有相关内容」，放行联网。
+  # 实测（2026-10-05，bge-reranker-base）：语料内有答案 0.9985，语料外 0.0077 / 0.0978。
+  # 只在开了重排时成立；关掉重排时分数是 RRF 名次分、不可比，闸门退化成「只有用户明确要求才放行」。
+  web_min_corpus_score: 0.2
+
+observability:
+  langsmith: false
+  project: multimodal_rag
+  logging:
+    # 业务日志的类别 → 文件（2026-10-06 起不再进数据库）。键就是类别名，对应
+    # logger `rag.<类别>`；path 留空 = 这一类不落文件。**同一个 path 只开一个 handler**：
+    # agent 的三类（一轮汇总 / 每次模型调用 / 每次工具调用）共用 agent.log，这样
+    # 一轮的时间线在同一个文件里连得上（类别靠行里的 logger 短名分）。
+    # 四个文件各 20MB × 3 个备份 = 上限 320MB。
+    files:
+      interface:
+        path: ./data/logs/interface.log
+        max_bytes: 20000000
+        backups: 3
+      channel:
+        path: ./data/logs/channel.log
+        max_bytes: 20000000
+        backups: 3
+      agent_run:
+        path: ./data/logs/agent.log
+        max_bytes: 20000000
+        backups: 3
+      agent_llm:
+        path: ./data/logs/agent.log
+        max_bytes: 20000000
+        backups: 3
+      agent_tool:
+        path: ./data/logs/agent.log
+        max_bytes: 20000000
+        backups: 3
+    # 系统日志：第三方库（LangChain / pymilvus / uvicorn…）与我们自己的非业务 rag.*
+    # （**不含**上面三类，避免同一行落两份）
+    system:
+      path: ./data/logs/system.log
+      max_bytes: 20000000
+      backups: 3
+    # 控制台（stderr）一个出口：所有日志在这里也看得见
+    console: true
+    # 默认 INFO；DEBUG 会把 HTTP 客户端与 LangChain 的调用细节全刷出来
+    level: INFO
+    # 太吵的库默认压到 WARNING，需要时按模块覆盖，例如 levels: { pymilvus: DEBUG }
+    levels: {}
+    # **内容默认不落**：问题/查询原文属于数据（语料与用户原话），只在排查时临时开。
+    # **工具那一行不吃这个开关**（2026-10-10）：agent_tool 的入参/出参永远给内容、只截断
+    # （上限见 obs/log.py 的 TOOL_*_CHARS）—— 只报「多少字」的话，出了问题没法分析。
+    content: ${RAG_LOG_CONTENT:-false}
+    # 每一行顺手再写一份进 PG（`log_line` 表，与 chat 那三张表同库），页面按
+    # request_id / 类别 / 时间查的就是它。**文件仍是唯一真相**：写库失败只喊一句、
+    # 不拖业务；没配 persistence.postgres.url 或这里填 false = 只落文件。
+    postgres: ${RAG_LOG_PG:-true}

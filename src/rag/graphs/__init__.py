@@ -1,0 +1,21 @@
+"""编排层：LangGraph 的两张图。
+
+* ``query.py`` —— QueryGraph：plan → retrieve → grade →（不达标就改写重查）→ assemble → generate
+* ``index.py`` —— IndexGraph：discover → 按文件 fan-out（parse → 人工核对闸门 → chunk）→ 写库
+
+两者都**只做编排**：真正干活的还是 ingest / retrieval / providers 里那些函数与契约。
+所以这一层可以被完整替换（比如换成 Temporal、Airflow）而不动下层 —— 这也是当初把
+三层协议定成 Protocol 的用途。
+"""
+
+from rag.graphs.index import IndexGraphResult, build_index_graph, run_index_graph
+from rag.graphs.query import QueryGraphResult, build_query_graph, run_query_graph
+
+__all__ = [
+    "IndexGraphResult",
+    "QueryGraphResult",
+    "build_index_graph",
+    "build_query_graph",
+    "run_index_graph",
+    "run_query_graph",
+]

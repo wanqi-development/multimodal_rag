@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: true
+# pnpm 12 起，这类设置从 package.json 搬到了这里。
+# 默认不许依赖跑构建脚本（供应链防护），而 esbuild 必须跑它的 postinstall 才会装好
+# 原生二进制 —— 显式放行这一条（换台机器也一样，文件进版本库）。

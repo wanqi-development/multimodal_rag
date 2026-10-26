@@ -1,0 +1,70 @@
+# 开发环境覆盖项。只写与 base.yaml 不同的部分（深合并）。
+# 切生产用 RAG_PROFILE=prod，见 prod.yaml.example。
+
+indexing:
+  vector:
+    # 同 base.yaml：collection 名带指纹（embedding + 块表结构），换一个就得换名字
+    # rag_dev_qwen3_v2 是**纯文本**那条路留下的（Qwen3-Embedding-0.6B，1024 维）；
+    # 换成多模态之后维度是 2560，Milvus 建好表就改不了维度 —— 只能新建一个。
+    collection: rag_dev_qwen3vl_v1
+
+providers:
+  embedding:
+    # 开发档走**多模态**那条：图片块用「描述 + 图片本体」出一个融合向量，正文块与查询
+    # 走同一个模型，四向检索才成立（见 docs/architecture.md §8.3）。
+    # 写成 ${VAR:-默认值}：.env 里设了同名变量仍然优先，换机器不用改这个文件。
+    backend: ${EMBEDDING_BACKEND:-qwen3-vl}
+    model: ${EMBEDDING_MODEL:-qwen3-vl-embedding}
+    dim: ${EMBEDDING_DIM:-2560}
+
+ingest:
+  images:
+    # 多模态那条路**必须有描述**：融合向量的文字部分就是它。关着的话
+    # run_chunk 会直接报错（见 stages._require_image_descriptions）。
+    # 代价：每张图一次 VLM 调用，按量计费；描述会落缓存，重跑不重复花钱。
+    describe: true
+  assets:
+    # 原始资产（目前只有图片）落在哪。图片本体放这里，正文里只留
+    # `![image](asset:<doc_id>/p0003_01.jpg)` 这样的短标记。
+    # auto（默认）= 听统一开关 storage.backend（.env 里的 RAG_STORAGE_BACKEND）；
+    # 要单独钉死这个域才写 local（本地盘）/ minio（进桶，键 = assets/<doc_id>/<名>）。
+    # 正文标记两种后端都一样。
+    backend: auto
+  stages:
+    # 三段流水线的中间产物：data/stages/<doc_id>/{document,chunks}.json + .md
+    #   document.* 阶段1（解析文件）的结果；chunks.* 阶段2（切分+图片描述）的结果
+    # 用处一：*.md 是人读版，解析/切分对不对可以人工核对（页码行号、章节路径、块边界都带着）
+    # 用处二：阶段1、2 不碰 Milvus —— 可以在 Milvus 挂掉时先跑，或等机器空闲再灌库
+    # 这是缓存：删掉只会让下次 ingest 重跑一遍，不影响已入库的数据
+    # auto（默认）= 听统一开关 storage.backend；要单独钉死这个域才写 local / minio。见 storage.py。
+    backend: auto
+  uploads:
+    # auto（默认）= 听统一开关 storage.backend；要单独钉死这个域才写 local / minio。见 storage.py。
+    backend: auto
+
+
+retrieval:
+  # 只开 Milvus 那一路。2026-10-07 实测把 bm25 通道关掉（hybrid 的稀疏腿就是同一个内建
+  # BM25，同索引同 analyzer，再开一路只是把同一份证据在 L2 投两票：27 题 recall@8 完全一样，
+  # MRR 71.70%→71.43%、nDCG 75.58%→75.36%，关掉反而略好）；**2026-10-08 干脆把那个
+  # 通道删了** —— 关键词就在这一路里，不再是"同一个库的另一种搜法"。
+  # 图谱要用就照 base.yaml 里注释那样加一项（`--channel milvus,kg` 也能临时开）。
+  channels:
+    - name: milvus
+      type: milvus
+      enabled: true
+    # 图谱插件（pip install -e plugins/rag-channel-neo4j）：**默认关**，只是让名字可被选中，
+    # 想临时带上就 `rag search "…" --channel milvus,kg`；要长期开就把 enabled 改成 true。
+    - name: kg
+      type: neo4j
+      enabled: false
+      complement_only: true   # 只补位：与 milvus 那一路重复的候选丢掉
+      top_k: 10
+
+observability:
+  langsmith: false
+  project: multimodal_rag-dev
+
+api:
+  # auto（默认）= 听统一开关 storage.backend；要单独钉死这个域才写 local / minio。
+  media_backend: auto

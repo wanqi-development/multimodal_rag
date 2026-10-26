@@ -1,0 +1,30 @@
+# 黄金集：一行一个问题（JSONL，# 开头是注释）。
+# 字段说明见 eval/README.md。expected_* 的落点是**本机核对过的 chunk_id**，
+# 语料换了（换 embedding / 重灌）就要重新核对一遍 —— 不然指标掉的是「期望写歪了」。
+{"id": "flink-arch-sources", "question": "Flink 的架构图里画了哪些数据源？", "expected_chunk_ids": ["3481c48bcb813900:0032"], "answer_points": ["交易数据", "日志数据", "IOT 设备数据", "用户点击数据"], "tags": ["image", "flink"], "notes": "1.1.1 那张架构图的图片描述块（modality=image）"}
+{"id": "flink-savepoints", "question": "Flink 的 Save Points 是做什么用的？", "expected_chunk_ids": ["3481c48bcb813900:0019"], "answer_points": ["把任务执行的快照保存在存储介质上", "重启时可以从 Save Points 恢复原有的计算状态"], "tags": ["flink", "概念"]}
+{"id": "flink-lambda", "question": "书里讲大数据 Lambda 架构时提到了哪些问题？", "expected_chunk_ids": ["3481c48bcb813900:0012"], "tags": ["flink", "概念"]}
+{"id": "flink-scenes", "question": "Flink 有哪些应用场景？举几个数据源的例子", "expected_chunk_ids": ["3481c48bcb813900:0021"], "tags": ["flink", "概念"]}
+{"id": "flink-window", "question": "Flink 对窗口（Window）操作的支持有什么特点？", "expected_doc_ids": ["3481c48bcb813900"], "expected_headings": ["5. 支持高度灵活的窗口"], "tags": ["flink", "概念"]}
+{"id": "flink-batch-env", "question": "Flink 批处理和流处理的上下文环境有什么不同？", "expected_chunk_ids": ["705cb6dd2dee8bfc:0026"], "answer_points": ["批处理用 ExecutionEnvironment", "流处理用 StreamExecutionEnvironment"], "tags": ["flink", "代码"]}
+{"id": "flink-tuple", "question": "Flink 的 Java API 里怎么创建 Tuple2？", "expected_chunk_ids": ["705cb6dd2dee8bfc:0028"], "answer_points": ["new Tuple2 方式", "Tuple2.of 方式"], "tags": ["flink", "代码"]}
+{"id": "flink-returns", "question": "Flink Java API 里的 returns 方法是干什么的？", "expected_doc_ids": ["705cb6dd2dee8bfc"], "expected_headings": ["6. 关于Flink Java api 中的 returns"], "tags": ["flink", "代码"]}
+{"id": "flink-batch-case", "question": "Flink 批数据处理案例的代码大致怎么写？", "expected_doc_ids": ["705cb6dd2dee8bfc"], "expected_headings": ["2.3.1"], "tags": ["flink", "代码"]}
+{"id": "gokafka-library-version", "question": "kafka-go 的 LibraryVersion 函数返回什么？", "expected_chunk_ids": ["ab940250c879acee:0040"], "answer_points": ["返回底层 librdkafka 的版本", "返回 (int, string) 两个值"], "tags": ["kafka-go", "精确词"]}
+{"id": "gokafka-transactional", "question": "kafka-go 的事务生产者 API 提供什么保证？", "expected_chunk_ids": ["ab940250c879acee:0009"], "answer_points": ["exactly-once 语义", "基于幂等生产者实现"], "tags": ["kafka-go", "精确词"]}
+{"id": "gokafka-producer", "question": "kafka-go 里创建一个 Producer 的步骤是什么？", "expected_doc_ids": ["ab940250c879acee"], "expected_headings": ["Producer"], "tags": ["kafka-go", "精确词"]}
+{"id": "kafka-five-apis", "question": "Kafka 有哪五个核心 API？", "expected_chunk_ids": ["f07bff71f70f36ae:0011"], "answer_points": ["Producer API", "Consumer API", "Streams"], "tags": ["kafka", "精确词"]}
+{"id": "kafka-connect-step", "question": "Kafka 快速开始里的 Step 7 是做什么的？", "expected_chunk_ids": ["f07bff71f70f36ae:0053"], "tags": ["kafka", "章节定位"]}
+{"id": "kafka-security", "question": "Kafka 2.5 的安全章节包含哪些小节？", "expected_chunk_ids": ["f07bff71f70f36ae:0007"], "tags": ["kafka", "章节定位"]}
+{"id": "kafka-streams", "question": "Kafka 文档里 KAFKA STREAMS 这一章有哪些内容？", "expected_chunk_ids": ["f07bff71f70f36ae:0009"], "tags": ["kafka", "章节定位"]}
+{"id": "kafka-balance-leadership", "question": "broker 挂掉之后，Kafka 怎么做 leader 再平衡？", "expected_chunk_ids": ["f07bff71f70f36ae:0791"], "answer_points": ["broker 停止或崩溃时领导权转移给其他副本", "重启后只作为 follower"], "tags": ["kafka", "运维"]}
+{"id": "kafka-listener-name", "question": "Kafka 配置里 listener.name 这种前缀是干什么用的？", "expected_chunk_ids": ["f07bff71f70f36ae:0293", "f07bff71f70f36ae:0274"], "tags": ["kafka", "配置"], "notes": "第一次跑时我写的是 :0228，那是 control.plane.listener.name（控制器专用监听器），不是通用前缀 —— 期望写歪了，改这里"}
+{"id": "kafka-log-retention", "question": "Kafka 的日志保留时间由哪个配置项决定？", "expected_chunk_ids": ["f07bff71f70f36ae:0238", "f07bff71f70f36ae:0397"], "tags": ["kafka", "配置"], "notes": "语料是 OCR 出来的，配置名被拼成 log.retentionminutes / log.retention.ms，按 heading 找 log.retention 找不到；改成认这两块"}
+{"id": "kafka-topic-partition", "question": "Kafka 的 topic 和 partition 是什么关系？", "expected_doc_ids": ["f07bff71f70f36ae"], "expected_headings": ["Topics and Logs"], "tags": ["kafka", "概念"]}
+{"id": "docker-kafka-images", "question": "官方 Kafka 的 Docker 镜像有哪几种变体？", "expected_chunk_ids": ["b30c556a183cbb3e:0001", "b30c556a183cbb3e:0002"], "tags": ["docker", "章节定位"]}
+{"id": "docker-graalvm", "question": "GraalVM 那个 Kafka 原生镜像能用在生产吗？", "expected_chunk_ids": ["b30c556a183cbb3e:0002"], "answer_points": ["实验性的、只建议本地开发测试用", "从 3.8.0 起提供"], "tags": ["docker", "精确词"]}
+{"id": "off-topic-asyncio", "question": "Python 的 asyncio 协程怎么用？", "must_refuse": true, "tags": ["语料外"]}
+{"id": "flink-vs-spark", "question": "Flink 和 Spark 在批处理、流处理的定位上有什么不同？", "expected_chunk_ids": ["3481c48bcb813900:0000", "3481c48bcb813900:0032"], "tags": ["flink", "关系"], "notes": "关系类问题：图里有 Flink --不同于--> Spark 这类边，加它是为了给 graph 通道一个能体现价值的问题"}
+{"id": "flink-dependencies", "question": "写一个 Flink 程序要引入哪些依赖？", "expected_chunk_ids": ["705cb6dd2dee8bfc:0007"], "tags": ["flink", "代码"], "notes": "关系类问题：pom 里 flink 依赖 flink-clients 这类边"}
+{"id": "off-topic-k8s-rollout", "question": "Kubernetes 的 Deployment 怎么做滚动更新？", "must_refuse": true, "tags": ["语料外"]}
+{"id": "off-topic-price", "question": "Confluent 的商业支持报价是多少？", "must_refuse": true, "tags": ["语料外"]}

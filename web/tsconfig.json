@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+    "noEmit": true
+  },
+  "//": "只检查应用代码：vite.config.ts 是构建配置（在 Node 里跑、要 @types/node），别让 vue-tsc 管它。",
+  "include": ["src/**/*.ts", "src/**/*.vue"]
+}
