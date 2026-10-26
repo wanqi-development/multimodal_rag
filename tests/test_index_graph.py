@@ -59,9 +59,47 @@ class _Index:
         return len(chunks)
 
 
+class _VersionedIndex(_Index):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[tuple[str, list[str]]] = []
+
+    async def delete_docs(self, doc_ids: list[str]) -> None:
+        raise AssertionError("双版本写入不能先删旧块")
+
+    async def upsert_batch(self, chunks, vectors, *, batch_id: str) -> int:
+        ids = [chunk.chunk_id for chunk in chunks]
+        self.batches.append((batch_id, ids))
+        self.upserted.extend(ids)
+        return len(chunks)
+
+
 class _Registry:
     def __init__(self) -> None:
         self.records: list = []
+        self.batches: list[tuple[str, list[str]]] = []
+        self.failures: list[tuple[str, list[str], str]] = []
+
+    async def begin_index(self, batch_id: str, records) -> None:
+        items = list(records)
+        self.batches.append((batch_id, [record.doc_id for record in items]))
+
+    async def complete_index(self, batch_id: str, records) -> int:
+        items = [
+            record.model_copy(
+                update={
+                    "stage": "indexed",
+                    "index_batch_id": batch_id,
+                    "index_status": "active",
+                }
+            )
+            for record in records
+        ]
+        self.records.extend(items)
+        return len(items)
+
+    async def fail_index(self, batch_id: str, doc_ids: list[str], error: str) -> None:
+        self.failures.append((batch_id, list(doc_ids), error))
 
     async def upsert(self, records) -> None:
         self.records.extend(records)
@@ -107,9 +145,19 @@ def _confirm_all(tmp_path: Path) -> None:
         )
 
 
-def _run(settings, files, tmp_path, *, ocr=None, concurrency=None):
+def _run(
+    settings,
+    files,
+    tmp_path,
+    *,
+    ocr=None,
+    concurrency=None,
+    index=None,
+    registry=None,
+):
     store = build_artifact_store(settings)
-    index, registry = _Index(), _Registry()
+    index = index or _Index()
+    registry = registry or _Registry()
     result = asyncio.run(
         run_index_graph(
             settings,
@@ -148,6 +196,10 @@ def test_each_file_is_parsed_and_chunked_on_its_own(tmp_path: Path) -> None:
     assert len(result.pending) == 1
     assert index.upserted, "切出来的块写进了库"
     assert len(registry.records) == 1
+    record = registry.records[0]
+    assert record.index_status == "active"
+    assert record.index_batch_id
+    assert registry.batches == [(record.index_batch_id, [record.doc_id])]
 
 
 def test_one_broken_file_does_not_stop_the_others(tmp_path: Path) -> None:
@@ -173,6 +225,20 @@ def test_nothing_to_do_is_not_an_error(tmp_path: Path) -> None:
     result, _, _, _ = _run(settings, [], tmp_path)
 
     assert result.chunked == [] and result.written == 0
+
+
+def test_versioned_write_keeps_the_old_batch_until_complete(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    files = [_scan(tmp_path, "a.png")]
+    _run(settings, files, tmp_path)
+    _confirm_all(tmp_path)
+    index, registry = _VersionedIndex(), _Registry()
+
+    result, _, _, _ = _run(settings, files, tmp_path, index=index, registry=registry)
+
+    assert result.written > 0
+    assert index.batches and registry.records[0].index_status == "active"
+    assert registry.batches[0][0] == index.batches[0][0]
 
 
 def test_a_missing_artifact_keeps_the_whole_batch_out_of_the_index(tmp_path: Path) -> None:

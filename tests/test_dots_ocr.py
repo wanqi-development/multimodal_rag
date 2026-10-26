@@ -164,6 +164,16 @@ def test_unknown_prompt_mode_is_rejected() -> None:
         dots_module.build_dots(IngestDotsConfig(prompt_mode="prompt_不存在"))
 
 
+def test_missing_plugin_fails_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """核心包没装可选插件时，错误必须直接告诉人装哪一条。"""
+    monkeypatch.setattr(
+        dots_module, "_IMPORT_ERROR", ImportError("No module named rag_dots_parser")
+    )
+
+    with pytest.raises(dots_module.DotsOcrError, match="pip install -e plugins/rag-dots-parser"):
+        dots_module.build_dots(IngestDotsConfig())
+
+
 # ---- loader 串起来 ----
 
 

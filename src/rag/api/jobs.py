@@ -66,11 +66,18 @@ class JobStore:
         job.updated_at = int(time.time())
         with self._lock:
             self._jobs[job.id] = job
-        await self._redis.put(
+        stored = await self._redis.put(
             f"{self._redis.prefix}job:{job.id}",
             job.model_dump(mode="json"),
             ttl_s=JOB_TTL_S,
         )
+        if stored:
+            await self._redis.zadd(
+                f"{self._redis.prefix}job:index",
+                job.id,
+                score=float(job.updated_at),
+                ttl_s=JOB_TTL_S * 2,
+            )
 
     async def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -81,12 +88,30 @@ class JobStore:
         return Job.model_validate(payload) if payload else None
 
     async def list(self, *, limit: int = 20) -> list[Job]:
-        """最近的任务，新的在前（页面「任务」列表用它）。
-
-        **只看本进程内存**：内存里有就是最新的（本进程写的）。多 worker 那一天这里要
-        扩成「内存 + Redis 扫 `job:*`」—— 现在单 worker，内存里的就是全部，
-        不假装能看见别人进程的任务。
-        """
+        """最近的任务，新的在前；Redis 可用时合并其他 worker 的任务。"""
         with self._lock:
-            items = sorted(self._jobs.values(), key=lambda job: job.created_at, reverse=True)
-        return items[:limit]
+            local = list(self._jobs.values())
+        if not self._redis.available:
+            return sorted(
+                local,
+                key=lambda job: (job.created_at, job.updated_at),
+                reverse=True,
+            )[:limit]
+
+        ids = await self._redis.zrevrange(
+            f"{self._redis.prefix}job:index",
+            start=0,
+            end=max(limit * 3, limit) - 1,
+        )
+        found: dict[str, Job] = {job.id: job for job in local}
+        for job_id in ids:
+            if job_id in found:
+                continue
+            payload = await self._redis.get(f"{self._redis.prefix}job:{job_id}")
+            if payload:
+                found[job_id] = Job.model_validate(payload)
+        return sorted(
+            found.values(),
+            key=lambda job: (job.created_at, job.updated_at),
+            reverse=True,
+        )[:limit]

@@ -39,6 +39,7 @@ from rag.contracts import Chunk, Document
 from rag.ingest.assets import build_asset_store, context_for_marker, markers_in, position_at
 from rag.ingest.chunkers.base import make_chunk
 from rag.ingest.loaders.base import SkippedFile
+from rag.storage import BlobNotFound, BlobStore, build_blob_store, resolve_storage_backend
 
 if TYPE_CHECKING:
     from rag.providers.vision import VisionClient
@@ -71,7 +72,7 @@ def describe_images(
         )
 
     store = build_asset_store(settings)
-    cache = _DescriptionCache(Path(cfg.cache_path))
+    cache = build_description_cache(settings)
     described: list[Chunk] = []
     failed: list[SkippedFile] = []
     # 钱的口子：生成这么几条描述就停。两条口径写清楚，免得下次有人以为它是 bug：
@@ -125,7 +126,7 @@ def describe_images(
 
 
 def _describe(
-    cache: _DescriptionCache,
+    cache: _DescriptionCache | _BlobDescriptionCache,
     client: VisionClient,
     data: bytes,
     asset_uri: str,
@@ -266,6 +267,45 @@ class _DescriptionCache:
         if self._data is None:
             self._data = _read_cache(self._path)
         return self._data
+
+
+class _BlobDescriptionCache:
+    """多 worker 共享缓存：一个键一个对象，不需要读改写整份 JSON。"""
+
+    def __init__(self, store: BlobStore, prefix: str) -> None:
+        self._store = store
+        self._prefix = prefix.strip("/")
+
+    def _key(self, key: str) -> str:
+        return f"{self._prefix}/{key.replace(':', '/')}.json"
+
+    def get(self, key: str) -> str | None:
+        try:
+            payload = json.loads(self._store.get_text(self._key(key)))
+        except (BlobNotFound, ValueError, OSError, UnicodeDecodeError):
+            return None
+        text = payload.get("text") if isinstance(payload, dict) else None
+        return text if isinstance(text, str) and text else None
+
+    def put(self, key: str, text: str) -> None:
+        self._store.put_text(
+            self._key(key),
+            json.dumps({"text": text, "at": int(time.time())}, ensure_ascii=False),
+        )
+
+    def save(self) -> None:
+        return None
+
+
+def build_description_cache(settings: Settings) -> _DescriptionCache | _BlobDescriptionCache:
+    cfg = settings.ingest.images
+    if resolve_storage_backend(settings, cfg.cache_backend) == "minio":
+        store = build_blob_store(
+            backend="minio",
+            settings=settings,
+        )
+        return _BlobDescriptionCache(store, cfg.cache_prefix)
+    return _DescriptionCache(Path(cfg.cache_path))
 
 
 def _lock_for(path: Path) -> threading.Lock:

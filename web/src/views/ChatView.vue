@@ -493,7 +493,19 @@ function onCite(turn: Turn, event: MouseEvent): void {
   if (!(target instanceof HTMLElement)) return
   const index = Number(target.dataset.cite)
   const cite = turn.citations.find((item) => item.index === index)
-  if (cite) void openChunk(cite.chunk_id)
+  if (!cite) return
+  if (cite.url) {
+    try {
+      const url = new URL(cite.url)
+      if (url.protocol === 'http:' || url.protocol === 'https:') {
+        window.open(url.href, '_blank', 'noopener,noreferrer')
+      }
+    } catch {
+      // 非法 URL 不打开，也不退回拿空 chunk_id 去查原文
+    }
+    return
+  }
+  if (cite.chunk_id) void openChunk(cite.chunk_id)
 }
 
 onMounted(() => {

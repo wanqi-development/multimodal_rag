@@ -54,9 +54,9 @@ scripts\demo.cmd -DryRun         # 只看它要做什么，一个字都不写
 |---|---|
 | 工具面 | 只有 **4 个**工具：`search_knowledge`（**一次调用 = 一整轮融合检索**：所有启用通道并发 + RRF 融合 + 精排，`modality` 用来只看某类块）/ `list_documents` / `get_section` / `web_search_tool`。**刻意不做 subagent** —— 通道的并发与融合本来就在检索层做完，让模型分头调、再用文字拼结果，等于把 RRF 的分数换成模型的印象 |
 | 网络兜底 | 只当兜底，而且靠**机制**管、不靠"不给它工具"：`WebSearchGate` 在语料没查过、或语料已有结果时直接拒绝这次调用并回理由 |
-| 人在环（HITL） | 四个写类工具（`write_file` / `edit_file` / `delete` / `execute`）各挂一道闸门；中断与恢复走 LangGraph 原生协议（`Command(resume={"decisions": [...]})`），**跨进程**可用（CLI 一次进程、HTTP 一次请求都行）。CLI 中断退出码是 `3`，与真失败（`1`）分开，脚本里能一句话分辨 |
+| 工具策略与人在环（HITL） | `ToolPolicyMiddleware` 在模型请求阶段裁掉禁用工具，并在执行阶段硬拒绝越权调用；`readonly` 只开放知识工具和只读文件工具，`report` 额外开放 `write_file` / `edit_file`，`task` / `delete` / `execute` 始终禁用。两个允许的写工具各挂 HITL 闸门；中断与恢复走 LangGraph 原生协议（`Command(resume={"decisions": [...]})`），**跨进程**可用（CLI 一次进程、HTTP 一次请求都行）。CLI 中断退出码是 `3`，与真失败（`1`）分开，脚本里能一句话分辨 |
 | 流式 | `stream_mode=["messages", "updates"]` → SSE 四类事件 `token` / `tool` / `interrupt` / `done`；靠 `checkpoint_ns` 把子图 token 滤掉，不把中间话术当答案吐给用户 |
-| 引用编号 | `CitationRegistry` 发全局递增的 `[n]`：工具返回的每条命中拿号并登记，答案里的 `[n]` 直接查表；返回给调用方时只列答案**真的引用到**的那些（召回 20 条只用 3 条时，全塞回去就看不出哪条支撑哪句话）。引用表按会话存 PG —— 答案是中断恢复**之后**才生成的，用的还是中断前发的号 |
+| 引用编号 | `EvidenceLedger` 发全局递增的 `[n]`：语料块和网页结果进同一张证据表，答案里的 `[n]` 直接查表；返回给调用方时只列答案**真的引用到**的那些（召回 20 条只用 3 条时，全塞回去就看不出哪条支撑哪句话）。引用表按会话存 PG —— 答案是中断恢复**之后**才生成的，用的还是中断前发的号 |
 | 记忆与技能 | PG checkpointer（会话 / HITL 中断）+ store（跨会话记忆）；`workspace/AGENTS.md` 挂成 memory；skills 按需加载，两个源（包内 `src/rag/agent/skills/` + 用户目录，同名以用户为准） |
 | 编排 | LangGraph 两张图，都**只做编排**：`QueryGraph`（plan → 并行通道 → 融合 → 精排 → **评分不够就改写重查**）与 `IndexGraph`（解析 / 切分 / 入库三段断点续跑） |
 
@@ -106,6 +106,7 @@ Python **3.13**（`pyproject.toml` 锁了 `>=3.13,<3.14`；langgraph 官方声�
 conda create -n multi_modal_rag python=3.13
 conda activate multi_modal_rag
 pip install -e . --group dev     # 含 pytest / ruff；要跑评测再加 --extra eval
+pip install -e plugins/rag-dots-parser --no-deps  # 默认 PDF parser=dots
 rag --help                       # CLI 入口
 ```
 
@@ -131,6 +132,16 @@ cp .env.example .env             # Windows: Copy-Item .env.example .env
 
 想看最终生效的是什么，用 `rag config`。
 
+部署档位 `RAG_DEPLOYMENT_PROFILE` 有三档：
+
+| profile | 必需后端 | 说明 |
+|---|---|---|
+| `single-node` | SQLite + local | 默认；单进程 |
+| `server` | PostgreSQL | 单 worker；文件可 local 或 MinIO |
+| `scale-out` | PostgreSQL + MinIO + Redis | 总副本数 `max(workers, replicas) >= 2`；任务、灌库闸门、VLM 缓存共享 |
+
+`scale-out` 启动前会校验后端组合，不会静默退回单进程。模型仍会在每个 worker 各加载一份。
+
 ### 3. 依赖服务
 
 | 服务 | 必需？ | 起法 |
@@ -139,7 +150,7 @@ cp .env.example .env             # Windows: Copy-Item .env.example .env
 | OCR 产线 | 扫描件才要 | `deploy/paddleocr-vl.yaml`，按 `RAG_PDF_PARSER` 选一个（dots / mineru / paddleocr） |
 | PostgreSQL | 不要（单机走 SQLite） | 多 worker / 多机才配 `RAG_PG_URL` |
 | MinIO | 不要（单机走本地盘） | 多 worker 才把 `RAG_STORAGE_BACKEND` 切 `minio` |
-| Redis / Neo4j | 不要 | 分别是限流+任务状态、知识图谱通道 |
+| Redis / Neo4j | `scale-out` 要 Redis；Neo4j 不要 | Redis 管限流、跨 worker 任务列表、灌库槽位；Neo4j 是可选图谱通道 |
 
 ### 4. 本地模型
 
@@ -171,6 +182,10 @@ scripts\windows\frontend.cmd   ./scripts/linux/frontend.sh
 生产用 `cd web && pnpm.cmd build`（或 `npm.cmd run build`）再 `rag serve` —— 它会自动把
 `web/dist` 挂到 `/`，一个进程就够。
 
+多 worker：先设置 `RAG_DEPLOYMENT_PROFILE=scale-out`、`RAG_API_WORKERS=2`，再
+`rag serve --workers 2`。两个单 worker 容器则设 `RAG_DEPLOYMENT_REPLICAS=2`；
+`--reload` 与多 worker 不能同时开。
+
 ### 6. 灌第一批语料
 
 页面上是四步：**上传 / 导入 → 解析 → 核对大纲 → 切分并入库**。命令行等价：
@@ -195,7 +210,7 @@ rag agent  "Flink 的 Savepoint 是什么"  # 对话式 agent（多轮加 --thre
 | `rag search` / `rag ask` / `rag agent` | 检索 / 带引用问答 / 对话式 agent |
 | `rag serve` | 起 FastAPI 服务（有 `web/dist` 就一并托管页面） |
 | `rag eval` | 跑黄金集（`--judge` 再加生成侧判定，花钱） |
-| `rag registry` / `rag storage` / `rag models` | 文档注册表 / 文件落点（含把本地已有文件推上桶）/ 模型选型 |
+| `rag registry` / `rag storage` / `rag models` | 文档注册表（含 `reconcile` 索引对账与 `prune` 旧版本清理）/ 文件落点（含把本地已有文件推上桶）/ 模型选型 |
 | `rag logs` / `rag chats` / `rag sessions` | 日志 / UI 会话记录 / LangGraph 会话 |
 | `rag graph` | 知识图谱通道（**由插件提供**，默认关） |
 
@@ -217,16 +232,17 @@ src/rag/
   providers/    chat / vision / asr / embedding / rerank / OCR 的适配
   storage.py    文件落点门面：本地盘 或 MinIO 桶，键的写法两边一致
 web/            Vue 3 + TypeScript + Vite 前端（没引 UI 组件库）
-plugins/        两个扩展点（检索通道 / CLI 命令）的现成样板：rag-channel-neo4j
+plugins/        三个扩展点（检索通道 / CLI 命令 / PDF parser）的样板：
+                rag-channel-neo4j、rag-dots-parser
 config/         base.yaml 与 dev.yaml（值放 .env）
 deploy/         Milvus 与 OCR 产线的 compose
 eval/           黄金集（跑出来的报告落在 eval/reports/，不进库）
-tests/          pytest（915 个用例；需要真 Milvus / OCR 的集成用例默认跳过）
+tests/          pytest（953 个用例；需要真 Milvus / OCR 的集成用例默认跳过）
 ```
 
-> `src/rag/ingest/dots_ocr/` 是 **dots.ocr 官方仓库整包拿过来的第三方样例代码**（含它自己的
+> `plugins/rag-dots-parser/` 是 **dots.ocr 官方仓库整包拿过来的第三方样例代码**（含它自己的
 > tools 与演示脚本），不是本仓库写的；我们只通过 `ingest/dots.py` 这个薄客户端调它，
-> 所以它被排除在 lint / format 之外（见 `pyproject.toml` 的 `extend-exclude`）。
+> 所以它是可选插件包，第三方目录仍排除在 lint / format 之外（见 `pyproject.toml`）。
 
 ## 已知边界
 
@@ -249,6 +265,8 @@ python -m ruff format --check
 
 cd web && pnpm.cmd dev        # 前端开发模式（热更新）
 cd web && pnpm.cmd build      # 出 web/dist，交给 rag serve 托管
+python scripts/generate_openapi_types.py          # 后端 schema → 前端 TS 类型
+python scripts/generate_openapi_types.py --check  # CI 检查类型是否漂移
 ```
 
 ## 文档
@@ -258,7 +276,7 @@ cd web && pnpm.cmd build      # 出 web/dist，交给 rag serve 托管
 | [docs/results.md](docs/results.md) | 实测数字汇总：口径、逐题清单、工程侧实测（每张表都指向论证出处） |
 | [docs/architecture.md](docs/architecture.md) | 主文档：分层设计、配置体系、每个决策的理由（ADR）与验证清单 |
 | [docs/milvus-schema-design.md](docs/milvus-schema-design.md) | collection / 字段 / 索引为什么是现在这样 |
-| [docs/plugins.md](docs/plugins.md) | "按名字找实现"的插件约定（通道 + CLI 两个扩展点） |
+| [docs/plugins.md](docs/plugins.md) | 插件约定（通道、CLI 命令与可选 PDF parser） |
 
 ## 许可
 

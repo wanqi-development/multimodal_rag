@@ -15,9 +15,11 @@ from rag.contracts import AssembledContext, ChannelStats, Chunk, ScoredChunk
 from rag.graphs.query import (
     MAX_SUB_QUERIES,
     build_query_graph,
+    build_query_preflight,
     normalise_plan,
     parse_json_object,
     run_query_graph,
+    run_query_preflight,
 )
 
 
@@ -143,6 +145,29 @@ def test_a_good_grade_goes_straight_to_generate() -> None:
     assert retriever.calls[0]["query"] == "问题改写", "检索用的是计划改写后的查询"
     assert len(planner.prompts) == 1 and len(grader.prompts) == 1
     assert "资料" in grader.prompts[0], "grade 拿到的 prompt 里要有候选内容"
+
+
+def test_preflight_stops_after_assemble_without_generating() -> None:
+    """流式生成前只要检索上下文；generate 不能在图里被偷偷调一次。"""
+    settings = _settings()
+    retriever = _Retriever([["a", "b"]])
+    planner = _Json({"sub_queries": ["问题改写"]})
+    grader = _Json({"score": 0.9, "missing": ""})
+    graph = build_query_preflight(
+        settings,
+        retrieve=retriever,
+        plan_llm=planner,
+        grade_llm=grader,
+        channels=["milvus"],
+    )
+
+    result = asyncio.run(run_query_preflight(graph, "原问题", top_k=5))
+
+    assert result["rounds"] == 1
+    assert result["grade"]["score"] == 0.9
+    assert [hit.chunk.chunk_id for hit in result["hits"]] == ["a", "b"]
+    assert "[1]" in result["context"].text
+    assert result["context"].citations[0].chunk_id == "a"
 
 
 def test_a_low_grade_rewrites_and_retries_with_the_missing_note() -> None:

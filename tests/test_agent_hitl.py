@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
+from pydantic import PrivateAttr
 
 from rag.agent import (
     CitationRegistry,
@@ -61,14 +62,57 @@ class _ToolCallingModel(BaseChatModel):
         )
 
 
+class _RecordingModel(BaseChatModel):
+    """记录模型实际绑定的工具；把策略过滤后的可见面留在测试里。"""
+
+    _seen_tools: list[list[str]] = PrivateAttr(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-recording"
+
+    def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        names = []
+        for tool in tools:
+            name = tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
+            if isinstance(name, str):
+                names.append(name)
+        self._seen_tools.append(names)
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="答案"))])
+
+
+class _ExecuteCallingModel(_ToolCallingModel):
+    """第一条消息请求执行命令；策略应在 HITL 之前拒绝。"""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        tool_messages = [item for item in messages if getattr(item, "type", "") == "tool"]
+        if tool_messages:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(content=f"工具结果：{tool_messages[-1].content}")
+                    )
+                ]
+            )
+        call = {"name": "execute", "args": {"command": "whoami"}, "id": "call-x"}
+        return ChatResult(
+            generations=[
+                ChatGeneration(message=AIMessage(content="我先执行命令", tool_calls=[call]))
+            ]
+        )
+
+
 class _Heavy:
     """只满足 `build_agent` 的取用：模型给假的，检索那三件只要「有」。"""
 
-    def __init__(self) -> None:
+    def __init__(self, model: BaseChatModel | None = None) -> None:
         self.index = object()
         self.embedder = object()
         self.reranker = None
-        self.chat = _ToolCallingModel()
+        self.chat = model or _ToolCallingModel()
         self.generator = object()
         self.errors: dict[str, str] = {}
 
@@ -112,8 +156,8 @@ def test_default_workspace_follows_the_config(tmp_path: Path) -> None:
     assert default_workspace(settings) is None, "关掉写盘就该回到批次 A 的只读"
 
 
-def test_the_gate_covers_every_write_tool(tmp_path: Path, monkeypatch) -> None:
-    """写盘 / 执行这四类**一个都不能漏** —— 漏一个就是一个能改磁盘的洞。"""
+def test_the_gate_covers_every_policy_allowed_write_tool(tmp_path: Path, monkeypatch) -> None:
+    """HITL 只接策略允许的写工具；delete / execute 在更前面的策略层直接拒绝。"""
     from deepagents.backends import CompositeBackend
 
     captured: dict = {}
@@ -129,8 +173,8 @@ def test_the_gate_covers_every_write_tool(tmp_path: Path, monkeypatch) -> None:
     build_agent(_settings(tmp_path), _Heavy(), workspace=workspace)
 
     assert isinstance(captured["backend"], CompositeBackend), "/workspace/ 要路由到真磁盘"
-    assert set(captured["interrupt_on"]) == {"write_file", "edit_file", "delete", "execute"}
-    assert all(captured["interrupt_on"].values()), "四个都要挂闸门，没有例外"
+    assert set(captured["interrupt_on"]) == {"write_file", "edit_file"}
+    assert all(captured["interrupt_on"].values()), "允许的写工具都要挂闸门，没有例外"
     assert captured["memory"] is None, "没有 AGENTS.md 就不该挂一个不存在的路径"
     assert workspace.is_dir()
 
@@ -151,6 +195,60 @@ def test_without_a_workspace_nothing_is_gated_because_nothing_writes(
 
     assert captured["interrupt_on"] is None
     assert captured["memory"] is None
+
+
+def test_compiled_graph_exposes_only_policy_tools(tmp_path: Path) -> None:
+    readonly_model = _RecordingModel()
+    readonly_graph, readonly_registry = build_agent(
+        _settings(tmp_path),
+        _Heavy(readonly_model),
+    )
+    asyncio.run(
+        run_agent(
+            readonly_graph,
+            "只读问题",
+            registry=readonly_registry,
+            thread_id="readonly",
+        )
+    )
+
+    readonly_tools = set(readonly_model._seen_tools[-1])
+    assert {"search_knowledge", "read_file", "grep"} <= readonly_tools
+    assert {"task", "write_file", "edit_file", "delete", "execute"}.isdisjoint(readonly_tools)
+
+    report_model = _RecordingModel()
+    report_graph, report_registry = build_agent(
+        _settings(tmp_path),
+        _Heavy(report_model),
+        workspace=tmp_path / "workspace-report",
+    )
+    asyncio.run(
+        run_agent(
+            report_graph,
+            "写报告",
+            registry=report_registry,
+            thread_id="report",
+        )
+    )
+
+    report_tools = set(report_model._seen_tools[-1])
+    assert {"write_file", "edit_file"} <= report_tools
+    assert {"task", "delete", "execute"}.isdisjoint(report_tools)
+
+
+def test_policy_denial_happens_before_hitl(tmp_path: Path) -> None:
+    agent = build_agent(
+        _settings(tmp_path),
+        _Heavy(_ExecuteCallingModel()),
+        checkpointer=InMemorySaver(),
+        workspace=tmp_path / "workspace",
+    )[0]
+
+    result = _run(agent)
+
+    assert result.status == "answered", "策略拒绝不该进入等人批准"
+    assert result.interrupt is None
+    assert "execute" in result.answer and "不可用" in result.answer
 
 
 def test_agents_md_becomes_the_agents_memory(tmp_path: Path, monkeypatch) -> None:
@@ -368,9 +466,12 @@ def test_the_stream_ends_with_done_and_the_cited_sources(tmp_path: Path) -> None
 def test_the_tool_event_carries_the_arguments_and_a_duration(tmp_path: Path) -> None:
     """工具事件不能只有个名字 —— 时间线上「它查了什么词 / 要写哪个文件」全靠参数，
     而「这一步值不值得等」靠耗时。参数在 AIMessage 的 `tool_calls` 上，不在 ToolMessage 上。"""
-    agent = _agent(tmp_path, None)
+    agent = _agent(tmp_path, tmp_path / "workspace")
+    assert _drain(agent)[-1]["type"] == "interrupt", "先撞一次写盘闸门"
 
-    tool = next(event for event in _drain(agent) if event["type"] == "tool")
+    tool = next(
+        event for event in _drain_resume(agent, [{"type": "approve"}]) if event["type"] == "tool"
+    )
 
     assert tool["name"] == "write_file" and tool["status"] == "success"
     assert tool["args"] == {"file_path": FILE, "content": "报告正文"}

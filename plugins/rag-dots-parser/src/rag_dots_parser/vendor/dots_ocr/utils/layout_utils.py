@@ -4,9 +4,9 @@ from io import BytesIO
 import fitz
 from PIL import Image
 
-from rag.ingest.dots_ocr.utils.consts import MAX_PIXELS, MIN_PIXELS
-from rag.ingest.dots_ocr.utils.image_utils import smart_resize
-from rag.ingest.dots_ocr.utils.output_cleaner import OutputCleaner
+from rag_dots_parser.vendor.dots_ocr.utils.consts import MAX_PIXELS, MIN_PIXELS
+from rag_dots_parser.vendor.dots_ocr.utils.image_utils import smart_resize
+from rag_dots_parser.vendor.dots_ocr.utils.output_cleaner import OutputCleaner
 
 # Define a color map (using RGBA format)
 dict_layout_type_to_color = {

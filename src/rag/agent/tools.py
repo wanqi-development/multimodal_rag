@@ -15,22 +15,22 @@
 1. **返回紧凑结构**（编号 + 定位 + 截断正文）。agent 的 state 会被序列化进 PG
    （`checkpoints` / `checkpoint_blobs`），一次返回 8 块千字正文既吃上下文也吃库。
 2. **引用编号由我们发**，不是模型编。每次工具调用返回的条目拿到**全局递增**的 `[n]`，
-   同时把 `n → Citation` 记进 `CitationRegistry`；最终答案里的 `[n]` 直接查这张表 ——
+   同时把 `n → Citation` 记进 `EvidenceLedger`；最终答案里的 `[n]` 直接查这张表 ——
    否则模型自己编的编号与我们的引用表必然对不上。
-3. **只读**。批次 A 里没有写盘/执行工具（用的是 StateBackend，写也只落在内存 state 里），
-   `execute` 更是无从谈起（没有 shell 后端）。
+3. **这四个业务工具只读**。文件工具由 deepagents backend 提供；ToolPolicy 先决定
+   哪些能力可见，给了 workspace 时 `write_file` / `edit_file` 再由 HITL 拦住。
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 
 from rag.config.schema import Settings
-from rag.contracts import Citation
+from rag.contracts import EvidenceLedger
 
 # 每条命中给模型看的正文上限：够判断相关性，又不至于把上下文吃光
 SNIPPET_CHARS = 320
@@ -41,41 +41,7 @@ SECTION_CHARS = 2000
 MAX_SECTIONS = 5
 
 
-@dataclass
-class CitationRegistry:
-    """本次问答的引用表：工具发号，答案里的 `[n]` 靠它翻译回真实来源。
-
-    ``order`` 只用来还原「第一次被引用」的顺序（返回给前端的引用列表按它排）。
-    """
-
-    items: dict[int, Citation] = field(default_factory=dict)
-
-    def issue(self, *, chunk_id: str, source_uri: str, snippet: str, heading_path: str = "") -> int:
-        """发一个新号。**同一个 chunk 复用同一个号** —— 同一个来源在答案里出现两次
-        不该占两个编号。"""
-        for number, item in self.items.items():
-            if item.chunk_id == chunk_id:
-                return number
-        number = len(self.items) + 1
-        self.items[number] = Citation(
-            index=number,
-            chunk_id=chunk_id,
-            source_uri=source_uri,
-            snippet=snippet,
-            heading_path=heading_path,
-        )
-        return number
-
-    def cited_in(self, answer: str) -> list[Citation]:
-        """答案里**真的被引用到**的那些（按编号排）。
-
-        只返回被引用的：模型可能召回了 20 条只用了 3 条，把 20 条都塞给前端会让
-        「哪条支撑了哪句话」变得看不出来。
-        """
-        import re
-
-        used = {int(match) for match in re.findall(r"\[(\d+)\]", answer)}
-        return [self.items[number] for number in sorted(used) if number in self.items]
+CitationRegistry = EvidenceLedger
 
 
 @dataclass
@@ -179,7 +145,7 @@ def build_tools(
                 f"\n\n（提示：以上结果的最高分只有 {best:.3f}，"
                 f"低于「算作相关」的阈值 {settings.agent.web_min_corpus_score} —— "
                 "语料里很可能没有这个问题的内容：可以换关键词再试，"
-                "或者派 web-researcher 查网络。）"
+                "或者按规则调用 web_search_tool 查网络。）"
             )
         return text
 
@@ -232,7 +198,7 @@ def build_tools(
         list_documents,
         get_section,
         # key 由它自己从 Secrets 取（见函数说明）：build_tools 不该被塞一堆机密
-        build_web_search_tool(settings, gate=gate),
+        build_web_search_tool(settings, gate=gate, registry=registry),
     ]
 
 
@@ -322,7 +288,11 @@ def _section(
 
 
 def build_web_search_tool(
-    settings: Settings, secrets: Any = None, *, gate: WebSearchGate | None = None
+    settings: Settings,
+    secrets: Any = None,
+    *,
+    gate: WebSearchGate | None = None,
+    registry: EvidenceLedger | None = None,
 ) -> BaseTool:
     """智谱 web 搜索工具（使用者自研，M6 接进来）。
 
@@ -398,15 +368,17 @@ def build_web_search_tool(
         if not result:
             return "搜索无结果。"
 
-        # 实际返回 list[SearchResultResp]，逐条格式化为可读文本。
+        # 实际返回 list[SearchResultResp]。网络结果和语料块登记进同一张证据表，
+        # 模型用同一个 [n] 引用，前端与评测也拿到同一种来源形状。
+        ledger = registry or EvidenceLedger()
         parts = []
         for item in result:
             title = item.title or "(无标题)"
             content = (item.content or "").strip()
             meta = "、".join(x for x in (item.media, item.publish_date) if x)
-            refer = f"[{item.refer}] " if item.refer else ""
+            number = ledger.issue_web(url=str(item.link or ""), title=str(title), snippet=content)
             link = f"\n链接：{item.link}" if item.link else ""
-            head = f"{refer}{title}" + (f"（{meta}）" if meta else "")
+            head = f"[{number}] 来自网络 · {title}" + (f"（{meta}）" if meta else "")
             parts.append(f"{head}\n{content}{link}")
         return "\n\n".join(parts)
 

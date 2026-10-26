@@ -4,19 +4,19 @@ import os
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
-from model.inference import inference_with_vllm
+from rag_dots_parser.vendor.dots_ocr.model.inference import inference_with_vllm
 from tqdm import tqdm
 
-from rag.ingest.dots_ocr.utils.consts import MAX_PIXELS, MIN_PIXELS, image_extensions
-from rag.ingest.dots_ocr.utils.doc_utils import load_images_from_pdf
-from rag.ingest.dots_ocr.utils.format_transformer import layoutjson2md
-from rag.ingest.dots_ocr.utils.image_utils import fetch_image, get_image_by_fitz_doc, smart_resize
-from rag.ingest.dots_ocr.utils.layout_utils import (
+from rag_dots_parser.vendor.dots_ocr.utils.consts import MAX_PIXELS, MIN_PIXELS, image_extensions
+from rag_dots_parser.vendor.dots_ocr.utils.doc_utils import load_images_from_pdf
+from rag_dots_parser.vendor.dots_ocr.utils.format_transformer import layoutjson2md
+from rag_dots_parser.vendor.dots_ocr.utils.image_utils import fetch_image, get_image_by_fitz_doc, smart_resize
+from rag_dots_parser.vendor.dots_ocr.utils.layout_utils import (
     draw_layout_on_image,
     post_process_output,
     pre_process_bboxes,
 )
-from rag.ingest.dots_ocr.utils.prompts import dict_promptmode_to_prompt
+from rag_dots_parser.vendor.dots_ocr.utils.prompts import dict_promptmode_to_prompt
 
 
 class DotsOCRParser:

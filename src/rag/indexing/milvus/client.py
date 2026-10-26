@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from functools import cached_property
 from typing import Any
@@ -43,9 +44,16 @@ class MilvusIndex:
     pymilvus 是同步客户端，所有调用都扔进线程池，别堵事件循环。
     """
 
-    def __init__(self, cfg: VectorIndexConfig, dim: int) -> None:
+    def __init__(
+        self,
+        cfg: VectorIndexConfig,
+        dim: int,
+        *,
+        include_batch_id: bool = False,
+    ) -> None:
         self._cfg = cfg
         self._dim = dim
+        self._include_batch_id = include_batch_id
         self.name = f"milvus:{cfg.collection}"
 
     @property
@@ -59,6 +67,14 @@ class MilvusIndex:
     @cached_property
     def _client(self) -> MilvusClient:
         return MilvusClient(uri=self._cfg.uri, token=self._cfg.token, timeout=_SYNC_TIMEOUT_S)
+
+    @property
+    def _output_fields(self) -> list[str]:
+        fields = list(_OUTPUT_FIELDS)
+        if self._include_batch_id:
+            fields.append("index_batch_id")
+            fields.append("logical_chunk_id")
+        return fields
 
     # ---- 生命周期 ----
 
@@ -84,14 +100,24 @@ class MilvusIndex:
         if not self._client.has_collection(self._cfg.collection):
             self._client.create_collection(
                 self._cfg.collection,
-                schema=build_schema(self._cfg, self._dim),
+                schema=build_schema(
+                    self._cfg,
+                    self._dim,
+                    include_batch_id=self._include_batch_id,
+                ),
                 index_params=build_index_params(self._client, self._cfg),
             )
         # 带 index_params 建表时 Milvus 会自动 load；对已存在的 collection 则要显式 load。
         # 实测重复 load 不报错，所以无条件调用，省掉一次状态判断。
         self._client.load_collection(self._cfg.collection)
 
-    async def get_chunks(self, chunk_ids: list[str]) -> list[Chunk]:
+    async def get_chunks(
+        self,
+        chunk_ids: list[str],
+        *,
+        logical: bool = False,
+        filter_expr: str | None = None,
+    ) -> list[Chunk]:
         """按主键批量取块（**图通道**用它把「关系命中的 chunk_id」换回正文）。
 
         只读一次 query、不 embed：图谱那边只给得出 chunk_id，正文还在 Milvus 里。
@@ -101,13 +127,27 @@ class MilvusIndex:
             return []
         rows: list[dict[str, Any]] = []
         for batch in _batched(ids, UPSERT_BATCH):
-            rows.extend(await asyncio.to_thread(self._query_chunks, batch))
+            rows.extend(
+                await asyncio.to_thread(
+                    self._query_chunks,
+                    batch,
+                    "logical_chunk_id" if logical else "chunk_id",
+                    filter_expr,
+                )
+            )
         return [_to_chunk(row) for row in rows]
 
-    def _query_chunks(self, chunk_ids: list[str]) -> list[dict[str, Any]]:
-        expr = "chunk_id in [" + ", ".join(f'"{cid}"' for cid in chunk_ids) + "]"
+    def _query_chunks(
+        self,
+        chunk_ids: list[str],
+        field: str = "chunk_id",
+        filter_expr: str | None = None,
+    ) -> list[dict[str, Any]]:
+        expr = f"{field} in [" + ", ".join(f'"{cid}"' for cid in chunk_ids) + "]"
+        if filter_expr:
+            expr = f"({expr}) and ({filter_expr})"
         return self._client.query(
-            self._cfg.collection, filter=expr, output_fields=_OUTPUT_FIELDS, **STRONG
+            self._cfg.collection, filter=expr, output_fields=self._output_fields, **STRONG
         )
 
     async def drop(self) -> None:
@@ -119,6 +159,9 @@ class MilvusIndex:
             self._client.release_collection(self._cfg.collection)
             self._client.drop_collection(self._cfg.collection)
 
+    async def has_collection(self) -> bool:
+        return await asyncio.to_thread(self._client.has_collection, self._cfg.collection)
+
     async def count(self) -> int:
         rows = await asyncio.to_thread(
             self._client.query,
@@ -129,12 +172,48 @@ class MilvusIndex:
         )
         return int(rows[0]["count(*)"])
 
+    async def get_doc_chunks(
+        self,
+        doc_id: str,
+        *,
+        extra_filter: str | None = None,
+    ) -> list[Chunk]:
+        """按 doc_id 取全部块：对账要比块数、chunk_id 与内容指纹。"""
+        rows = await asyncio.to_thread(self._query_doc_chunks, doc_id, extra_filter)
+        return [_to_chunk(row) for row in rows]
+
+    def _query_doc_chunks(
+        self,
+        doc_id: str,
+        extra_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        expr = f"doc_id == {json.dumps(doc_id, ensure_ascii=False)}"
+        if extra_filter:
+            expr = f"({expr}) and ({extra_filter})"
+        return self._client.query(
+            self._cfg.collection,
+            filter=expr,
+            output_fields=self._output_fields,
+            **STRONG,
+        )
+
     # ---- 写 ----
 
-    async def upsert(self, chunks: list[Chunk], embeddings: Embeddings) -> int:
-        return await asyncio.to_thread(self._upsert_sync, chunks, embeddings)
+    async def upsert(
+        self,
+        chunks: list[Chunk],
+        embeddings: Embeddings,
+        *,
+        batch_id: str = "",
+    ) -> int:
+        return await asyncio.to_thread(self._upsert_sync, chunks, embeddings, batch_id)
 
-    def _upsert_sync(self, chunks: list[Chunk], embeddings: Embeddings) -> int:
+    def _upsert_sync(
+        self,
+        chunks: list[Chunk],
+        embeddings: Embeddings,
+        batch_id: str,
+    ) -> int:
         if len(chunks) != len(embeddings.dense):
             raise ValueError(
                 f"chunk 数与向量数不一致：{len(chunks)} 个 chunk vs "
@@ -146,7 +225,11 @@ class MilvusIndex:
                 f"检查 providers.embedding.dim"
             )
 
-        rows = [self._row(c, vec) for c, vec in zip(chunks, embeddings.dense, strict=True)]
+        if self._include_batch_id and not batch_id:
+            raise ValueError("版本化 collection 写入必须提供 batch_id")
+        rows = [
+            self._row(c, vec, batch_id) for c, vec in zip(chunks, embeddings.dense, strict=True)
+        ]
         written = 0
         for batch in _batched(rows, UPSERT_BATCH):
             self._client.upsert(self._cfg.collection, data=batch)
@@ -155,7 +238,7 @@ class MilvusIndex:
         self._client.flush(self._cfg.collection)
         return written
 
-    def _row(self, chunk: Chunk, dense: list[float]) -> dict[str, Any]:
+    def _row(self, chunk: Chunk, dense: list[float], batch_id: str = "") -> dict[str, Any]:
         # 这里绝不能出现 sparse：它是 BM25 function 的输出字段，
         # 手动带上会被服务端直接拒绝
         size = len(chunk.text.encode("utf-8"))
@@ -170,8 +253,10 @@ class MilvusIndex:
                 f"chunk {chunk.chunk_id} 引用了 {len(chunk.assets)} 个资产，"
                 f"超过 assets 字段容量 {MAX_ASSETS}。调小 indexing.chunk.size。"
             )
-        return {
-            "chunk_id": chunk.chunk_id,
+        row = {
+            "chunk_id": (
+                f"{batch_id}:{chunk.chunk_id}" if self._include_batch_id else chunk.chunk_id
+            ),
             "doc_id": chunk.doc_id,
             "chunk_index": chunk.index,
             "source_uri": str(chunk.metadata.get("source_uri", "")),
@@ -187,6 +272,10 @@ class MilvusIndex:
             "text": chunk.text,
             "dense": dense,
         }
+        if self._include_batch_id:
+            row["index_batch_id"] = batch_id
+            row["logical_chunk_id"] = chunk.chunk_id
+        return row
 
     async def delete(self, chunk_ids: list[str]) -> int:
         return await asyncio.to_thread(self._delete_sync, chunk_ids)
@@ -216,6 +305,19 @@ class MilvusIndex:
     def _delete_docs_sync(self, doc_ids: list[str]) -> None:
         quoted = ", ".join(f'"{doc_id}"' for doc_id in doc_ids)
         self._client.delete(self._cfg.collection, filter=f"doc_id in [{quoted}]")
+        self._client.flush(self._cfg.collection)
+
+    async def delete_batch(self, batch_id: str) -> None:
+        """只删一个候选/旧批次；活动版本不受影响。"""
+        if not self._include_batch_id:
+            raise ValueError("legacy collection 没有 index_batch_id，不能按批次清理")
+        await asyncio.to_thread(self._delete_batch_sync, batch_id)
+
+    def _delete_batch_sync(self, batch_id: str) -> None:
+        self._client.delete(
+            self._cfg.collection,
+            filter=f"index_batch_id == {json.dumps(batch_id, ensure_ascii=False)}",
+        )
         self._client.flush(self._cfg.collection)
 
     # ---- 读 ----
@@ -306,7 +408,7 @@ class MilvusIndex:
             reqs,
             ranker=ranker,
             limit=top_k,
-            output_fields=_OUTPUT_FIELDS,
+            output_fields=self._output_fields,
             **STRONG,
         )[0]
         return _to_scored(hits, "hybrid")
@@ -326,7 +428,7 @@ class MilvusIndex:
             anns_field=field,
             search_params={"metric_type": metric},
             limit=top_k,
-            output_fields=_OUTPUT_FIELDS,
+            output_fields=self._output_fields,
             **STRONG,
             **extra,
         )[0]
@@ -362,7 +464,7 @@ def _to_chunk(row: dict[str, Any]) -> Chunk:
     直接 ``row["text"]`` 也能取到。
     """
     return Chunk(
-        chunk_id=row["chunk_id"],
+        chunk_id=row.get("logical_chunk_id") or row["chunk_id"],
         doc_id=row.get("doc_id", ""),
         text=row.get("text", ""),
         index=int(row.get("chunk_index", 0)),

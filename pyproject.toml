@@ -89,12 +89,16 @@ line-length = 100
 target-version = "py313"
 src = ["src", "tests"]
 # docs/ 里是文档示例代码，不是可运行代码：别让 linter 去改文档排版、也别报里面的未定义名
-# ingest/dots_ocr/ 是从 dots.ocr 官方仓库整包拿过来的样例代码（含它自己的工具与
+# plugins/rag-dots-parser/.../dots_ocr/ 是从 dots.ocr 官方仓库整包拿过来的样例代码（含它自己的工具与
 # 演示脚本、以及一堆它自己的风格问题）。它是**外部代码**，我们不按本仓库的风格去改它 ——
 # 只通过 ingest/dots.py 这个薄客户端调用它。
 # .models/ 是从 ModelScope 下下来的模型本体（含它自己的 README），不是我们的代码 ——
 # ruff 0.15 起会格式化 markdown 里的代码块，不加这条会把下载下来的文件也「改一遍」。
-extend-exclude = ["docs", "src/rag/ingest/dots_ocr", ".models"]
+extend-exclude = [
+    "docs",
+    "plugins/rag-dots-parser/src/rag_dots_parser/vendor/dots_ocr",
+    ".models",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

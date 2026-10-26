@@ -1,4 +1,4 @@
-# 插件：通道与命令怎么"零代码"扩展
+# 插件：通道、命令与可选解析器怎么扩展
 
 **一句话**：核心只认识「**按名字找实现**」这套机制，不认识任何具体的外部服务。
 要接一个新数据源（Elasticsearch、第二个 Milvus collection、别家的图库……），写一个 Python
@@ -9,16 +9,21 @@
 包里、靠 `META-INF/services` 在运行时对上。Python 的对应物是 **entry points**
 （`importlib.metadata`）；我们用它，另外留了一条点路径的逃生舱给开发期。
 
-## 1. 两个扩展点
+## 1. 三类扩展包
 
-| 扩展点 | entry point 组名 | 实现什么 | 装完的效果 |
+| 扩展包 | entry point 组名 | 实现什么 | 装完的效果 |
 |---|---|---|---|
 | **通道** | `rag.channels` | `build(*, index, embedder, settings, cfg) -> Retriever` | 配置里能写 `type: <入口点名>` |
 | **命令** | `rag.cli` | 一个 `typer.Typer()` 实例 | `rag` 下多出一组子命令（名字 = 入口点名） |
+| **PDF parser** | 不适用（可选 import） | dots.ocr 官方样例及适配目录 | 默认 `pdf.parser: dots` 可用 |
 
-两者都是**运行时按名字查**：装了就出现、卸了就消失（不是"配置写了却静默不生效"）；
+前两者是**运行时按名字查**：装了就出现、卸了就消失（不是"配置写了却静默不生效"）；
 查不到时当场报错，并把**内置的**与**已装插件声明的**名单一起列出来；核心的 import 图里
 没有插件 —— 插件坏了只影响它自己那条路。
+
+`plugins/rag-dots-parser` 是另一类边界：它承载不适合混进核心发行物的第三方样例代码，
+由 `rag.ingest.dots` 可选 import。装上后默认 dots 链路可用；没装时核心照常启动，
+只有选择 dots 才报明确的 `pip install -e plugins/rag-dots-parser` 安装提示。
 
 ## 2. 通道的解析顺序
 

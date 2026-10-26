@@ -7,6 +7,6 @@
 **建一次重对象**、翻请求/响应、翻状态码；真正的活儿在 retrieval / ingest / graphs 那几层。
 """
 
-from rag.api.app import Components, ServiceUnavailable, create_app
+from rag.api.app import Components, ServiceUnavailable, create_app, create_app_from_env
 
-__all__ = ["Components", "ServiceUnavailable", "create_app"]
+__all__ = ["Components", "ServiceUnavailable", "create_app", "create_app_from_env"]

@@ -51,6 +51,7 @@ import {
   type DocumentRow,
   type Folder,
   type Job,
+  type OutlineRow,
   type Uploaded,
   type UploadResult,
 } from '../api'
@@ -70,7 +71,7 @@ const fetching = ref(false)
 const currentId = ref<string | null>(null)
 const detail = ref<DocumentDetail | null>(null)
 /** 清单的编辑副本：提交前动的是它，`detail.outline` 保持「服务端给的那一份」好比对 */
-const draft = ref<{ level: number; hint: number; title: string; page: number }[]>([])
+const draft = ref<OutlineRow[]>([])
 const maxLevel = ref(3)
 const confirmed = ref(false)
 const busy = ref('')

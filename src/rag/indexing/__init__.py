@@ -11,9 +11,11 @@ from typing import Any
 from rag.config.schema import Settings
 from rag.contracts import Index
 from rag.indexing.milvus import MilvusIndex
+from rag.indexing.milvus.versioned import DualVersionMilvusIndex
 
 __all__ = [
     "MilvusIndex",
+    "DualVersionMilvusIndex",
     "build_index",
     "build_registry",
 ]
@@ -28,6 +30,12 @@ def build_index(settings: Settings) -> Index:
     cfg = settings.indexing.vector
     if cfg.backend != "milvus":
         raise KeyError(f"未实现的向量库后端: {cfg.backend!r}；目前只有 'milvus'")
+    if cfg.versions_enabled:
+        return DualVersionMilvusIndex(
+            cfg,
+            settings.providers.embedding.dim,
+            settings=settings,
+        )
     return MilvusIndex(cfg, dim=settings.providers.embedding.dim)
 
 

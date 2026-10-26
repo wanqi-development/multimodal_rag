@@ -89,9 +89,13 @@ class ChatRequest(BaseModel):
 
 class CitationView(BaseModel):
     index: int
-    chunk_id: str
-    source_uri: str
+    source_type: str = "corpus"
+    chunk_id: str = ""
+    source_uri: str = ""
+    url: str = ""
+    title: str = ""
     snippet: str = ""
+    heading_path: str = ""
 
 
 class ImageUploadView(BaseModel):
@@ -124,6 +128,8 @@ class ChatResponse(BaseModel):
     stats: list[StatsView] = Field(default_factory=list)
     rounds: int = 1
     grade: dict[str, Any] = Field(default_factory=dict)
+    mode: str = "plain"
+    usage: dict[str, Any] | None = None
     session_id: str | None = None
 
 

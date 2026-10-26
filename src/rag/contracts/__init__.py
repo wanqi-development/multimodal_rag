@@ -5,6 +5,8 @@
 
 from rag.contracts.document import (
     DOC_STAGES,
+    INDEX_STATUSES,
+    INDEX_VERSION_STATUSES,
     AssembledContext,
     ChannelStats,
     Chunk,
@@ -13,6 +15,7 @@ from rag.contracts.document import (
     Document,
     Embeddings,
     ImageAsset,
+    IndexVersionRecord,
     Position,
     RetrievalResult,
     ScoredChunk,
@@ -20,6 +23,7 @@ from rag.contracts.document import (
     reached,
     stage_rank,
 )
+from rag.contracts.evidence import EvidenceLedger
 from rag.contracts.protocols import (
     Chunker,
     Embedder,
@@ -47,6 +51,8 @@ __all__ = [
     "CHANNEL_TYPES",
     "CHUNKERS",
     "DOC_STAGES",
+    "INDEX_STATUSES",
+    "INDEX_VERSION_STATUSES",
     "EMBEDDERS",
     "PARSERS",
     "RERANKERS",
@@ -59,8 +65,10 @@ __all__ = [
     "Document",
     "Embedder",
     "Embeddings",
+    "EvidenceLedger",
     "Generator",
     "ImageAsset",
+    "IndexVersionRecord",
     "Index",
     "Position",
     "Parser",

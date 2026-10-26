@@ -9,7 +9,7 @@ dots.ocr 是端到端的版面模型，输出的布局块**自带 markdown 层�
 接口与 ``ingest/ocr.py::OcrClient`` **完全一致**（``parse(path, file_type) -> list[OcrPage]``），
 所以 loader 与下游（切分 / 定位 / 图片描述 / 灌库）一行都不用改。
 
-实现复用了用户提供的样例（``ingest/dots_ocr/``）里的工具函数，只做三件事：
+实现复用了可选插件 ``plugins/rag-dots-parser`` 里的 dots.ocr 官方样例，只做三件事：
 
 1. 按页渲染 PDF（复用 `load_images_from_pdf`）；
 2. 逐页调用 vLLM（复用 `inference_with_vllm` + `post_process_output`），**页之间并发** ——
@@ -27,13 +27,25 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from rag.config.schema import IngestConfig, IngestDotsConfig
-from rag.ingest.dots_ocr.model.inference import inference_with_vllm
-from rag.ingest.dots_ocr.utils.doc_utils import load_images_from_pdf
-from rag.ingest.dots_ocr.utils.format_transformer import layoutjson2md
-from rag.ingest.dots_ocr.utils.image_utils import fetch_image
-from rag.ingest.dots_ocr.utils.layout_utils import post_process_output
-from rag.ingest.dots_ocr.utils.prompts import dict_promptmode_to_prompt
 from rag.ingest.ocr_client import OcrEngine, OcrPage, register_ocr
+
+try:
+    from rag_dots_parser.vendor.dots_ocr.model.inference import inference_with_vllm
+    from rag_dots_parser.vendor.dots_ocr.utils.doc_utils import load_images_from_pdf
+    from rag_dots_parser.vendor.dots_ocr.utils.format_transformer import layoutjson2md
+    from rag_dots_parser.vendor.dots_ocr.utils.image_utils import fetch_image
+    from rag_dots_parser.vendor.dots_ocr.utils.layout_utils import post_process_output
+    from rag_dots_parser.vendor.dots_ocr.utils.prompts import dict_promptmode_to_prompt
+
+    _IMPORT_ERROR: Exception | None = None
+except ImportError as exc:  # 核心包不安装可选的 dots parser 也能启动
+    inference_with_vllm = None
+    load_images_from_pdf = None
+    layoutjson2md = None
+    fetch_image = None
+    post_process_output = None
+    dict_promptmode_to_prompt: dict[str, str] = {}
+    _IMPORT_ERROR = exc
 
 PARSER_NAME = "dots"
 
@@ -46,6 +58,10 @@ class DotsOcrClient:
     """vLLM 上的 dots.ocr。同步接口，页内并发。"""
 
     def __init__(self, cfg: IngestDotsConfig) -> None:
+        if _IMPORT_ERROR is not None:
+            raise DotsOcrError(
+                "dots.ocr 解析器是可选插件；先运行 `pip install -e plugins/rag-dots-parser`"
+            ) from _IMPORT_ERROR
         self._cfg = cfg
         parts = urlsplit(cfg.base_url)
         if not parts.hostname:

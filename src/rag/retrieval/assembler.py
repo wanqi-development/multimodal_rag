@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from rag.contracts import AssembledContext, Citation, ScoredChunk
+from rag.contracts import AssembledContext, Citation, EvidenceLedger, ScoredChunk
 
 # CJK 及全角标点：中文按 1 字 ≈ 1 token 估，拉丁文按 4 字符 ≈ 1 token。
 # 故意估高一点 —— 估低了会超模型窗口被静默截断，估高只是少放几条。
@@ -28,6 +28,7 @@ def _citation(index: int, scored: ScoredChunk) -> Citation:
     snippet = " ".join(scored.chunk.text.split())[:SNIPPET_CHARS]
     return Citation(
         index=index,
+        source_type="corpus",
         chunk_id=scored.chunk.chunk_id,
         source_uri=str(meta.get("source_uri", "")),
         snippet=snippet,
@@ -45,7 +46,7 @@ def assemble(chunks: list[ScoredChunk], max_tokens: int) -> AssembledContext:
     """
     seen: set[str] = set()
     picked: list[ScoredChunk] = []
-    citations: list[Citation] = []
+    ledger = EvidenceLedger()
     used = 0
     dropped = 0
 
@@ -57,7 +58,7 @@ def assemble(chunks: list[ScoredChunk], max_tokens: int) -> AssembledContext:
             continue
         seen.add(chunk_id)
 
-        citation = _citation(len(citations) + 1, scored)
+        citation = _citation(ledger.next_index, scored)
         cost = estimate_tokens(scored.chunk.text) + estimate_tokens(_render(citation, scored))
         if used + cost > max_tokens:
             dropped += 1
@@ -65,11 +66,19 @@ def assemble(chunks: list[ScoredChunk], max_tokens: int) -> AssembledContext:
 
         used += cost
         picked.append(scored)
-        citations.append(citation)
+        number = ledger.issue(
+            source_type=citation.source_type,
+            chunk_id=citation.chunk_id,
+            source_uri=citation.source_uri,
+            title=citation.title,
+            snippet=citation.snippet,
+            heading_path=citation.heading_path,
+        )
+        assert number == citation.index
 
     return AssembledContext(
-        text="\n\n".join(_render(c, s) for c, s in zip(citations, picked, strict=True)),
-        citations=citations,
+        text="\n\n".join(_render(c, s) for c, s in zip(ledger.records(), picked, strict=True)),
+        citations=ledger.records(),
         dropped=dropped,
         tokens_estimate=used,
     )

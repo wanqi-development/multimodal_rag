@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from rag.api.ingest_gate import IngestGate
 from rag.api.jobs import JobStore
 from rag.api.ratelimit import RateLimiter
 from rag.api.redis_backend import RedisBackend
@@ -28,8 +29,8 @@ from rag.api.routes import router
 from rag.config.schema import Settings
 from rag.config.settings import Secrets, get_secrets
 from rag.contracts import ChannelStats, ScoredChunk
-from rag.graphs import build_query_graph, run_index_graph, run_query_graph
-from rag.graphs.wiring import build_heavy, build_query_nodes
+from rag.graphs import run_index_graph
+from rag.graphs.wiring import build_heavy
 
 
 class ServiceUnavailable(RuntimeError):
@@ -65,18 +66,28 @@ class Components:
         # 那几个端点会明确回 503 —— 而不是让人对着一个连不上的地址猜。
         self.chats: Any = None
         self.index_error: str = ""
-        self.ingest_slot: asyncio.Semaphore | None = None
+        self.ingest_gate: IngestGate | None = None
         self.background: set[asyncio.Task] = set()
 
     # ---- 生命周期 ----
 
     async def startup(self) -> None:
-        self.ingest_slot = asyncio.Semaphore(max(self.settings.api.max_concurrent_ingest, 1))
         await self.redis.connect()
+        profile = self.settings.deployment.profile
+        if profile == "scale-out" and not self.redis.available:
+            raise RuntimeError(f"scale-out 要求 Redis 可用：{self.redis.reason}")
+        self.ingest_gate = IngestGate(
+            self.redis,
+            limit=self.settings.api.max_concurrent_ingest,
+            lease_s=self.settings.deployment.ingest_lease_s,
+            require_shared=profile == "scale-out",
+        )
         from rag.persistence import build_persistence
 
         self.persistence = build_persistence(self.settings, self.secrets)
         await self.persistence.connect()
+        if profile in ("server", "scale-out") and not self.persistence.available:
+            raise RuntimeError(f"{profile} 要求 PostgreSQL 可用：{self.persistence.reason}")
         if self.settings.persistence.postgres.url:
             from rag.persistence import build_chat_store
 
@@ -176,17 +187,32 @@ class Components:
         return hits, getattr(retriever, "last_stats", [])
 
     async def answer(self, body) -> dict[str, Any]:
-        """一次完整问答（含 QueryGraph，按配置）。"""
+        """一次完整问答；流式与非流式共用 AnswerEngine 的检索预检。"""
         local = self._local(body.channels, body.rerank)
         if body.graph is not None:
             local.graph.enabled = body.graph
         self._require("embedding", "generator")
+        from rag.graphs import build_answer_engine
+
         # token 用量靠调用方传容器收集（`heavy.generator` 是跨请求单例，不能挂实例属性）
         usage: dict[str, Any] = {}
-        if local.graph.enabled:
-            out = await self._answer_with_graph(local, body, usage)
-        else:
-            out = await self._answer_plain(local, body, usage)
+        engine = build_answer_engine(local, self.index, self.heavy)
+        result = await engine.answer(
+            body.question,
+            body.top_k,
+            filters=body.filters or None,
+            usage=usage,
+        )
+        out = {
+            "answer": result.answer,
+            "hits": result.hits,
+            "stats": result.stats,
+            "citations": result.citations,
+            "rounds": result.rounds,
+            "grade": result.grade,
+            "mode": result.mode,
+            "usage": result.usage,
+        }
         sid = await self._open_session(body.session_id, title=body.question[:30], mode="chat")
         await self._save_turn(
             sid, question=body.question, answer=out["answer"], mode="chat", usage=usage
@@ -194,88 +220,36 @@ class Components:
         out["session_id"] = sid
         return out
 
-    async def _answer_plain(
-        self, local: Settings, body, usage: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        from rag.retrieval import assemble, build_retriever
-
-        retriever = build_retriever(local, self.index, self.heavy.embedder, self.heavy.reranker)
-        hits = await retriever.retrieve(body.question, body.top_k, filters=body.filters or None)
-        context = assemble(hits, local.retrieval.assemble.max_tokens)
-        answer = await self.heavy.generator.generate(body.question, context, usage=usage)
-        return {
-            "answer": answer,
-            "hits": hits,
-            "stats": getattr(retriever, "last_stats", []),
-            "citations": context.citations,
-            "rounds": 1,
-            "grade": {},
-        }
-
-    async def _answer_with_graph(
-        self, local: Settings, body, usage: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        # 四个依赖都从 heavy 里取 —— 这里绝不重建模型
-        retrieve, plan_llm, grade_llm, generate = build_query_nodes(
-            local, self.index, self.heavy, usage=usage
-        )
-        graph = build_query_graph(
-            local,
-            retrieve=retrieve,
-            plan_llm=plan_llm,
-            grade_llm=grade_llm,
-            generate=generate,
-            # 计划里能选的通道 = 这次启用的那几路（QueryGraph 只做子查询展开，不做通道决策）
-            channels=[item.name for item in local.retrieval.channels if item.enabled],
-        )
-        result = await run_query_graph(graph, body.question, top_k=body.top_k)
-        return {
-            "answer": result["answer"],
-            "hits": result["hits"],
-            "stats": result["stats"],
-            "citations": result["citations"],
-            "rounds": result["rounds"],
-            "grade": result["grade"],
-        }
-
     async def stream_answer(self, body):
         """流式问答：产出 `retrieval` → `token`* → `done` 三种字典。
 
-        **流式走直线，不叠 QueryGraph**：纠错要在生成**之前**决定要不要重查，而流式是生成
-        过程中的事 —— 两者叠起来要先把「重查」和「已吐出去的 token」对齐，那是另一件事。
-        需要用纠错就 `stream=false`。
+        `graph=true` 时先跑完整的生成前预检，再开始流式生成；检索纠错不会因为
+        `stream=true` 被绕过。
         """
         local = self._local(body.channels, body.rerank)
+        if body.graph is not None:
+            local.graph.enabled = body.graph
         self._require("embedding", "generator")
-        from rag.retrieval import assemble
+        from rag.graphs import build_answer_engine
 
-        hits, stats = await self.search(
-            query=body.question,
-            top_k=body.top_k,
-            filters=body.filters,
-            channels=body.channels,
-            rerank=body.rerank,
-        )
-        context = assemble(hits, local.retrieval.assemble.max_tokens)
-        yield {"type": "retrieval", "hits": hits, "stats": stats}
+        engine = build_answer_engine(local, self.index, self.heavy)
         sid = await self._open_session(body.session_id, title=body.question[:30], mode="chat")
-        usage: dict[str, Any] = {}
-        collected: list[str] = []
-        async for piece in self.heavy.generator.astream(body.question, context, usage=usage):
-            collected.append(piece)
-            yield {"type": "token", "text": piece}
-        # **跑完了才落库**。客户端中途断开（点停止/关页面）时不落：异步生成器被关闭时
-        # 不许再 await（会 RuntimeError），而且「没跑完的那一轮」本来也不该当成一轮记录。
-        await self._save_turn(
-            sid, question=body.question, answer="".join(collected), mode="chat", usage=usage
-        )
-        yield {
-            "type": "done",
-            "citations": context.citations,
-            "session_id": sid,
-            # 这一轮花了多少，界面要显示
-            "usage": usage or None,
-        }
+        async for event in engine.stream(
+            body.question,
+            body.top_k,
+            filters=body.filters or None,
+        ):
+            if event["type"] == "done":
+                # **先落库再发出去**：SSE 收到 done 就取消生产者，yield 之后再写会被取消。
+                await self._save_turn(
+                    sid,
+                    question=body.question,
+                    answer=str(event.get("answer") or ""),
+                    mode="chat",
+                    usage=event.get("usage") or {},
+                )
+                event = {**event, "session_id": sid}
+            yield event
 
     # ---- 会话落库 ----
 
@@ -608,8 +582,8 @@ class Components:
         job.status = "running"
         await self.jobs.save(job)
         try:
-            assert self.ingest_slot is not None
-            async with self.ingest_slot:
+            assert self.ingest_gate is not None
+            async with self.ingest_gate.hold():
                 job.result = await asyncio.to_thread(self._parse_one, doc_id)
             # 内容哈希这一格在**上传**时就写过了；这里再带一次是为了老行（升级前建的）
             # 能补上 —— `plan_incremental` 判「这份变了没有」用的就是它
@@ -675,8 +649,8 @@ class Components:
         job.status = "running"
         await self.jobs.save(job)
         try:
-            assert self.ingest_slot is not None
-            async with self.ingest_slot:
+            assert self.ingest_gate is not None
+            async with self.ingest_gate.hold():
                 job.result = await self.run_index(doc_id)
             job.status = "done"
         except Exception as exc:  # noqa: BLE001 —— 后台任务，失败写进任务记录
@@ -738,8 +712,8 @@ class Components:
         job.status = "running"
         await self.jobs.save(job)
         try:
-            assert self.ingest_slot is not None  # startup 里建的；None 只可能是没跑 lifespan
-            async with self.ingest_slot:
+            assert self.ingest_gate is not None  # startup 里建的；None 只可能是没跑 lifespan
+            async with self.ingest_gate.hold():
                 job.result = await self.run_ingest(body)
             job.status = "done"
         except Exception as exc:  # noqa: BLE001
@@ -858,6 +832,9 @@ def _registry(settings: Settings):
 
 def create_app(settings: Settings, secrets: Secrets | None = None) -> FastAPI:
     """建应用。`settings` 由调用方给（CLI 从 yaml 读、测试直接构造）。"""
+    from rag.deployment import validate_deployment
+
+    validate_deployment(settings)
     if settings.persistence.postgres.url:
         # Windows 上 psycopg 的 async 需要 Selector 循环，而它**必须在建循环之前**设。
         # `create_app` 是 CLI 与 TestClient（启动 portal 之前）都会先走到的地方，放这里能兜住
@@ -894,6 +871,16 @@ def create_app(settings: Settings, secrets: Secrets | None = None) -> FastAPI:
     _install_error_handlers(app)
     _mount_web(app)
     return app
+
+
+def create_app_from_env() -> FastAPI:
+    """uvicorn 多 worker 的 import-string 工厂：每个子进程从环境重读配置。"""
+    from rag.config import load_settings
+    from rag.obs import configure_logging
+
+    settings = load_settings()
+    configure_logging(settings)
+    return create_app(settings)
 
 
 def _mount_web(app: FastAPI) -> None:

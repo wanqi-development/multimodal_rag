@@ -61,10 +61,41 @@ class DocRecord(BaseModel):
     pipeline_version: str = ""
     # 这份文档**走到哪一步了**（见 ``DOC_STAGES``）。列表页只读它，不去翻产物。
     stage: str = ""
+    # 最近一次索引写入的批次与状态：staging → active / failed。
+    # batch 在写 Milvus 前落库，只有 Milvus 与注册表都写完才转 active；
+    # 中途失败会留下可对账的 failed / staging 记录，而不是只靠猜。
+    index_batch_id: str = ""
+    index_status: str = ""
+    indexed_at: int = 0
+    index_error: str = ""
+    # 最近一次索引写入的批次与状态：staging → active / failed。
+    # batch 在写 Milvus 前落库，只有 Milvus 与注册表都写完才转 active；
+    # 中途失败会留下可对账的 failed / staging 记录，而不是只靠猜。
+    index_batch_id: str = ""
+    index_status: str = ""
+    indexed_at: int = 0
+    index_error: str = ""
+
+
+class IndexVersionRecord(BaseModel):
+    """一批候选索引记录；旧 active 在新版本完成前保持可查。"""
+
+    doc_id: str
+    batch_id: str
+    status: str
+    content_hash: str = ""
+    pipeline_version: str = ""
+    chunk_count: int = 0
+    created_at: int = 0
+    completed_at: int = 0
+    error: str = ""
 
 
 # 一份文档在页面上那条流水线里的位置。**只前进**（重做会让它退回去）。
 DOC_STAGES = ("uploaded", "parsed", "reviewed", "chunked", "indexed")
+INDEX_STATUSES = ("", "staging", "active", "failed")
+INDEX_VERSION_STATUSES = ("staging", "active", "failed", "superseded")
+INDEX_STATUSES = ("", "staging", "active", "failed")
 
 
 def stage_rank(stage: str) -> int:
@@ -176,11 +207,17 @@ class RetrievalResult(BaseModel):
 
 
 class Citation(BaseModel):
-    """答案里的引用条目，编号在装配阶段生成。"""
+    """统一引用条目；语料块与网络结果共用这一种形状。"""
 
     index: int
-    chunk_id: str
-    source_uri: str
+    # corpus / web；以后接别的数据源也只扩展类型，不另造引用协议
+    source_type: str = "corpus"
+    chunk_id: str = ""
+    # 人读的来源名；语料通常是相对路径，网络通常是 URL
+    source_uri: str = ""
+    # 网络来源的稳定定位；语料块留空
+    url: str = ""
+    title: str = ""
     snippet: str = ""
     # 这一块属于哪个章节（`标题1 -> 标题2`）。答案末尾那段来源清单要靠它 ——
     # 「引用了哪个文档的哪一章」比「引用了哪一块」对人有用。
@@ -204,7 +241,14 @@ def format_sources(citations: Sequence[Citation]) -> str:
         return ""
     groups: dict[str, list[int]] = {}
     for item in sorted(citations, key=lambda row: row.index):
-        where = f"{item.source_uri} · {item.heading_path}" if item.heading_path else item.source_uri
+        if item.source_type == "web":
+            label = item.title or item.url or item.source_uri or "网络来源"
+            where = f"来自网络 · {label}"
+            if item.url and item.url != label:
+                where += f" · {item.url}"
+        else:
+            label = item.title or item.source_uri
+            where = f"{label} · {item.heading_path}" if item.heading_path else label
         groups.setdefault(where, []).append(item.index)
     lines = [
         f"{''.join(f'[{number}]' for number in numbers)} {where}"

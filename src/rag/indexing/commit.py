@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -98,26 +100,47 @@ async def commit_chunks(
 
     index = index or build_index(settings)
     registry = registry or build_registry(settings)
-    await index.ensure_ready()
-    if not chunks:
-        return CommitResult(registered=records)
+    doc_ids = sorted({record.doc_id for record in records})
+    batch_id = uuid4().hex[:12]
+    # 先落 staging：若进程在 Milvus 写入中途退出，DB 会留下可对账的批次，而不是
+    # 一份仍在宣称 active、实际块却已删/写了一半的假状态。
+    await registry.begin_index(batch_id, records)
+    try:
+        await index.ensure_ready()
+        if not chunks:
+            await registry.complete_index(batch_id, records)
+            return CommitResult(registered=records)
 
-    embedder = embedder or _build_embedder(settings)
-    # 两条路在这一行分岔：纯文本 backend 传 None；多模态 backend 给图片块附上图片本体，
-    # 「图 + 描述」编成一个融合向量（正文块照旧只有文字）。
-    images: list[list[Path]] | None = None
-    if getattr(embedder, "supports_images", False):
-        images, _ = image_paths_for(chunks, build_asset_store(settings))
-    vectors = await embedder.embed_documents([chunk.text for chunk in chunks], images)
+        embedder = embedder or _build_embedder(settings)
+        # 两条路在这一行分岔：纯文本 backend 传 None；多模态 backend 给图片块附上图片本体，
+        # 「图 + 描述」编成一个融合向量（正文块照旧只有文字）。
+        images: list[list[Path]] | None = None
+        if getattr(embedder, "supports_images", False):
+            images, _ = image_paths_for(chunks, build_asset_store(settings))
+        vectors = await embedder.embed_documents([chunk.text for chunk in chunks], images)
 
-    await index.delete_docs(sorted({chunk.doc_id for chunk in chunks}))
-    written = await index.upsert(chunks, vectors)
-    await registry.upsert(records)
-    return CommitResult(
-        written=written,
-        described=sum(1 for chunk in chunks if chunk.modality == "image"),
-        registered=records,
-    )
+        if hasattr(index, "upsert_batch"):
+            # 双版本：只写新批次，旧批次保留到活动指针切换之后。
+            written = await index.upsert_batch(chunks, vectors, batch_id=batch_id)
+        else:
+            # 非版本化后端 / 测试替身：保留原来的覆盖语义。
+            await index.delete_docs(doc_ids)
+            written = await index.upsert(chunks, vectors)
+        # 所有 Milvus 写成功后才把整批转 active；这一步在注册表一个事务里完成。
+        await registry.complete_index(batch_id, records)
+        return CommitResult(
+            written=written,
+            described=sum(1 for chunk in chunks if chunk.modality == "image"),
+            registered=records,
+        )
+    except Exception as exc:
+        with suppress(Exception):
+            await registry.fail_index(
+                batch_id,
+                doc_ids,
+                f"{type(exc).__name__}: {exc}",
+            )
+        raise
 
 
 async def drop_docs(

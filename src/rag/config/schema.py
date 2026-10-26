@@ -197,6 +197,10 @@ class VectorIndexConfig(BaseModel):
     uri: str = "http://localhost:19530"
     token: str | None = None
     collection: str = "rag_v1"
+    # 双版本：旧 collection 只读，新批次写 <collection>_versions。
+    # 版本化表的 schema 多一个显式 index_batch_id，不能复用旧 collection。
+    versions_enabled: bool = True
+    versions_collection: str = ""
     # 开工前探活的超时（秒）。为什么需要它：Milvus 停掉时 pymilvus 的重连会**空转很久**
     # —— 实测 `rag ingest` 在写库那步烧了三十几分钟 CPU、数据一行没进（§16）。
     # 探活接不住（5 秒没响应）就直接退出，别让人对着一个不动的终端猜。
@@ -495,6 +499,9 @@ class IngestImagesConfig(BaseModel):
     # 单次最多描述几张图，0 = 不限制。**先花几毛钱看效果**的口子：
     # 打开 describe 之前先用它跑几张，确认提示词与模型对路再全量。
     max_images: int = 0
+    # auto（听 storage.backend）| local | minio。scale-out 下自动走桶，避免每个 worker 一份缓存。
+    cache_backend: str = "auto"
+    cache_prefix: str = "image-cache"
     # 描述缓存的落盘位置。**按图片内容哈希 + 模型 + 提示词版本做键** ——
     # 改一段正文不该让几十张图全部重问一遍 VLM（那是整条链路里最贵的一步）。
     cache_path: str = "./data/cache/image_descriptions.json"
@@ -701,6 +708,7 @@ class ApiConfig(BaseModel):
 
     host: str = "127.0.0.1"
     port: int = 8000
+    workers: int = 1
     # 每分钟每个 key/IP 的请求上限；0 = 不限
     rate_limit_per_min: int = 60
     # 同时在跑的 ingest 任务数。重活（OCR/VLM/重排）与检索同进程争资源，
@@ -724,6 +732,16 @@ class ApiConfig(BaseModel):
     # 所以只有 `confirmed=true`（人明确勾了「已核对」）才会触发。
     index_after_review: bool = True
     redis: RedisConfig = Field(default_factory=RedisConfig)
+
+
+class DeploymentConfig(BaseModel):
+    """部署形态。profile 约束必需的共享后端，具体值仍在各配置块里。"""
+
+    profile: str = "single-node"  # single-node | server | scale-out
+    # 外部容器/进程副本数；容器里通常 workers=1、replicas=2
+    replicas: int = 1
+    # 分布式灌库槽位的租约。正常释放走 finally；进程崩溃时靠它回收。
+    ingest_lease_s: int = 86400
 
 
 class PersistenceConfig(BaseModel):
@@ -975,6 +993,7 @@ class Settings(BaseModel):
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     graph: GraphConfig = Field(default_factory=GraphConfig)
+    deployment: DeploymentConfig = Field(default_factory=DeploymentConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)

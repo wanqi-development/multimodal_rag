@@ -3,7 +3,7 @@ import os
 import requests
 from openai import OpenAI
 
-from rag.ingest.dots_ocr.utils.image_utils import PILimage_to_base64
+from rag_dots_parser.vendor.dots_ocr.utils.image_utils import PILimage_to_base64
 
 
 def inference_with_vllm(

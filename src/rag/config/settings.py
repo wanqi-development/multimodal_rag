@@ -130,7 +130,11 @@ def load_settings(profile: str | None = None, directory: Path | None = None) -> 
     profile = profile or os.environ.get("RAG_PROFILE", "dev")
     data = _read_yaml(directory / "base.yaml")
     data = _deep_merge(data, _read_yaml(directory / f"{profile}.yaml"))
-    return Settings.model_validate(data)
+    settings = Settings.model_validate(data)
+    from rag.deployment import validate_deployment
+
+    validate_deployment(settings)
+    return settings
 
 
 @lru_cache(maxsize=1)
