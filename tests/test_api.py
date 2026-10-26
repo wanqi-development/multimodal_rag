@@ -111,7 +111,7 @@ class _Components:
         self.index_error = "" if index_ok else "MilvusException: 拒绝连接"
         self.persistence = _Persistence()
         self.heavy = _Heavy()
-        self.ingest_slot = None
+        self.ingest_gate = None
         self.background: set = set()
         self.searches: list[dict] = []
         self.ingested: list[Any] = []
@@ -1095,7 +1095,7 @@ def test_logs_stream_backfills_then_follows_the_live_buffer() -> None:
     用 `client.stream` 读会在关闭响应时卡在 portal 线程里（实测挂住）。要验的是
     「补历史 + 推新行」这两件事，驱动生成器就够，而且跑得快。
     """
-    from rag.api import routes
+    from rag.api import system_routes
     from rag.obs import live
 
     live.reset()
@@ -1110,12 +1110,12 @@ def test_logs_stream_backfills_then_follows_the_live_buffer() -> None:
     )
 
     async def scenario() -> tuple[str, str]:
-        response = await routes.logs_stream(backfill=5)
+        response = await system_routes.logs_stream(backfill=5)
         assert response.media_type == "text/event-stream"
         backfill = await anext(response.body_iterator)
 
         # 订阅之后再发一条：应当被推出来（而不是等 15 秒心跳）
-        gen = routes._log_sse(backfill=0)
+        gen = system_routes._log_sse(backfill=0)
         pending = asyncio.create_task(anext(gen))
         await asyncio.sleep(0.05)
         live.publish(

@@ -27,7 +27,12 @@ MAX_ASSETS = 64
 BM25_FUNCTION_NAME = "bm25_text"
 
 
-def build_schema(cfg: VectorIndexConfig, dim: int) -> CollectionSchema:
+def build_schema(
+    cfg: VectorIndexConfig,
+    dim: int,
+    *,
+    include_batch_id: bool = False,
+) -> CollectionSchema:
     """按配置建表结构。
 
     dense 维度由调用方传入（来自 providers.embedding.dim，那是唯一来源）；
@@ -39,6 +44,10 @@ def build_schema(cfg: VectorIndexConfig, dim: int) -> CollectionSchema:
     schema.add_field("doc_id", DataType.VARCHAR, max_length=MAX_ID_BYTES)
     schema.add_field("chunk_index", DataType.INT64)
     schema.add_field("source_uri", DataType.VARCHAR, max_length=MAX_URI_BYTES)
+    if include_batch_id:
+        # 版本化 collection 专用：旧 collection 没有这一列，继续作为只读 legacy。
+        schema.add_field("index_batch_id", DataType.VARCHAR, max_length=MAX_ID_BYTES)
+        schema.add_field("logical_chunk_id", DataType.VARCHAR, max_length=MAX_ID_BYTES)
     # —— 下面这些是「要过滤的」，全部显式声明，不塞 JSON ——
     # 来源类型与模态：按格式筛（只看 pdf）、按模态筛（只要正文、不要图片描述）
     schema.add_field("doc_type", DataType.VARCHAR, max_length=MAX_TAG_BYTES)

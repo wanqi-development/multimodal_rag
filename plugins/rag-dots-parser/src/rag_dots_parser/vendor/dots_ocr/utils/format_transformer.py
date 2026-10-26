@@ -2,7 +2,7 @@ import re
 
 from PIL import Image
 
-from rag.ingest.dots_ocr.utils.image_utils import PILimage_to_base64
+from rag_dots_parser.vendor.dots_ocr.utils.image_utils import PILimage_to_base64
 
 
 def has_latex_markdown(text: str) -> bool:

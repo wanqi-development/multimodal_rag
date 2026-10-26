@@ -13,7 +13,7 @@
 
 | 层 | 多模态体现在哪 |
 |---|---|
-| 接入层 | 每种模态一个 loader，出口统一是「带元数据的文本」。已实现：md / txt 族、PDF（统一走 PaddleOCR-VL 产线，ADR 17/18/23）、docx / html / xlsx（代码解析）、图片（OCR + VLM 描述，§7.4）。计划：csv / 代码 / web 抓取 |
+| 接入层 | 每种模态一个 loader，出口统一是「带元数据的文本」。已实现：md / txt 族、PDF（parser 可配置，默认 `dots` 可选插件；PaddleOCR-VL / MinerU 可切换，ADR 17/18/23）、docx / html / xlsx（代码解析）、图片（OCR + VLM 描述，§7.4）。计划：csv / 代码 / web 抓取 |
 | 存储层 | 文本块与向量进 Milvus（dense + 内建 BM25 sparse，§8）。原始资产：**内嵌图已落地**（本体进 `ingest.assets.dir`，正文留标记，图片另有 `modality=image` 的描述块，§7.4）；页面图像与表格片段仍未落地，见 §21 |
 
 **非目标：查询侧不做跨模态。** 检索与生成一律是文本 query 对文本块 —— 图像不作为 query，
@@ -256,6 +256,11 @@ class Index(Protocol):
 class Reranker(Protocol):
     async def rerank(self, query: str, chunks: list[ScoredChunk], top_n: int) -> list[ScoredChunk]: ...
 ```
+
+**引用不再按数据源分协议**（2026-10-23）：`Citation` 同时承载语料块和网页结果，
+用 `source_type` 区分 `corpus / web`，保留 `chunk_id / url / title / heading_path`。
+`EvidenceLedger` 是唯一的发号、去重、答案引用筛选与快照序列化入口；旧
+`CitationRegistry` 只是兼容别名。普通装配、Agent 工具与会话恢复都走这一套。
 
 `Embeddings.sparse` 字段保留，但当前恒为 `None`：dense 那条腿由 fastembed 出，sparse 那条腿由
 Milvus 服务端从原文生成，Python 侧根本不经手。字段留着是为了将来换成「自带 sparse 输出的模型」
@@ -1074,6 +1079,66 @@ querynode 的 DML channel 不可服务）每次查询要**等 9013ms 才回 503*
 全部搬到 `chunked`。旧的 `<collection>_docs` collection 从此没人读写，
 确认不再需要之后手动 drop 掉即可（**别在迁移前 drop** —— `--from-milvus` 还要用它）。
 
+### 8.6 索引批次 manifest 与对账（2026-10-23）
+
+`document_registry` 新增四个索引状态列，另有每批次一行的 `index_versions`：
+
+| 列 | 含义 |
+|---|---|
+| `index_batch_id` | **当前活动版本**；旧数据为空，表示仍在 legacy collection |
+| `index_status` | 新版本完成切活动时为 `active`；旧数据可为空 |
+| `indexed_at` | 这一批真正完成的时间 |
+| `index_error` | 最近一次活动版本错误；通常为空 |
+
+`index_versions` 的每一行是 `(doc_id, batch_id)`，状态只允许
+`staging / active / failed / superseded`。staging 版本不会改活动指针；失败版本也不会。
+
+**双 collection 路由**：
+
+| collection | 写 | 读 |
+|---|---|---|
+| 旧 `<collection>` | 升级后只读 legacy | 只用于没有活动版本的 doc；已有版本化的 doc 会被 filter 排除 |
+| `<collection>_versions` | 新批次唯一写入点 | 只读 registry 当前活动 batch；staging / superseded 全部排除 |
+
+版本化 schema 多两个字段：`index_batch_id` 与 `logical_chunk_id`。物理主键使用
+`batch_id:logical_chunk_id`，两代块可以并存；检索输出仍还原成稳定的逻辑 chunk_id，
+引用/详情接口不需要知道物理版本。
+
+`commit_chunks()` 的顺序是：
+
+1. 写 `index_versions(staging)`；旧活动版本保持可查；
+2. embedding + 只写 `<collection>_versions`，**不删除任何旧批次**；
+3. 关系库一个事务里把新版本转 active、旧版本转 superseded、注册表活动指针指向新 batch。
+
+切换前查询只命中旧 batch；提交事务后查询只命中新 batch。中途失败只会留下 failed 候选，
+旧版本完全不受影响。SQLite / PG 老表在 `setup()` 时原地补列和建 `index_versions`。
+
+`rag registry reconcile` 是只读对账入口，比较：
+
+- 切分产物的 `file_hash`、切法指纹与注册表；
+- manifest 的记录块数与产物块数；
+- Milvus 中该 `doc_id` 的 `chunk_id + content_hash` 集合；
+- `stage / index_status` 是否完整。
+
+`--repair` **只回填可证明完成的 manifest 状态**（例如数据都已写完、进程在转 active
+前退出）。它会逐项报告，不会静默修数据：
+
+- 产物缺失、文件/切法指纹不符、Milvus 块缺失/多出/内容变化 → 只报告；
+- staging / legacy 但产物与 Milvus 完全一致 → 可回填 active；
+- 真正的修复仍走重新 ingest。
+
+`rag registry prune --older-hours 24` 只删除不承载任何活动 batch 的 failed / superseded
+批次；活动 batch 永远不会被这个命令删除。先用 `--dry-run` 可以只看清单。
+
+**实测（2026-10-23）**：真实 Milvus 的 legacy collection 有 245 块；探针用其中一份文档
+的 100 个已有块/向量写入临时版本化 collection，验证 schema、活动 batch filter、
+hybrid 检索命中与清理，最终 `versions_cleaned=true`，legacy 未改。探针不调用
+embedding / VLM。
+
+**边界**：尚未跑真实 `commit_chunks` 全链路重灌和 registry 活动指针切换的端到端验收。
+查询每次还要从关系库读活动 batch 图，并把 batch/doc 集合拼进 Milvus filter；
+超大语料要再验证表达式长度与 scalar filter 性能。
+
 ---
 
 ## 9. 检索层
@@ -1156,6 +1221,18 @@ pip uninstall rag-channel-neo4j            # 卸掉 → 配置里写 neo4j 当�
 **核心不再有任何 Neo4j 代码**。命令靠**第二个扩展点**挂上去：entry point 组 `rag.cli`，
 核心只有 `cli/main.py::_mount_plugin_commands()` 那 15 行（模块级挂 + 插件坏了只警告）。
 
+**第三个扩展点是 PDF parser：`plugins/rag-dots-parser`**（2026-10-23 外置）。
+dots.ocr 官方样例约 1981 行，原先躺在核心包的 `ingest/dots_ocr/`；现在作为独立包
+`rag-dots-parser` 安装，核心的 `ingest/dots.py` 只保留可选 import 与薄客户端。
+装上后默认 `pdf.parser: dots` 照常工作，卸掉后核心仍能启动，直到真的选择 dots 时才报：
+
+```bash
+pip install -e plugins/rag-dots-parser   # 默认 PDF 链路需要
+```
+
+第三方 vendor 目录仍不按本仓库风格改写，但排除范围跟着包移动；CI 会装这个包，
+因此默认解析链路和插件缺失提示各有测试覆盖。
+
 **已入库语料补图不用重灌**：图是从**切分产物**（`data/stages/<doc_id>/chunks.json`，灌库时
 就落好的）抽的，`rag graph build --all` 一条命令搞定，只花抽取这一次 LLM 的钱。
 完整的插件说明（工作原理、怎么写一个、什么时候不该做插件）见 **`docs/plugins.md`**。
@@ -1193,7 +1270,8 @@ Milvus 内建 BM25（同索引、同 `chinese` analyzer、同一次打分），�
 - **fusion**：跨通道 RRF（L2 层，客户端）—— **已实现**（2026-10-03，`retrieval/fusion.py`）
 - **rerank**：本地 cross-encoder（flashrank / sentence-transformers 两个 backend），
   把融合后的 20 条候选重排 —— **已实现**（2026-10-03，`providers/rerank.py`，见 §9.4）
-- **assemble**：按 chunk_id 去重 → token 预算裁剪 → **引用编号**（编号在此生成，贯穿到最终答案）
+- **assemble**：按 chunk_id 去重 → token 预算裁剪 → **EvidenceLedger 引用编号**
+  （编号在此生成，贯穿到最终答案）
 
 **M1 已实现 assemble**（`retrieval/assembler.py`），**L2 融合已在 2026-10-03 落地**
 （`retrieval/fusion.py` + `retrieval/multichannel.py`），**重排也在同一天落地**
@@ -1370,17 +1448,22 @@ Protocol 的用途。总开关 `graph.enabled`（默认关，`--graph/--no-graph
 ### 10.1 QueryGraph（在线检索，带自我纠错）
 
 ```
-plan ──► retrieve ──► grade ──┬──► assemble ──► generate ──► END
-  ▲                            │
+plan ──► retrieve ──► grade ──┬──► assemble ──┬──► generate ──► END
+  ▲                            │               └──► END（流式预检）
   └──── 资料不够（轮数没用完） ─┘
 ```
+
+`AnswerEngine` 把生成前部分编译成预检图：非流式与流式都先跑完
+`plan → retrieve → grade/replan → assemble`，再分别选择 `generate` 或
+`generator.astream`。因此 `stream=true` 不再绕过检索纠错。
 
 | 节点 | 干什么 |
 |---|---|
 | `plan` | 一次 JSON 输出：`{sub_queries[], filters{}, channels[], reason}`。决定改写、要不要拆多查询、要不要过滤、走哪几路 |
 | `retrieve` | 每个子查询并行跑 `build_retriever`（M2 那一整套）；多个子查询的结果再用**同一个 `rrf_fuse`** 合一次 —— 多查询与多通道在数学上没有区别 |
 | `grade` | 一次 JSON 输出：`{score, missing}`。低于 `graph.relevance_threshold` → 回 `plan` 重来，最多 `max_corrective_rounds` 轮 |
-| `assemble` / `generate` | 复用 M1/M2 的两件套 |
+| `assemble` | 形成 `PreparedAnswer`；普通问答和流式问答从这里接同一个生成入口 |
+| `generate` | 非流式时接 `CitationGenerator.generate`；流式时由 `AnswerEngine.stream` 逐块输出 |
 
 **与初稿那张图的两处偏离，都有理由**：
 
@@ -1437,10 +1520,11 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 ## 11. Agent 层：deepagents（2026-10-04 落地批次 A + 批次 B）
 
 **批次 A 是只读的**：工具 + 主 agent + `rag agent` + `POST /agent`。
-**批次 B 打开写盘，但写盘要人批**：workspace 路由到真磁盘、四个写类工具挂 HITL 闸门、
-中断恢复（`--resume` / `POST /agent/resume`）、SSE 流式。
+**批次 B 打开写盘，但写盘要人批**：workspace 路由到真磁盘，`write_file` / `edit_file`
+挂 HITL 闸门；`delete` / `execute` 由 ToolPolicy 禁用、不会进入审批。另有
+中断恢复（`--resume` / `POST /agent/resume`）和 SSE 流式。
 
-**2026-10-08：一个 agent + 四个工具，subagent 全部撤掉。** 使用者定了两条：
+**2026-10-08：一个 agent + 四个知识工具，项目自定义 subagent 全部撤掉。** 使用者定了两条：
 「一个智能体走通道融合最后出结果就行了」「工具层面只需要 `search_knowledge` /
 `get_section` / `list_documents`（网络搜索工具还是要的）」。于是五个 subagent
 （vector / keyword / image / graph / web-searcher）全删，`search_keywords`、
@@ -1453,8 +1537,9 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 
 | 组件 | 是什么 |
 |---|---|
-| 工具（`agent/tools.py`）**四个** | `search_knowledge`（**一次调用 = 一次融合检索**：所有启用的通道并发 + 融合 + 重排，`modality` 用来只看某类块）/ `list_documents`（有哪些文档）/ `get_section`（取某几节原文）/ `web_search_tool`（网络，带闸门） |
-| subagent | **没有**（2026-10-08 撤） |
+| 知识工具（`agent/tools.py`）**四个** | `search_knowledge`（**一次调用 = 一次融合检索**：所有启用的通道并发 + 融合 + 重排，`modality` 用来只看某类块）/ `list_documents`（有哪些文档）/ `get_section`（取某几节原文）/ `web_search_tool`（网络，带闸门） |
+| 项目自定义 subagent | **没有**（2026-10-08 撤）。即使 deepagents 自动注入 general-purpose / `task`，ToolPolicy 也会把它从模型可见面和执行面同时裁掉 |
+| 工具策略 | `ToolPolicyMiddleware`：`readonly` 只允许知识工具 + 只读文件工具；`report` 另允许 `write_file` / `edit_file`；`task` / `delete` / `execute` 默认拒绝 |
 | 主 agent | `create_deep_agent(model=build_chat(agent.chat), tools, subagents=[], backend=StateBackend(), checkpointer=PG, store=PG)` |
 | CLI / API | `rag agent "问题" [--thread-id] [--no-writes]` / `rag agent --resume --thread-id <会话> --approve` / `POST /agent {message, thread_id, stream}` / `POST /agent/resume {thread_id, decisions}` |
 
@@ -1466,11 +1551,21 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
    而"哪条支撑哪句话"是靠 RRF 的分数与引用编号钉住的，不能交给模型的印象。
    （代价要说清：撤掉 `mode="isolated"` 的 subagent 之后，中间结果会累积在主上下文里；
    换来的是"一次工具调用 = 一次融合检索"这个形状。）
-2. **引用编号由我们发**（`CitationRegistry`）：工具返回的每条命中拿一个**全局递增的 `[n]`**，
-   同时登记 `n → Citation`；答案里的 `[n]` 直接查表。同一个来源复用同一个号；返回给调用方时
-   **只列答案里真的引用到的那些**（召回了 20 条只用 3 条时，全塞回去会让「哪条支撑哪句话」看不出来）。
+2. **引用编号由我们发**（`EvidenceLedger`）：工具返回的每条命中拿一个**全局递增的 `[n]`**，
+   同时登记 `n → Citation`；网页结果也登记到同一张表。答案里的 `[n]` 直接查表，同一个来源
+   复用同一个号；返回给调用方时**只列答案里真的引用到的那些**（召回了 20 条只用 3 条时，
+   全塞回去会让「哪条支撑哪句话」看不出来）。
 3. **每请求建图、但不重建模型**：工具要闭包住这次的引用表，所以图不能全局共享；
    而 embedder / reranker / chat 都在 `graphs/wiring.py::build_heavy` 里只建一次（M3 的教训）。
+4. **提示词只钉稳定契约**（2026-10-23）：主提示词负责证据优先、检索内容不可信、工具边界、
+   引用、冲突 / 部分回答和输出顺序；工具参数细节留在工具 docstring，格式例子留在 skill。
+   尤其明确 `task` 不用于委派检索，多节原文必须一次 `get_section` + `headings` 批量取，
+   低分检索反馈只指向 `web_search_tool`，不再提已删除的 `web-researcher`。
+   `tests/test_agent_tools.py` 钉住这几条，防止提示词以后在重构中被悄悄改薄。
+5. **工具权限用中间件，不靠提示词自觉**（2026-10-23）：`ToolPolicyMiddleware` 集成
+   `AgentMiddleware`，模型请求阶段按允许列表裁掉工具，执行阶段再拒绝越权调用。后者防的是
+   历史消息、缓存或模型幻觉绕过“它看不见”；两处共用同一个 `ToolPolicy`，测试覆盖编译后
+   真实图，而不只检查传给 `create_deep_agent` 的参数。
 
 ### 11.3 只读与多轮
 
@@ -1482,24 +1577,16 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 ```python
 agent = create_deep_agent(
     model=build_chat(settings, secrets, settings.agent.chat),   # 用哪家见 agent.chat（.env 的 AGENT_CHAT）
-    subagents=[
-        {"name": "vector-searcher",  "description": "语义相似检索，适合概念性/模糊问题",
-         "tools": [hybrid_search]},
-        {"name": "keyword-searcher", "description": "精确术语、编号、代码符号检索",
-         "tools": [bm25_search]},
-        {"name": "graph-explorer",   "description": "实体关系与多跳推理",
-         "tools": [graph_search]},
-        {"name": "web-researcher",   "description": "语料库外信息兜底",
-         "tools": [web_search]},   # web_search 调智谱的 web 搜索，工具自研，尚未落地
-        {"name": "report-writer",    "description": "汇总为带引用的报告"},
-    ],
+    tools=build_tools(settings, heavy, registry, gate=gate),
+    subagents=[],                           # 不再声明项目自己的检索 subagent
+    system_prompt=SYSTEM_PROMPT,            # 证据、安全、冲突与输出契约
     backend=CompositeBackend(default=StateBackend(), routes={
         "/workspace/": FilesystemBackend(root_dir="./data/workspace"),  # 报告落盘
-        "/memories/":  StoreBackend(store=store),                       # 跨会话记忆
     }),
-    memory=["/memories/AGENTS.md"],
-    interrupt_on={"write_file": True},       # 写盘要人批
+    memory=["/workspace/AGENTS.md"],         # 文件存在时才挂
+    interrupt_on={"write_file": True, "edit_file": True},
     checkpointer=checkpointer,
+    store=store,
 )
 ```
 
@@ -1513,8 +1600,9 @@ interrupt profile）确实对 Anthropic 支持最好，但价格也是最贵的 
 与批处理统一走国产模型：`agent.chat` 指向 `providers.chat` 的哪个条目，由 `.env` 的 `AGENT_CHAT`
 决定（默认 `default`，即 deepseek）。
 
-**还没做（M6）**：把「引用格式规范」「图谱检索怎么用」做成 **skill** 按需加载
-（比塞进 system prompt 省 token 也更准）；graph / web 两个 subagent。
+**框架注入的兜底**：deepagents 自动注入的 general-purpose / 文件工具先经过 ToolPolicy
+白名单。`task` 始终不可见、也不可执行；文件工具按 `readonly` / `report` 档位裁剪。
+引用格式已经按 skill 加载；图谱只作为检索通道，不再做 subagent。
 
 ### 11.5 批次 B：可写 workspace + HITL + 流式（2026-10-04）
 
@@ -1523,9 +1611,9 @@ interrupt profile）确实对 Anthropic 支持最好，但价格也是最贵的 
 * **不给** → `StateBackend`，与批次 A 一模一样：工具照样「成功」，但写的落点是内存
   state，**磁盘一个字不动**；
 * **给了** → `CompositeBackend(default=StateBackend(), routes={"/workspace/":
-  FilesystemBackend(root_dir=workspace)})`，同时 `interrupt_on` 给四个写类工具
-  （`write_file` / `edit_file` / `delete` / `execute`）各挂一道闸门。**四类一个都不能漏** ——
-  漏一个就是一个能改磁盘的洞；单测把这条钉死了。
+  FilesystemBackend(root_dir=workspace)})`，`interrupt_on` 只给策略允许的
+  `write_file` / `edit_file` 各挂一道闸门。`delete` / `execute` 更外层就被 ToolPolicy
+  拒绝，因此不会弹审批；权限判断与人工确认是两层，不能拿 HITL 冒充授权。
 
 `/workspace/` 是**虚拟根**：模型看到的路径是 `/workspace/report.md`，实际落在
 `agent.workspace_dir`（默认 `./data/workspace`）下 —— 实测确认过（写 `/workspace/sub/x.md`
@@ -1582,11 +1670,14 @@ base_url 从 `providers.chat.zhipuai.base_url`（**机密不进 yaml / Settings*
 **2026-10-08 起它直接挂主 agent**，不再藏在一个 `web-researcher` subagent 后面：
 「网络只当兜底」这条现在是 `WebSearchGate` 这个**机制**在管（语料没查过、或语料已有结果
 → 工具直接拒绝并回理由），不靠"主 agent 手上没有这个工具"。
+**Web 结果也进入 `EvidenceLedger`**（2026-10-23）：每条结果拿到与语料块同一编号空间的
+`[n]`，`source_type=web`、`title` 和 `url` 一起返回；前端点击时打开原链接，CLI 的来源清单
+明确写「来自网络」。不再出现“正文有编号、调用方却只有一段纯文本”的第二套来源格式。
 
 **图谱（`search_graph` 工具已删）**：§9.6 的知识图谱现在只以**一路通道**的身份出现
 （`type: neo4j`，`complement_only`：只补别人没找到的块），由检索层融合。
 原来那个 `graph-explorer` subagent 与 `search_graph` 工具在 2026-10-08 一并撤掉，
-理由与「工具只有四个」是同一条。它历史上的实测结论保留在这儿：**真机那轮模型没选它**
+理由与「知识工具只有四个」是同一条。它历史上的实测结论保留在这儿：**真机那轮模型没选它**
 （问「Flink 和 Spark 在定位上有什么不同」，它走了 `list_documents → search_keywords →
 search_knowledge → get_section`，11 步、引用 12 条，一次图谱都没查，答案是对的），
 与 §13.3 的 A/B 一致 —— 这份语料上关系信息本来就在正文里，所以图谱通道默认不开。
@@ -1673,8 +1764,10 @@ skills 是从 **backend** 读的（中间件只认 backend 路径），所以要
 
 真机验过：28 个 token 块逐块到达（不是攒完一次性发），`done` 事件带引用表。
 
-流式**不叠 QueryGraph**：纠错要在生成**之前**决定要不要重查，而流式是生成过程中的事。
-需要纠错就 `stream=false`。
+**流式也走生成前 QueryGraph**（2026-10-23）：`stream=true` 会先完成同一套
+`plan → retrieve → grade/replan → assemble`，随后才发出 `retrieval` 事件并开始
+`generator.astream`。检索纠错发生在第一个 token 之前，不需要把已发出的 token 回滚；
+`stream=true` 与 `stream=false` 只差最后一步的生成方式。
 
 `/agent` 的流式（批次 B）复用同一套心跳与断线取消，事件换成
 `token` / `tool` / `interrupt` / `done` —— agent 不是一条直线，中间会调工具、也可能停在
@@ -1683,8 +1776,9 @@ skills 是从 **backend** 读的（中间件只认 backend 路径），所以要
 ### 12.4 已知取舍
 
 * **`/ingest` 的路径是服务端本地路径**：不收上传流（multipart 上传是另一件事）。
-* **单 worker**（CLI 里写死 `workers=1`）：任务状态与模型单例都在进程内。要横向扩展得先把
-  状态挪出去（Redis 已经接上任务状态）、并把模型服务化 —— 那是部署期的事（§14）。
+* **多 worker 的共享状态已接上**（2026-10-23）：任务列表走 Redis 索引、灌库并发走
+  Redis 槽位租约、VLM 描述缓存在 MinIO 下按 key 共享。模型仍是每 worker 一份 ——
+  多 worker 会按 worker 数增加 embedding / rerank 的内存，这是当前明确代价。
 * **`/ingest` 与检索同进程争资源**：`api.max_concurrent_ingest`（默认 1）限住同时在跑的
   灌库任务；重活仍建议走 CLI。
 * **任务进度是粗粒度的**（排队/运行中/完成/失败 + 结果摘要），不是逐文件百分比。
@@ -1749,6 +1843,16 @@ rag sessions prune --keep 5           # 只保留最新 5 个；--dry-run 先看
 （`langchain_text_splitters` 的包 `__init__` 会顺带拉起 torch）。新增命令请照这个来，
 `tests/test_cli_startup.py` 在子进程里钉住了这条规矩。
 
+**命令组按领域分文件**（2026-10-23）：`cli/main.py` 只留核心流水线与命令注册，
+模型选型、注册表、存储迁移分别在 `cli/models.py`、`cli/registry.py`、`cli/storage.py`；
+Milvus 探活、错误翻译和异步执行抽到 `cli/runtime.py`。子模块只导出 `Typer` 实例，
+不反向 import `main.py`，因此没有循环依赖，命令名、参数与帮助文本保持不变。
+
+**API 路由同样按领域组合**：`api/routes.py` 现在是不到 30 行的聚合入口；
+系统管理、检索问答、文档工作流、会话与 agent 分别在 `*_routes.py`。共享的响应转换与
+SSE 报文在 `api/common.py`，限流只挂在聚合 router 一处，避免每个子路由各写一遍。
+这种拆法让 OpenAPI 继续由同一个 `create_app()` 生成，路径与 schema 不随文件边界变化。
+
 ### 12.6 会话残留的清理：`rag sessions`（2026-10-05）
 
 LangGraph 的 checkpointer **没有自动清理**：每聊一轮就多几版 `checkpoints`，另加
@@ -1790,11 +1894,16 @@ web/                 Vue 3 + TypeScript + Vite（pnpm 管理；**不引 UI 组�
   src/styles/app.css     外壳与组件样式（颜色一律引用 token）
   src/state.ts           极简共享状态：page / detail / status / theme / apiKey（不引 pinia）
   src/api.ts             接口薄封装：带 X-API-Key、拼 URL、把 SSE 拆成事件、取图转 blob
+  src/generated/openapi.ts  后端 OpenAPI schema 生成的 TS 类型（不手改）
   src/components/        NavRail / HitCard / LedgerTable / DetailPane / AssetImage
   src/views/             SearchView / ChatView / DocumentsView / LogsView（四个页面，**没有占位页**）
   src/App.vue            外壳装配：左导航 + 主区 + 右抽屉，主区按 page 切
   vite.config.ts     开发期把后端那几条路径代理到 127.0.0.1:8000（**不加 CORS**）
 ```
+
+**API 类型只有一个来源**（2026-10-23）：`scripts/generate_openapi_types.py`
+从 FastAPI OpenAPI 生成 `web/src/generated/openapi.ts`；`api.ts` 只保留类型别名与
+SSE/UI 专用事件。CI 跑 `--check`，后端 schema 改了却没重新生成会直接失败。
 
 **外壳的意义**：导航与详情抽屉只写一遍。加一个页面 = 在 `state.ts` 的 `PageId` 里加一项、
 在 `NavRail` 的 `items` 里加一行、写一个 view；不用再动外壳。**管理台就这四页**
@@ -2986,6 +3095,31 @@ Selector 循环里，为一份索引背这个约束不值得）。
 
 Milvus standalone 需要三个组件：**etcd + MinIO + milvus**。
 
+### 14.0 部署档位（2026-10-23）
+
+| profile | 数据库 | 文件 | Redis | workers |
+|---|---|---|---|---|
+| `single-node` | SQLite | local | 可选（不可用则进程内） | 1 |
+| `server` | PostgreSQL | local / MinIO | 可选 | 1 |
+| `scale-out` | PostgreSQL | MinIO | **必需** | `max(workers, replicas) >= 2` |
+
+`deployment.profile` 在 `load_settings()` 与 `create_app()` 都校验；不满足组合直接报错。
+`rag serve --workers N` 多 worker 时用 import-string 工厂让每个子进程重读配置；
+两个单 worker 容器通过 `deployment.replicas=2` 表达总副本数。
+
+**真实验收（2026-10-23）**：两个独立进程分别监听 18011 / 18012，`workers=1`、
+`replicas=2`，共享远端 PostgreSQL / Redis / MinIO；两边 `/health` 均为 `ok`，
+且 `ingest_gate=redis / job_store=redis / vision_cache=minio`。Docker 镜像与容器级
+验收仍未做，见 backlog #29。
+
+多 worker 的共享状态：
+
+- `JobStore`：任务 JSON + Redis sorted-set 索引，列表能看见其他 worker；
+- `IngestGate`：Redis `SET NX` 槽位 + 租约，finally 按 token 释放；scale-out 下 Redis
+  丢失会拒绝退回单进程；
+- VLM 描述缓存：scale-out 自动改用 MinIO，一个图片哈希一个 key，不存在 JSON 合并竞争；
+- 限流：沿用原 Redis 计数。
+
 ```yaml
 # deploy/docker-compose.yml（结构示意）
 services:
@@ -3065,7 +3199,7 @@ services:
 | **M2.5** 接入层 OCR | 扫描件与混合型 PDF 走 PaddleOCR-VL 产线服务（`auto` 逐页探测 → 整份送 OCR）+ 图片文件接入。**只碰 ingest**，不动检索/生成/编排 | 1–1.5 天 |
 | **M3** LangGraph 编排 | IndexGraph 断点续跑 + QueryGraph（plan→并行→融合→rerank→generate→grade 循环）+ 流式 | 3–4 天 |
 | **M4** API | FastAPI 五个端点 + SSE + 鉴权限流 | 2 天 |
-| **M5** deepagents | 主 agent + 5 个 subagent + CompositeBackend + memory + skills + HITL | 3–4 天 |
+| **M5** deepagents | 主 agent + 四个知识工具 + ToolPolicy + CompositeBackend + memory + skills + HITL | 3–4 天 |
 | **M6** 图谱 + 评测 | 实体关系抽取、graph 通道、ragas + 引用准确率、LangSmith、CI | 3–4 天 |
 
 **M1 结束就应该能 demo** —— 一个能问问题、带引用的最小 RAG。后面每阶段都是可独立停下的增量，不必全做完才有价值。
@@ -3267,7 +3401,7 @@ services:
 | `README.md` | **第一次见到这个项目的人**（评审、面试官、想跑起来的人） | 一句话定位、能力一览（agent 层单独一节）、**实测数字**、架构图、怎么跑、已知边界 | 论证过程、逐题的调研、踩坑细节 |
 | `docs/results.md` | 想知道"到底跑出什么数"的人 | **只有数字与口径**，每张表标出它在本文档的出处 | 论证（只说"为什么这么选"在本文档哪一节） |
 | `docs/architecture.md`（本文档） | 要改这个仓库的人 | 决策与理由（ADR）、验证清单、踩过的坑、**为什么不是另一种做法** | 待办清单 |
-| `docs/plugins.md` | 要接新数据源的人 | 两个扩展点的约定与写法 | — |
+| `docs/plugins.md` | 要接新数据源或可选解析器的人 | 通道、CLI 命令与 parser 扩展包的约定与写法 | — |
 | `docs/milvus-schema-design.md` | 要动 collection 的人 | 字段与索引为什么是现在这样 | — |
 | `docs/backlog.md` | **只给自己**（已 gitignore，不发布） | 还没做的事、已知问题、内网地址与本地细节 | — |
 | `CHANGELOG.md` | **只给自己**（已 gitignore） | 逐阶段的变更记录 | — |

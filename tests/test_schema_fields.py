@@ -43,6 +43,13 @@ def test_schema_declares_the_new_fields() -> None:
     assert {"chunk_id", "doc_id", "chunk_index", "source_uri", "metadata", "text"} <= names
 
 
+def test_versioned_schema_adds_batch_and_logical_id_fields() -> None:
+    schema = build_schema(VectorIndexConfig(), dim=1024, include_batch_id=True)
+    names = {field.name for field in schema.fields}
+
+    assert {"index_batch_id", "logical_chunk_id"} <= names
+
+
 def test_assets_is_a_typed_array_not_json() -> None:
     """图片路径用 ARRAY<VARCHAR>：类型化、容量显式、能用 array_contains 过滤。"""
     schema = build_schema(VectorIndexConfig(), dim=1024)
@@ -120,6 +127,16 @@ def test_row_carries_every_new_field_to_milvus() -> None:
     assert row["page"] == 3 and row["line"] == 12
     # sparse 绝不能出现在写入行里：它是 BM25 function 的输出
     assert "sparse" not in row
+
+
+def test_versioned_row_uses_a_physical_id_but_keeps_the_logical_id() -> None:
+    index = MilvusIndex(VectorIndexConfig(), dim=4, include_batch_id=True)
+
+    row = index._row(_chunk(), [0.0, 0.0, 0.0, 0.0], "batch-1")
+
+    assert row["chunk_id"] == "batch-1:d1:0000"
+    assert row["logical_chunk_id"] == "d1:0000"
+    assert row["index_batch_id"] == "batch-1"
 
 
 def test_too_many_assets_fails_loudly_instead_of_truncating() -> None:

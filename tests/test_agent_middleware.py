@@ -7,16 +7,115 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.messages import ToolMessage
 
-from rag.agent.middleware import ToolErrorMiddleware
+from rag.agent.middleware import ToolErrorMiddleware, ToolPolicy, ToolPolicyMiddleware
 
 
 class _Request:
     def __init__(self, name: str = "search_graph", args: Any = None) -> None:
         self.tool_call = {"name": name, "id": "call-1", "args": args or {"query": "Flink"}}
+
+
+class _ModelRequest:
+    def __init__(self, tools: list[Any]) -> None:
+        self.tools = tools
+
+    def override(self, **changes: Any) -> _ModelRequest:
+        return _ModelRequest(changes.get("tools", self.tools))
+
+
+def _tool(name: str) -> SimpleNamespace:
+    return SimpleNamespace(name=name)
+
+
+def test_readonly_policy_filters_the_model_visible_surface() -> None:
+    tools = [
+        _tool("search_knowledge"),
+        _tool("read_file"),
+        _tool("write_file"),
+        _tool("delete"),
+        _tool("execute"),
+        _tool("task"),
+    ]
+    seen: list[str] = []
+
+    def handler(request: Any) -> Any:
+        seen.extend(tool.name for tool in request.tools)
+        return "ok"
+
+    out = ToolPolicyMiddleware(ToolPolicy.readonly()).wrap_model_call(
+        _ModelRequest(tools),
+        handler,
+    )
+
+    assert out == "ok"
+    assert seen == ["search_knowledge", "read_file"]
+
+
+def test_report_policy_allows_report_writes_but_not_shell_or_delete() -> None:
+    tools = [
+        _tool("write_file"),
+        _tool("edit_file"),
+        _tool("delete"),
+        _tool("execute"),
+        _tool("task"),
+    ]
+
+    async def handler(request: Any) -> Any:
+        return [tool.name for tool in request.tools]
+
+    out = asyncio.run(
+        ToolPolicyMiddleware(ToolPolicy.report()).awrap_model_call(
+            _ModelRequest(tools),
+            handler,
+        )
+    )
+
+    assert out == ["write_file", "edit_file"]
+
+
+def test_policy_rejects_a_denied_tool_before_its_handler(caplog: Any) -> None:
+    called = False
+
+    async def handler(request: Any) -> Any:
+        nonlocal called
+        called = True
+        return ToolMessage(content="不该执行", tool_call_id="call-1")
+
+    with caplog.at_level("WARNING", logger="rag.agent.tool"):
+        out = asyncio.run(
+            ToolPolicyMiddleware(ToolPolicy.report()).awrap_tool_call(
+                _Request(name="execute"),
+                handler,
+            )
+        )
+
+    assert called is False
+    assert isinstance(out, ToolMessage)
+    assert out.status == "error"
+    assert "execute" in out.content and "不可用" in out.content
+    assert "工具策略拒绝：tool=execute mode=report" in caplog.text
+
+
+def test_policy_passes_an_allowed_tool_to_its_handler() -> None:
+    sentinel = ToolMessage(content="正常结果", tool_call_id="call-1")
+    called = False
+
+    def handler(request: Any) -> Any:
+        nonlocal called
+        called = True
+        return sentinel
+
+    out = ToolPolicyMiddleware(ToolPolicy.readonly()).wrap_tool_call(
+        _Request(name="search_knowledge"),
+        handler,
+    )
+
+    assert called is True and out is sentinel
 
 
 def test_a_failing_tool_becomes_a_readable_tool_message(caplog: Any) -> None:

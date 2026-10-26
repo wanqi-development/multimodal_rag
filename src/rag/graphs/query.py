@@ -1,8 +1,8 @@
-"""QueryGraph：带自我纠错的检索问答（M3）。
+"""QueryGraph：带自我纠错的检索预检，可选接一次性生成（M3）。
 
 ```
-plan ──► retrieve ──► grade ──┬──► assemble ──► generate ──► END
-  ▲                            │
+plan ──► retrieve ──► grade ──┬──► assemble ──┬──► generate ──► END
+  ▲                            │               └──► END（流式预检）
   └──── 资料不够（轮数没用完） ─┘
 ```
 
@@ -103,6 +103,17 @@ class QueryGraphResult(TypedDict):
     grade: dict[str, Any]
 
 
+class QueryPreparation(TypedDict):
+    """生成前已经确定的检索结果；流式与非流式都从这里接生成。"""
+
+    hits: list[ScoredChunk]
+    context: AssembledContext
+    citations: list[Citation]
+    rounds: int
+    stats: list[ChannelStats]
+    grade: dict[str, Any]
+
+
 def parse_json_object(text: str) -> dict[str, Any]:
     """从模型输出里抠出那个 JSON 对象。
 
@@ -147,12 +158,13 @@ def build_query_graph(
     retrieve: RetrieveFn,
     plan_llm: JsonFn,
     grade_llm: JsonFn,
-    generate: Callable[[str, AssembledContext], Awaitable[str]],
+    generate: Callable[[str, AssembledContext], Awaitable[str]] | None = None,
     channels: list[str] | None = None,
 ) -> Any:
-    """组图。所有外部依赖（检索、两个 LLM 调用、生成）都是**传进来的**。
+    """组图；``generate=None`` 时只跑到 assemble，供流式生成前预检。
 
-    这样做不是为了好看：图本身要能被单测跑起来，而单测不该连 Milvus、也不该调线上模型。
+    所有外部依赖（检索、两个 LLM 调用、生成）都是传进来的。图本身要能被单测跑起来，
+    而单测不该连 Milvus、也不该调线上模型。
     """
     cfg = settings.graph
     # 计划里能选的**通道名**（配置里的 `retrieval.channels[].name`）；空 = 不限制
@@ -228,19 +240,21 @@ def build_query_graph(
         context = assemble(state.get("hits") or [], settings.retrieval.assemble.max_tokens)
         return {"context": context, "citations": context.citations}
 
-    async def generate_node(state: QueryState) -> QueryState:
-        context = state.get("context")
-        if context is None:  # 理论上到不了；真到不了也别让 State 缺键炸在生成那一步
-            context = AssembledContext(text="")
-        return {"answer": await generate(state["question"], context)}
-
     graph = StateGraph(QueryState)
     graph.add_node("plan", plan_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("grade", grade_node)
     graph.add_node("plan_again", plan_again)
     graph.add_node("assemble", assemble_node)
-    graph.add_node("generate", generate_node)
+    if generate is not None:
+
+        async def generate_node(state: QueryState) -> QueryState:
+            context = state.get("context")
+            if context is None:  # 理论上到不了；真到不了也别让 State 缺键炸在生成那一步
+                context = AssembledContext(text="")
+            return {"answer": await generate(state["question"], context)}
+
+        graph.add_node("generate", generate_node)
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "retrieve")
     graph.add_edge("retrieve", "grade")
@@ -248,9 +262,50 @@ def build_query_graph(
         "grade", after_grade, {"plan": "plan_again", "assemble": "assemble"}
     )
     graph.add_edge("plan_again", "plan")
-    graph.add_edge("assemble", "generate")
-    graph.add_edge("generate", END)
+    if generate is not None:
+        graph.add_edge("assemble", "generate")
+        graph.add_edge("generate", END)
+    else:
+        graph.add_edge("assemble", END)
     return graph.compile()
+
+
+def build_query_preflight(
+    settings: Settings,
+    *,
+    retrieve: RetrieveFn,
+    plan_llm: JsonFn,
+    grade_llm: JsonFn,
+    channels: list[str] | None = None,
+) -> Any:
+    """只编译生成前部分：plan → retrieve → grade/replan → assemble。"""
+    return build_query_graph(
+        settings,
+        retrieve=retrieve,
+        plan_llm=plan_llm,
+        grade_llm=grade_llm,
+        generate=None,
+        channels=channels,
+    )
+
+
+async def run_query_preflight(
+    graph: Any,
+    question: str,
+    *,
+    top_k: int = 8,
+) -> QueryPreparation:
+    """跑生成前图，返回统一的检索上下文。"""
+    state = await graph.ainvoke({"question": question, "top_k": top_k, "round": 0})
+    context = state.get("context") or AssembledContext(text="")
+    return QueryPreparation(
+        hits=state.get("hits") or [],
+        context=context,
+        citations=context.citations,
+        rounds=state.get("round", 0) + 1,
+        stats=state.get("stats") or [],
+        grade=state.get("grade") or {},
+    )
 
 
 async def run_query_graph(

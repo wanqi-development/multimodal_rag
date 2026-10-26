@@ -19,6 +19,10 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from rag import __version__
+from rag.cli.models import models_app
+from rag.cli.registry import registry_app
+from rag.cli.runtime import _probe_milvus, _run_async
+from rag.cli.storage import storage_app
 from rag.config import Settings, get_secrets, load_settings
 
 if TYPE_CHECKING:  # 只为标注：这些都是重依赖，别在模块级真 import（见模块说明）
@@ -140,61 +144,6 @@ def _require(heavy, *names: str) -> None:
     if missing:
         typer.secho("组件建不起来：" + "；".join(missing), fg=typer.colors.RED)
         raise typer.Exit(code=1)
-
-
-async def _probe_milvus(index, settings) -> None:
-    """开工前探一次活；接不住就一行话 + 退出 1。
-
-    实测（§16）：虚拟机上的 Milvus 停掉后，`rag ingest` 在写库那一步空转**三十几分钟**
-    （纯 CPU 烧、零 I/O，数据一行没进），而库还查不出为什么。探活把这段等待压到
-    `indexing.vector.probe_timeout_s`（默认 5 秒），而且探在**解析/OCR 之前** ——
-    否则那几十分钟的 OCR 也白花。
-    """
-    timeout = settings.indexing.vector.probe_timeout_s
-    uri = settings.indexing.vector.uri
-    try:
-        await index.ping(timeout_s=timeout)
-    except TimeoutError:
-        typer.secho(f"Milvus 探活超时（{timeout:g} 秒没响应）：{uri}", fg=typer.colors.RED)
-        typer.secho(
-            "  先确认服务起来了（虚拟机上的 etcd + MinIO + milvus），或检查 .env 里的 MILVUS_URI；"
-            "机器慢就把 indexing.vector.probe_timeout_s 调大。",
-            fg=typer.colors.YELLOW,
-        )
-        raise typer.Exit(code=1) from None
-    except Exception as exc:  # noqa: BLE001 —— 连不上交给 _explain 翻成人话，别的原样抛
-        _explain(exc, settings)
-
-
-def _explain(exc: Exception, settings) -> None:
-    """把「连不上 Milvus」说成人话，而不是甩一屏 pymilvus 的调用栈。
-
-    实测：Milvus 停掉时 CLI 会吐 **100 行 traceback**（`Failed to connect …` 埋在中间），
-    而 API 那边早就是「503 + 一句话」。同一件事两种体验没道理，所以这里也收成一句。
-    只认「连不上」这一类；别的异常**原样抛出去** —— 不能把真 bug 也一起吞掉。
-    """
-    from pymilvus.exceptions import MilvusException
-
-    if not isinstance(exc, MilvusException) or "Fail connecting" not in str(exc):
-        raise exc
-    uri = settings.indexing.vector.uri
-    typer.secho(f"Milvus 连不上：{uri}", fg=typer.colors.RED)
-    typer.secho(
-        "  先确认服务起来了（虚拟机上那套 etcd + MinIO + milvus），或检查 .env 里的 MILVUS_URI。",
-        fg=typer.colors.YELLOW,
-    )
-    raise typer.Exit(code=1) from None
-
-
-def _run_async(coro, settings):
-    """跑协程，并把「连不上 Milvus」翻译成人话（其它异常原样抛出）。
-
-    所有会碰库的命令都走这里 —— 否则每个命令都要抄一遍 try/except。
-    """
-    try:
-        return asyncio.run(coro)
-    except Exception as exc:  # noqa: BLE001 —— 不匹配的会由 _explain 原样抛出
-        _explain(exc, settings)
 
 
 def _parse_filters(pairs: list[str]) -> dict[str, Any]:
@@ -729,44 +678,30 @@ def ask(
     filters = _parse_filters(where)
 
     async def _run() -> tuple[str, list[ScoredChunk], list, dict]:
-        from rag.graphs import build_query_graph, run_query_graph
-        from rag.graphs.wiring import build_heavy, build_query_nodes
+        from rag.graphs import build_answer_engine
+        from rag.graphs.wiring import build_heavy
         from rag.indexing import build_index
-        from rag.retrieval import assemble, build_retriever
 
         index = build_index(settings)
         await _probe_milvus(index, settings)
         await index.ensure_ready()
         heavy = build_heavy(settings, index, chat_name=chat)
         _require(heavy, "embedding", "generator")
-        if settings.graph.enabled:
-            # QueryGraph：plan → retrieve → grade →（不够就改写重查）→ assemble → generate
-            retrieve, plan_llm, grade_llm, generate = build_query_nodes(settings, index, heavy)
-            # 计划里能选的通道名 = 这次启用的那几路（`retrieval.channels[].name`）
-            known = [item.name for item in settings.retrieval.channels if item.enabled]
-            graph_app = build_query_graph(
-                settings,
-                retrieve=retrieve,
-                plan_llm=plan_llm,
-                grade_llm=grade_llm,
-                generate=generate,
-                channels=known,
-            )
-            result = await run_query_graph(graph_app, question, top_k=top_k)
-            return (
-                result["answer"],
-                result["hits"],
-                result["stats"],
-                {
-                    "rounds": result["rounds"],
-                    "grade": result["grade"],
-                },
-            )
-        retriever = build_retriever(settings, index, heavy.embedder, heavy.reranker)
-        hits = await retriever.retrieve(question, top_k, filters=filters or None)
-        context = assemble(hits, settings.retrieval.assemble.max_tokens)
-        answer = await heavy.generator.generate(question, context)
-        return answer, hits, getattr(retriever, "last_stats", []), {}
+        result = await build_answer_engine(settings, index, heavy).answer(
+            question,
+            top_k,
+            filters=filters or None,
+        )
+        return (
+            result.answer,
+            result.hits,
+            result.stats,
+            {
+                "mode": result.mode,
+                "rounds": result.rounds,
+                "grade": result.grade,
+            },
+        )
 
     answer, hits, stats_rows, meta = _run_async(_run(), settings)
     typer.echo("")
@@ -777,7 +712,7 @@ def ask(
         _print_hits(hits)
     if stats:
         _print_stats(stats_rows)
-    if meta:
+    if meta.get("mode") == "graph":
         grade = meta.get("grade") or {}
         typer.echo(
             f"\n编排：{meta['rounds']} 轮，自评 {float(grade.get('score') or 0):.2f}"
@@ -1561,6 +1496,9 @@ def _pct(value: float | None) -> str:
 def serve(
     host: str | None = typer.Option(None, help="监听地址；默认用 api.host"),
     port: int | None = typer.Option(None, help="监听端口；默认用 api.port"),
+    workers: int | None = typer.Option(
+        None, "--workers", min=1, help="worker 数；默认用 api.workers"
+    ),
     reload: bool = typer.Option(False, "--reload", help="改代码自动重启（仅开发用）"),
 ) -> None:
     """启动 FastAPI 服务（M4）。
@@ -1568,9 +1506,9 @@ def serve(
     端点：`/health`、`/search`、`/chat`（`stream=true` 走 SSE）、`/ingest`（202 + job_id）、
     `/jobs/{id}`。鉴权走 `X-API-Key`（`.env` 的 `RAG_API_KEY`；没配就只允许本机）。
 
-    **单 worker**：任务状态与模型单例都在进程内，多 worker 会让内存翻倍且 `/jobs` 查不到
-    别的 worker 提交的任务。要横向扩展得先把状态挪出去（Redis 已经接上了任务状态，
-    但模型单例仍在进程内）。
+    `single-node` 默认单 worker；`scale-out` 要求 PostgreSQL + MinIO + Redis 且 workers>=2。
+    多 worker 时任务列表、灌库槽位与 VLM 缓存走共享后端；embedding/rerank 模型仍会在
+    每个 worker 各加载一份，这是内存代价。
 
     **loop 必须显式指到我们的工厂**：uvicorn ≥0.36 不再看事件循环策略，它在 Windows 上
     自己建 `ProactorEventLoop`，而 psycopg 的 async 在那上面直接拒绝启动（实测）。详见
@@ -1584,6 +1522,13 @@ def serve(
     if host or port:
         settings.api.host = host or settings.api.host
         settings.api.port = port or settings.api.port
+    if workers is not None:
+        settings.api.workers = workers
+    from rag.deployment import validate_deployment
+
+    validate_deployment(settings)
+    if reload and settings.api.workers > 1:
+        raise typer.BadParameter("--reload 不能和 --workers > 1 同时使用", param_hint="--workers")
     # **在 uvicorn 之前把 logging 装好**：装的是 root logger，第三方库（LangChain、
     # pymilvus、httpx…）的日志也会走同一套 handler —— 它们以前只能在 stderr 上裸奔
     from rag.obs import configure_logging
@@ -1591,16 +1536,18 @@ def serve(
     configure_logging(settings)
     typer.echo(
         f"服务：http://{settings.api.host}:{settings.api.port}  "
+        f"profile={settings.deployment.profile} workers={settings.api.workers}  "
         f"（鉴权=已关闭（2026-10-06 起不再用 RAG_API_KEY），"
         f"限流={settings.api.rate_limit_per_min}/分钟，"
         f"Redis={settings.api.redis.url or '未配（退回进程内）'}）"
     )
+    app = create_app(settings) if settings.api.workers == 1 else "rag.api:create_app_from_env"
     uvicorn.run(
-        create_app(settings),
+        app,
         host=settings.api.host,
         port=settings.api.port,
         reload=reload,
-        workers=1,
+        workers=settings.api.workers,
         # 接口日志我们自己记（带 request_id，与 agent/通道日志串得起来）；
         # 再叠一份 uvicorn 的 access log 只会重复且格式对不上
         access_log=False,
@@ -1637,291 +1584,9 @@ def _mount_plugin_commands() -> None:
 # **模块级挂**：Typer/Click 先解析子命令再进回调，挂晚了 `rag graph …` 会认不出来。
 _mount_plugin_commands()
 
-models_app = typer.Typer(
-    help="模型选型（槽位 → 谁）：存库 + 审计。**这一版写入后重启生效**（热切是遗留项）",
-    no_args_is_help=True,
-)
 app.add_typer(models_app, name="models")
-
-
-@models_app.command("init")
-def models_init() -> None:
-    """建两张表（幂等）：`model_setting`（当前选型）与 `model_setting_change`（审计）。
-
-    **这是一次写操作**，所以要显式触发。库的选法见 `models.backend`：
-    `auto`（默认）= 配了 PG 用 PG，否则单机 SQLite（`models.sqlite_path`）。
-    """
-    from rag.persistence.model_settings import build_model_setting_store
-
-    settings = load_settings()
-    store = build_model_setting_store(settings)
-    store.setup()
-    typer.secho(
-        f"模型选型表已就绪：{store.name}（backend={settings.models.backend}）",
-        fg=typer.colors.GREEN,
-    )
-
-
-@models_app.command("list")
-def models_list() -> None:
-    """八个槽位 + 当前选的谁 + **这份值是哪层来的**。只读。"""
-    from rag.config.schema import MODEL_SLOTS
-    from rag.persistence.model_settings import build_model_setting_store
-
-    settings = load_settings()
-    stored = build_model_setting_store(settings).all()
-    typer.echo(f"{'槽位':<14}{'来源':<10}{'provider_key':<16}{'model':<34}{'版本':>4}  更新时间")
-    for slot in MODEL_SLOTS:
-        row = stored.get(slot)
-        if row is None:
-            typer.echo(f"{slot:<14}{'未设置':<10}{'-':<16}{'（沿用 .env / yaml）':<34}{'-':>4}  -")
-            continue
-        typer.echo(
-            f"{slot:<14}{'库':<10}{row['provider_key'] or '-':<16}"
-            f"{(row['model'] or '-'):<34}{row['version']:>4}  {row['updated_at']}"
-        )
-    typer.echo("\n优先级：**库 > .env > yaml 默认**（库里没有的槽位就走原处那份配置）")
-
-
-@models_app.command("set")
-def models_set(
-    slot: str = typer.Argument(..., help="槽位名，如 chat.agent / rerank"),
-    provider_key: str = typer.Option(
-        "", "--provider-key", help="chat 指 providers.chat 的键名；rerank 指 backend"
-    ),
-    model: str = typer.Option("", "--model", help="模型名或本地路径"),
-    actor: str = typer.Option("", "--actor", help="谁改的（写进审计）"),
-) -> None:
-    """写一个槽位（写库 + **写一行审计**）。**重启服务才生效** —— 这一版不做热切。"""
-    from rag.persistence.model_settings import build_model_setting_store
-
-    settings = load_settings()
-    store = build_model_setting_store(settings)
-    result = store.set(slot, provider_key=provider_key, model=model, actor=actor or "cli")
-    typer.secho(
-        f"{result['slot']} → provider_key={provider_key or '-'} model={model or '-'}"
-        f"（版本 {result['version']}，已记审计）",
-        fg=typer.colors.GREEN,
-    )
-    typer.secho("重启 `rag serve` 后生效（这一版不做热切）。", fg=typer.colors.YELLOW)
-
-
-registry_app = typer.Typer(
-    help="文档注册表（每篇一行：走到哪一步 + 入库信息）。**2026-10-09 起落数据库**（PG / SQLite）",
-    no_args_is_help=True,
-)
 app.add_typer(registry_app, name="registry")
-
-
-@registry_app.command("init")
-def registry_init() -> None:
-    """建 `document_registry` 表（幂等）。**写操作**，所以显式触发 —— 与
-    `rag models init` / `rag logs init` / `rag chats init` 同一个规矩。"""
-    from rag.persistence.documents import build_document_store
-
-    settings = load_settings()
-    store = build_document_store(settings)
-    store.setup()
-    typer.secho(
-        f"文档注册表已就绪：{store.name}（backend={settings.documents.backend}）",
-        fg=typer.colors.GREEN,
-    )
-
-
-@registry_app.command("migrate")
-def registry_migrate(
-    from_milvus: bool = typer.Option(
-        False, "--from-milvus", help="再按旧 Milvus 注册表把「真的入库了」标出来（要 Milvus 活着）"
-    ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="只报数，一个字都不写"),
-) -> None:
-    """把**已经存在的**文档搬进新表（这一步不重灌、不调模型、不花钱）。
-
-    为什么需要它：注册表从 Milvus 搬到数据库之后，老数据的"这份走到哪一步了"没有地方记 ——
-    不搬的话页面会把明明做过解析/切分的文档显示成"什么都没做"，逼人重来一遍。
-
-    两路来源，**都不依赖向量库**（除非显式加 `--from-milvus`）：
-
-    * `data/uploads/` —— 每个上传件一行，状态至少是 `uploaded`；
-    * `data/stages/<doc_id>/` —— 有 `document.md` → `parsed`、有 `outline.tsv` → `reviewed`、
-      有 `chunks.json` → `chunked`（块数 / 文件哈希 / 切法指纹都从这份产物抄）。
-
-    **`indexed` 只能问 Milvus**：产物齐不代表灌进去了。所以 `--from-stages` 走到
-    `chunked` 为止（看起来像"没入库"，重跑 `/index` 是安全的幂等操作）；等向量库好了，
-    再跑一次 `--from-milvus` 把真正入库的那些补标成 `indexed`。
-
-    命令**幂等，且只前进不后退**：已经是 `indexed` 的行不会被 `chunked` 覆盖。
-    """
-    from rag.api.uploads import build_upload_store
-    from rag.contracts import DocRecord, stage_rank
-    from rag.ingest.stages import build_artifact_store
-    from rag.persistence.documents import build_document_store
-
-    settings = load_settings()
-    store = build_document_store(settings)
-    store.setup()
-    current = store.sync_stages()
-
-    # 1) 上传件：至少 `uploaded`（`sources` 存落盘名，注册表里 `source_uri` 记的就是它）
-    planned: dict[str, str] = {}
-    sources: dict[str, str] = {}
-    for item in build_upload_store(settings).list():
-        planned[item.doc_id] = "uploaded"
-        sources[item.doc_id] = item.name
-
-    # 2) 产物：按"最高走到哪一步"升级（**不读 Milvus**）
-    artifacts = build_artifact_store(settings)
-    payloads: dict[str, dict] = {}
-    root = Path(settings.ingest.stages.dir)
-    if root.is_dir():
-        for entry in sorted(root.iterdir()):
-            if not entry.is_dir():
-                continue
-            doc_id = entry.name
-            stage = planned.get(doc_id, "uploaded")
-            if (entry / "document.md").is_file() or (entry / "document.json").is_file():
-                stage = "parsed"
-            if (entry / "outline.tsv").is_file():
-                stage = "reviewed"
-            payload = artifacts.read_payload(doc_id, "chunks.json")
-            if payload is not None:
-                stage = "chunked"
-                payloads[doc_id] = payload
-            planned[doc_id] = stage
-
-    # 3) 可选：旧 Milvus 注册表 → 真正入库的那些（**只有向量库活着才拿得到**）
-    records: dict[str, DocRecord] = {}
-    if from_milvus:
-        from rag.indexing.milvus.registry import DocRegistry
-
-        try:
-            records = asyncio.run(DocRegistry(settings.indexing.vector).all())
-        except Exception as exc:  # noqa: BLE001 —— 库够不着就退回「只按产物搬」
-            typer.secho(
-                f"读不到旧 Milvus 注册表（{type(exc).__name__}: {str(exc)[:160]}）；"
-                f"这次只按产物搬，入库状态等向量库好了再补。",
-                fg=typer.colors.YELLOW,
-            )
-        for doc_id, record in records.items():
-            planned[doc_id] = "indexed"
-            sources.setdefault(doc_id, record.source_uri)
-
-    counts: dict[str, int] = {}
-    advanced = 0
-    for doc_id, stage in sorted(planned.items()):
-        # **只前进不后退**：已经是 indexed 的行不该被产物那一趟拽回 chunked
-        if stage_rank(stage) <= stage_rank(current.get(doc_id, "")):
-            continue
-        counts[stage] = counts.get(stage, 0) + 1
-        advanced += 1
-        if dry_run:
-            continue
-        store.sync_set_stage(doc_id, stage, sources.get(doc_id, ""))
-        record = records.get(doc_id)
-        if record is None and doc_id in payloads:
-            payload = payloads[doc_id]
-            record = DocRecord(
-                doc_id=doc_id,
-                source_uri=str(payload.get("source_uri") or sources.get(doc_id, "")),
-                content_hash=str(payload.get("file_hash") or ""),
-                chunk_count=len(payload.get("chunks") or []),
-                ingested_at=int(payload.get("saved_at") or 0),
-                # 注册表那一列 = 切法指纹 + 这一份的清单指纹（见 commit.index_fingerprint）
-                pipeline_version=f"{payload.get('pipeline_version') or ''}"
-                f"+{payload.get('outline_hash') or ''}",
-            )
-        if record is not None:
-            # `stage=""`：状态上面已经写好了，这里只补数字，别把状态再写一遍
-            store.sync_upsert([DocRecord(**{**record.model_dump(), "stage": ""})])
-
-    total = "、".join(f"{name} {count}" for name, count in sorted(counts.items()) if count)
-    head = "--dry-run（什么都没写）：" if dry_run else "已写入："
-    typer.secho(f"{head}{advanced} 份（{total or '无'}）", fg=typer.colors.GREEN)
-    typer.echo(f"注册表：{store.name}（backend={settings.documents.backend}）")
-    if not from_milvus:
-        typer.secho(
-            "入库状态没搬（那只能问 Milvus）。等向量库好了再跑 "
-            "`rag registry migrate --from-milvus`，把真正入库的补标成 indexed。",
-            fg=typer.colors.YELLOW,
-        )
-
-
-storage_app = typer.Typer(
-    help="文件落点：本地盘 / MinIO 桶（多 worker 用桶，见 storage.py）", no_args_is_help=True
-)
 app.add_typer(storage_app, name="storage")
-
-
-@storage_app.command("migrate")
-def storage_migrate(
-    dry_run: bool = typer.Option(False, "--dry-run", help="只报数，一个字都不写"),
-    only: str = typer.Option(
-        "uploads,stages,assets,media", "--only", help="只搬这几个域（逗号分隔）"
-    ),
-) -> None:
-    """把**本地盘上已有的**文件推上 MinIO 桶（幂等）。改动的是桶，本地文件不删。
-
-    什么时候用：把统一开关 `storage.backend`（或某一域的 `backend`）从 `local` 改成
-    `minio` **之后**。不改的话新上传的会进桶，而老文件还在本地 —— 页面就少看见它们
-    （台账已经独立在库里，不会丢）。只搬**解析后**为 minio 的那几个域；`--dry-run`
-    先看会搬多少。
-
-    键与两个后端保持一致（`<域前缀>/<相对路径>`），所以搬完读到的还是同一批 `doc_id`。
-    """
-    from rag.api.uploads import INDEX_NAME
-    from rag.storage import LocalBlobStore, build_blob_store, resolve_storage_backend
-
-    settings = load_settings()
-    wanted = {item.strip() for item in only.split(",") if item.strip()}
-    plan = (
-        (
-            "uploads",
-            settings.ingest.uploads.backend,
-            settings.ingest.uploads.dir,
-            settings.ingest.uploads.prefix,
-        ),
-        (
-            "stages",
-            settings.ingest.stages.backend,
-            settings.ingest.stages.dir,
-            settings.ingest.stages.prefix,
-        ),
-        (
-            "assets",
-            settings.ingest.assets.backend,
-            settings.ingest.assets.dir,
-            settings.ingest.assets.prefix,
-        ),
-        ("media", settings.api.media_backend, settings.api.media_dir, settings.api.media_prefix),
-    )
-    total = 0
-    for name, backend, directory, prefix in plan:
-        if name not in wanted:
-            continue
-        # 四个域默认写 auto = 听统一开关 `storage.backend`，所以这里得先解析再判
-        resolved = resolve_storage_backend(settings, backend)
-        if resolved != "minio":
-            typer.secho(
-                f"{name}：backend={resolved}，跳过（只搬配成 minio 的域）", fg=typer.colors.YELLOW
-            )
-            continue
-        local = LocalBlobStore(directory)
-        # 那份老台账（`_index.json`）与半截文件（`.part`）不是内容，别搬进桶
-        all_keys = local.keys()
-        keys = [
-            key for key in all_keys if not key.endswith(".part") and Path(key).name != INDEX_NAME
-        ]
-        total += len(keys)
-        if dry_run:
-            typer.echo(f"{name}：将搬 {len(keys)} 个文件 → {prefix}/")
-            continue
-        target = build_blob_store(backend="minio", settings=settings, dir=directory, prefix=prefix)
-        for key in keys:
-            target.put(key, local.get(key))
-        typer.secho(f"{name}：已搬 {len(keys)} 个 → {target.name}", fg=typer.colors.GREEN)
-    head = "--dry-run（什么都没写）" if dry_run else "搬完"
-    typer.secho(f"{head}：共 {total} 个文件", fg=typer.colors.GREEN)
-
 
 if __name__ == "__main__":
     app()

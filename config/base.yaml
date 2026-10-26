@@ -22,6 +22,15 @@ storage:
     # 只认 Path 的消费方（loader / PyMuPDF / OCR）的读穿透缓存：桶是真相，这里是副本
     cache_dir: ${RAG_BLOB_CACHE:-./data/cache/blobs}
 
+deployment:
+  # single-node：SQLite + local（默认）
+  # server：PostgreSQL 必需，单 worker
+  # scale-out：PostgreSQL + MinIO + Redis 必需，workers >= 2
+  profile: ${RAG_DEPLOYMENT_PROFILE:-single-node}
+  # 外部容器/进程副本数；两个单 worker 容器时设 2
+  replicas: ${RAG_DEPLOYMENT_REPLICAS:-1}
+  ingest_lease_s: ${RAG_INGEST_LEASE_S:-86400}
+
 providers:
   # 按名字分组，"多供应商可切换" = 换一组 .env，不用改代码。
   #
@@ -239,6 +248,9 @@ ingest:
     # 单次最多描述几张图，0 = 不限制。**先花几毛钱看效果**的口子：
     # 打开 describe 之前先用它跑几张，确认提示词与模型对路再全量。
     max_images: 0
+    # auto（默认听 storage.backend）| local | minio
+    cache_backend: ${RAG_VISION_CACHE_BACKEND:-auto}
+    cache_prefix: image-cache
     # 描述缓存。键 = 图片内容哈希 + 模型 + 提示词版本：
     # 改一段正文不该让几十张图全部重问一遍（见 docs/milvus-schema-design.md §4.4）
     cache_path: ${RAG_VISION_CACHE:-./data/cache/image_descriptions.json}
@@ -299,6 +311,11 @@ indexing:
     #   v2：1024 维的 Qwen3 + 8 个新字段（doc_type/modality/heading_path/...）
     # 另有一个注册表 collection，名字是本名加 `_docs`（见 schema.registry_collection）
     collection: rag_qwen3_v2
+    # 双版本索引：旧 collection 只读；新批次写 <collection>_versions，完成后再切活动批次。
+    # 版本化 collection 的 schema 多一个 index_batch_id，不能直接复用旧 collection。
+    versions_enabled: ${RAG_VERSIONED_INDEX:-true}
+    # 带引号：否则空默认值会被 YAML 解析成 null，而字段是 str
+    versions_collection: "${RAG_VERSIONS_COLLECTION:-}"
     indexes:
       dense:
         type: IVF_FLAT
@@ -405,6 +422,7 @@ api:
   # FastAPI 服务（`rag serve`）。默认只听本机，要对外就改 RAG_API_HOST。
   host: ${RAG_API_HOST:-127.0.0.1}
   port: ${RAG_API_PORT:-8000}
+  workers: ${RAG_API_WORKERS:-1}
   # 每分钟每个 key/IP 的请求上限（0 = 不限）。有 Redis 时是**跨 worker 共享**的计数，
   # 没有就退回进程内（那种情况下每个 worker 各算各的）。
   rate_limit_per_min: ${RAG_API_RATE_LIMIT:-60}

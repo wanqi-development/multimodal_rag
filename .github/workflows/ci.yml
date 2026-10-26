@@ -48,12 +48,17 @@ jobs:
           # 等于 CI 从来没验证过「装了插件配置里就能用」这条主线。
           # 它自己**零运行时依赖**（neo4j 驱动是函数内懒导入），装上不增加下载。
           pip install -e plugins/rag-channel-neo4j
+          # dots.ocr 是可选 PDF 解析插件；默认 parser=dots，测试和默认链路都要它。
+          pip install -e plugins/rag-dots-parser --no-deps
 
       - name: ruff check
         run: python -m ruff check
 
       - name: ruff format --check
         run: python -m ruff format --check
+
+      - name: OpenAPI 前端类型漂移
+        run: python scripts/generate_openapi_types.py --check
 
       - name: pytest
         shell: bash

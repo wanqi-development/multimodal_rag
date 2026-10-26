@@ -13,6 +13,7 @@ from typing import Any
 
 from rag.config.schema import Settings
 from rag.contracts import AssembledContext, ChannelStats, ScoredChunk
+from rag.usage import absorb_usage
 
 # 图要的四个外部依赖（见 graphs/query.py 的说明）
 RetrieveFn = Callable[..., Awaitable[tuple[list[ScoredChunk], list[ChannelStats]]]]
@@ -103,7 +104,7 @@ def build_retrieve(heavy: Heavy) -> RetrieveFn:
     return retrieve
 
 
-def build_json_caller(heavy: Heavy) -> JsonFn:
+def build_json_caller(heavy: Heavy, usage: dict[str, Any] | None = None) -> JsonFn:
     """plan / grade 用的「prompt → 模型原文」。
 
     JSON 的解析放在图里（`graphs/query.py`），所以这一层与模型/网关无关。
@@ -114,6 +115,7 @@ def build_json_caller(heavy: Heavy) -> JsonFn:
 
     async def ask(prompt: str) -> str:
         reply = await heavy.chat.ainvoke([system, HumanMessage(prompt)])
+        absorb_usage(usage, reply)
         content = reply.content
         return content if isinstance(content, str) else str(content)
 

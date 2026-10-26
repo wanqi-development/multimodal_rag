@@ -4,56 +4,20 @@
 // 而我们的 /chat 与 /agent 都要 X-API-Key。fetch + ReadableStream 还能顺手支持取消
 // （浏览器关页面/点停止时 abort，后端那套断线取消正好接上）。
 
-export interface Hit {
-  chunk_id: string
-  score: number
-  sources: string[]
-  doc_id: string
-  modality: string
-  doc_type: string
-  source_uri: string
-  heading_path: string
-  heading_numbers: string
-  page: number
-  line: number
-  assets: string[]
-  text: string
-}
+import type { S } from './generated/openapi'
 
-export interface Stats {
-  channel: string
-  candidates: number
-  kept: number
-  latency_ms: number | null
-  error: string | null
-}
+type RequiredSchema<K extends keyof S> = Required<S[K]>
 
-export interface Citation {
-  index: number
-  chunk_id: string
-  source_uri: string
-  snippet: string
-}
-
-export interface Chunk {
-  chunk_id: string
-  doc_id: string
-  text: string
-  doc_type: string
-  modality: string
-  source_uri: string
-  heading_path: string
-  heading_numbers: string
-  page: number
-  line: number
-  assets: string[]
-}
-
-export interface SearchResponse {
-  query: string
+export type Hit = RequiredSchema<'HitView'>
+export type Stats = RequiredSchema<'StatsView'>
+export type Citation = RequiredSchema<'CitationView'>
+export type Chunk = RequiredSchema<'ChunkView'>
+export type SearchResponse = Omit<RequiredSchema<'SearchResponse'>, 'hits' | 'stats'> & {
   hits: Hit[]
   stats: Stats[]
 }
+export type ImageUpload = RequiredSchema<'ImageUploadView'>
+export type TranscribeResult = RequiredSchema<'TranscribeResponse'>
 
 // 图片 blob 缓存：同一个路径只拉一次。
 const assetBlobs = new Map<string, Promise<string>>()
@@ -91,27 +55,8 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 /** 一个模型槽位（`GET /models`）。**key 只回状态不回值**（`key_ready`）。 */
-export interface ModelSlot {
-  slot: string
-  provider_key: string
-  model: string
-  params: Record<string, unknown>
-  /** "库"（有人设过）或 "未设置"（沿用 .env / yaml） */
-  source: string
-  version: number | null
-  updated_at: string
-  updated_by: string
-  candidates: string[]
-  key_ready: boolean | null
-  hot_swappable: boolean
-}
-
-export interface ModelList {
-  backend: string
-  storage: string
-  slots: ModelSlot[]
-  note: string
-}
+export type ModelSlot = RequiredSchema<'ModelSlotView'>
+export type ModelList = Omit<RequiredSchema<'ModelListView'>, 'slots'> & { slots: ModelSlot[] }
 
 /** 模型选型总览。**只读**：改选型走 `rag models set`，重启生效（热切是遗留项）。 */
 export function modelSettings(): Promise<ModelList> {
@@ -130,21 +75,9 @@ export function setModelSlot(
 }
 
 /** 一家供应商（`GET /providers`）。**没有 key**：只有 `has_key` 与指纹（sha256 前 8 位）。 */
-export interface ProviderSetting {
-  provider_key: string
-  has_key: boolean
-  api_key_fingerprint: string
-  base_url: string
-  models: Array<Record<string, unknown>>
-  updated_at: string
-  updated_by: string
-  /** 能不能在页面上填 key：主密钥在（部署配置 RAG_SECRET_KEY）才 True */
-  can_set_key: boolean
-}
-
-export interface ProviderList {
+export type ProviderSetting = RequiredSchema<'ProviderSettingView'>
+export type ProviderList = Omit<RequiredSchema<'ProviderListView'>, 'providers'> & {
   providers: ProviderSetting[]
-  note: string
 }
 
 /** 供应商清单。**只读、不回 key**：key 那一格只有"配没配"与指纹。 */
@@ -169,17 +102,14 @@ export function setProvider(
 }
 
 /** 依赖探活条目：`/health` 里 milvus / redis / postgres / models.* 都是这个形状。 */
-export interface DependencyView {
-  ok: boolean
-  detail: string
-}
+export type DependencyView = RequiredSchema<'DependencyView'>
 
 /** `/health` 的原样返回：分开报，哪个挂了单独看得见。 */
-export interface Health {
+export type Health = Omit<
+  RequiredSchema<'HealthResponse'>,
+  'status' | 'models' | 'config'
+> & {
   status: string
-  milvus: DependencyView
-  redis: DependencyView
-  postgres: DependencyView
   models: Record<string, DependencyView>
   config: Record<string, unknown>
 }
@@ -189,24 +119,10 @@ export function health(): Promise<Health> {
 }
 
 /** 一行日志。`ts` / `level` / `source` / 关联 id 都是后端切好的字段，`text` 只剩正文。 */
-export interface LogLine {
-  kind: string
-  ts: string | null
-  level: string
-  /** logger 短名：`storage` / `ocr` / `uvicorn`…（页面上单列「来源」） */
-  source: string
-  /** 一次请求的关联 id（行首 `req=…`）—— 页面上**可点**，点一下串出整条链路 */
-  request_id: string
-  run_id: string
-  /** 只有查库那一路有：入口标记 `http` / `cli` / `task` / `library` */
-  origin: string
-  text: string
-}
+export type LogLine = RequiredSchema<'LogLineView'>
 
-export interface LogTail {
+export type LogTail = Omit<RequiredSchema<'LogTailResponse'>, 'items'> & {
   items: LogLine[]
-  /** 类别 → 文件路径（页面上写清「读的是哪个文件」） */
-  files: Record<string, string>
 }
 
 /** 最近几行日志。**读文件**，所以 CLI 进程（`rag ingest` / `rag ask`）写的也在里面。 */
@@ -214,12 +130,8 @@ export function logTail(kind = 'all', limit = 200): Promise<LogTail> {
   return json(`/logs/tail?kind=${encodeURIComponent(kind)}&limit=${limit}`)
 }
 
-export interface LogSearch {
-  request_id: string
-  category: string
+export type LogSearch = Omit<RequiredSchema<'LogSearchResponse'>, 'items'> & {
   items: LogLine[]
-  files: Record<string, string>
-  note: string
 }
 
 /**
@@ -280,173 +192,76 @@ export function search(body: {
  */
 export async function uploadSearchImage(
   file: File,
-): Promise<{ path: string; name: string; bytes: number }> {
+): Promise<ImageUpload> {
   const form = new FormData()
   form.append('file', file)
   const res = await fetch('/search/image', { method: 'POST', body: form })
   if (!res.ok) throw await failure(res)
-  return (await res.json()) as { path: string; name: string; bytes: number }
+  return (await res.json()) as ImageUpload
 }
 
 // ---- 文档：上传 → 解析 → 人工核对标题 → 切分 → 入库（页面那五步）----
 
 /** 一份上传件走到哪一步（页面上那排步骤灯用它）。 */
-export interface DocumentStages {
-  parsed: boolean
-  reviewed: boolean
-  chunked: boolean
-  indexed: boolean
-}
-
-export interface DocumentRow {
-  doc_id: string
-  /** 落盘名（带内容哈希）。**页面显示 `display_name`**，这个只用于排查 */
-  name: string
-  /** 真名：来源文件名 / 链接给的名字。页面显示这个 */
-  display_name: string
-  size: number
-  /** 内容哈希：与「解析产物是否过期」用的同一把钥匙 */
-  sha1: string
+export type DocumentStages = RequiredSchema<'DocumentStageView'>
+export type DocumentRow = Omit<RequiredSchema<'DocumentView'>, 'stages'> & {
   stages: DocumentStages
-  /** 链接导入才有：用户给的 URL */
-  source_url: string
-  content_type: string
-  /** 落盘时间（老的、加哈希之前传的为 0） */
-  created_at: number
-  /** 附属文件（抓页面时一起下下来的图片）的相对路径 */
-  attachments: string[]
-  /** 人工目录的 id；空串 = 还没归类（页面上的「未分类」） */
-  folder: string
+}
+export type DocumentList = Omit<
+  RequiredSchema<'DocumentListResponse'>,
+  'documents' | 'folders'
+> & {
+  documents: DocumentRow[]
+  folders: Folder[]
 }
 
 /** 人工目录。**纯页面上的组织**：不改 doc_id、不动文件，最多三层。 */
-export interface Folder {
-  id: string
-  name: string
-  parent: string | null
-}
-
-export interface Uploaded {
-  doc_id: string
-  name: string
-  display_name: string
-  size: number
-  /** **同一份内容**已经在了（同名同哈希）—— 如实显示，别让人以为新增了一份 */
-  replaced: boolean
-  sha1: string
-  source_url: string
-  content_type: string
-  created_at: number
-}
-
-export interface UploadResult {
+export type Folder = RequiredSchema<'FolderView'>
+export type FolderChange = RequiredSchema<'FolderChangeResponse'>
+export type Deleted = RequiredSchema<'DeletedView'>
+export type Uploaded = RequiredSchema<'UploadedView'>
+export type UploadResult = Omit<
+  RequiredSchema<'UploadResponse'>,
+  'uploads' | 'conflicts'
+> & {
   uploads: Uploaded[]
-  /** 被拒的文件（后缀不支持 / 太大），连原因一起给出来 */
-  skipped: string[]
-  /**
-   * **同名但内容不一样**的旧版本。新版本已经落盘（名字带哈希，不会互相覆盖），
-   * 这里把冲突摆出来，页面负责问「覆盖更新还是保留两份」。
-   */
   conflicts: Uploaded[]
-  /** 拿到了但没拿全：页面里哪些图没抓下来、为什么（**不静默丢**） */
-  notes: string[]
 }
 
-export interface OutlineRow {
-  /** 人工核定的层级（**唯一可改的一位**） */
-  level: number
-  /** 按作者编号推断的初值，只读，供对照 */
-  hint: number
-  /** 标题原文：**只读**。正文不允许改，这里也就没有可写的地方 */
-  title: string
-  /** 这一行在原文的第几页（1 起；0 = 这类来源没有页的概念） */
-  page: number
-}
+export type OutlineRow = RequiredSchema<'OutlineRowView'>
+export type Outline = Omit<RequiredSchema<'OutlineView'>, 'rows'> & { rows: OutlineRow[] }
 
-export interface Outline {
-  rows: OutlineRow[]
-  max_level: number
-  confirmed: boolean
-  notes: string[]
-}
-
-export interface DocumentDetail extends DocumentRow {
-  source_uri: string
-  /** 解析稿（只读 markdown）—— 页面上只渲染、不提供编辑入口 */
-  markdown: string
+export type DocumentDetail = DocumentRow &
+  Omit<
+    RequiredSchema<'DocumentDetailResponse'>,
+    'stages' | 'outline' | 'parse' | 'chunks' | 'index' | 'index_job'
+  > & {
+  stages: DocumentStages
   outline: Outline | null
-  /** 每一步「做到了什么」：页面上那条流程图与阶段面板的数字都从这儿来 */
   parse: ParseSummary | null
   chunks: ChunkSummary | null
   index: IndexSummary | null
-  /**
-   * 勾了「已核对」提交时**后端自动排的那个**「切分 + 入库」任务（`api.index_after_review`）。
-   * 非空 = 这一步已经开始了，页面直接跟着轮询，不用再让人点一次。
-   */
   index_job: Job | null
 }
 
 /** 第二步（解析）的产物摘要。`stale=true` = 产物过期，步骤灯因此回退（这里说明原因）。 */
-export interface ParseSummary {
-  at: number
-  chars: number
-  images: number
-  /** 取不到的图与原因：要一直看得见 */
-  missing_images: string[]
-  parser: string
-  mime: string
-  parse_key: string
-  recorded_hash: string
-  current_hash: string
-  stale: boolean
-}
+export type ParseSummary = RequiredSchema<'ParseSummaryView'>
 
 /** 大纲里的一节：多少块、多少字。 */
-export interface SectionSummary {
-  heading_path: string
-  heading_numbers: string
-  blocks: number
-  chars: number
-  /** 这一节第一块的开头几十个字 —— 没有它，「（无标题）1 块 133 字」看不出是什么 */
-  head: string
-}
+export type SectionSummary = RequiredSchema<'SectionSummaryView'>
 
 /** 第四步里「拆分」那半的结果。 */
-export interface ChunkSummary {
-  at: number
-  blocks: number
-  chars: number
-  avg_chars: number
-  max_chars: number
-  text_blocks: number
-  image_blocks: number
-  /** 每块的字数：接成一条宽度正比字数的色条，看切得匀不匀 */
-  sizes: number[]
+export type ChunkSummary = Omit<
+  RequiredSchema<'ChunkSummaryView'>,
+  'sections'
+> & {
   sections: SectionSummary[]
-  artifact_bytes: Record<string, number>
-  recorded_hash: string
-  current_hash: string
-  stale: boolean
 }
 
 /** 第四步里「入库」那半：拿 Milvus 注册表那一行说话。 */
-export interface IndexSummary {
-  indexed: boolean
-  chunk_count: number
-  ingested_at: number
-  pipeline_version: string
-  /** 注册表块数 == 产物块数？对不上就是「没灌全」 */
-  in_sync: boolean
-  /** 稠密向量的**理论**占用（块数 × dim × 4B），只是估算 */
-  vector_bytes: number
-  vector_dim: number
-}
+export type IndexSummary = RequiredSchema<'IndexSummaryView'>
 
-export function documents(): Promise<{
-  documents: DocumentRow[]
-  indexed_known: boolean
-  folders: Folder[]
-}> {
+export function documents(): Promise<DocumentList> {
   return json('/documents')
 }
 
@@ -470,7 +285,7 @@ export function updateFolder(
 }
 
 /** 删目录。里面的文档回「未分类」；还有子目录时后端回 409。`moved` = 影响了几份文档。 */
-export function deleteFolder(folderId: string): Promise<{ moved: number }> {
+export function deleteFolder(folderId: string): Promise<FolderChange> {
   return json(`/documents/folders/${encodeURIComponent(folderId)}`, { method: 'DELETE' })
 }
 
@@ -478,7 +293,7 @@ export function deleteFolder(folderId: string): Promise<{ moved: number }> {
 export function assignFolder(
   docIds: string[],
   folderId: string | null,
-): Promise<{ moved: number }> {
+): Promise<FolderChange> {
   return json('/documents/folders/members', {
     method: 'PUT',
     body: JSON.stringify({ doc_ids: docIds, folder_id: folderId }),
@@ -534,15 +349,12 @@ export async function uploadDocuments(files: File[]): Promise<UploadResult> {
  *
  * 这段音频**按量计费**（一次调用一次），所以只在这里发，且不做自动重试。
  */
-export async function transcribeAudio(
-  audio: Blob,
-  name = 'take.wav',
-): Promise<{ text: string; model: string; chars: number }> {
+export async function transcribeAudio(audio: Blob, name = 'take.wav'): Promise<TranscribeResult> {
   const form = new FormData()
   form.append('file', audio, name)
   const res = await fetch('/chat/transcribe', { method: 'POST', body: form })
   if (!res.ok) throw await failure(res)
-  return (await res.json()) as { text: string; model: string; chars: number }
+  return (await res.json()) as TranscribeResult
 }
 
 /**
@@ -559,7 +371,7 @@ export function fetchDocument(body: { url: string; name?: string }): Promise<Upl
  * 删掉一份文档。`purge=true`（默认，也是页面用的）连 Milvus 里的块与解析产物一起清 ——
  * **不可逆**。页面上的「覆盖更新」就是先导入新版、再对旧版调它。
  */
-export function deleteDocument(docId: string, purge = true): Promise<{ deleted: string }> {
+export function deleteDocument(docId: string, purge = true): Promise<Deleted> {
   return json(`/documents/${encodeURIComponent(docId)}?purge=${purge}`, { method: 'DELETE' })
 }
 
@@ -584,18 +396,11 @@ export function indexDocument(docId: string): Promise<Job> {
   return json(`/documents/${encodeURIComponent(docId)}/index`, { method: 'POST' })
 }
 
-export interface Job {
-  id: string
-  kind: string
+export type Job = Omit<RequiredSchema<'JobView'>, 'status'> & {
   status: 'queued' | 'running' | 'done' | 'failed'
-  request: Record<string, unknown>
-  result: Record<string, unknown>
-  error: string | null
-  created_at: number
-  updated_at: number
 }
 
-/** 最近的任务，新的在前。**只列本进程的**（多 worker 那天后端会扩，见 jobs.py）。 */
+/** 最近的任务，新的在前；Redis 可用时包含其他 worker 提交的任务。 */
 export function jobs(limit = 20): Promise<{ jobs: Job[] }> {
   return json(`/jobs?limit=${limit}`)
 }
@@ -637,6 +442,9 @@ export interface ChatEvent {
   citations?: Citation[]
   session_id?: string | null
   usage?: Usage | null
+  rounds?: number
+  grade?: Record<string, unknown>
+  mode?: string
   message?: string
 }
 
@@ -679,46 +487,28 @@ export interface AgentEvent {
 }
 
 /** 一段会话或一轮问答的 token 用量。 */
-export interface Usage {
-  input_tokens: number
-  output_tokens: number
-  total_tokens: number
-  /** 这一共发生了多少次模型调用（agent 一轮会有好几次，快问答是 1） */
-  calls: number
-}
+export type Usage = RequiredSchema<'SessionUsageView'>
 
 /** `GET /sessions` 里的一行。 */
-export interface SessionSummary {
-  session_id: string
-  title: string
-  mode: string
-  thread_id: string | null
-  turns: number
-  created_at: string | null
-  updated_at: string | null
+export type SessionSummary = Omit<RequiredSchema<'SessionView'>, 'usage'> & {
   usage: Usage
 }
 
 /** `GET /sessions/{id}` 里的一条消息。只会有 human 与 ai 两种角色。 */
-export interface SessionMessage {
-  seq: number
+export type SessionMessage = Omit<
+  RequiredSchema<'SessionMessageView'>,
+  'role' | 'status' | 'interrupt' | 'usage'
+> & {
   role: 'human' | 'ai'
-  content: string
   status: 'answered' | 'interrupted' | 'stopped' | 'error'
-  created_at: string | null
-  /** 只在 `status=interrupted` 时可能有：读的时候现从 checkpointer 取的待批载荷 */
   interrupt?: Interrupt | null
-  /** 这一轮的 token 用量（历史轮次也有） */
   usage?: Usage | null
 }
 
-export interface SessionDetail {
-  session_id: string
-  title: string
-  mode: string
-  thread_id: string | null
-  created_at: string | null
-  updated_at: string | null
+export type SessionDetail = Omit<
+  RequiredSchema<'SessionDetailResponse'>,
+  'messages' | 'usage'
+> & {
   messages: SessionMessage[]
   usage: Usage
 }

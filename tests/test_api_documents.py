@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rag.api.app import Components, create_app
+from rag.api.ingest_gate import IngestGate
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
 
@@ -36,7 +37,10 @@ def _settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 def components(tmp_path: Path) -> Components:
-    return Components(_settings(tmp_path), Secrets(rag_api_key=None))
+    components = Components(_settings(tmp_path), Secrets(rag_api_key=None))
+    # 这些用例不进 lifespan；手动装与 startup 相同的本地闸门。
+    components.ingest_gate = IngestGate(components.redis, limit=1, lease_s=60)
+    return components
 
 
 @pytest.fixture
@@ -159,7 +163,6 @@ def test_parse_produces_the_preview_and_the_outline(
     item = _upload(client, "手册.md").json()["uploads"][0]
 
     # 后台任务的编排在这里真实跑一遍（HTTP 那层只负责 spawn，见模块说明）
-    components.ingest_slot = asyncio.Semaphore(1)
     job = components.jobs.spawn(kind="parse", request={"doc_id": item["doc_id"]})
     asyncio.run(components.run_parse_job(job, item["doc_id"]))
 
@@ -186,7 +189,7 @@ def test_unknown_document_is_404(client: TestClient) -> None:
 
 
 def test_jobs_list_is_newest_first(components: Components) -> None:
-    """`GET /jobs` 只列本进程的任务（多 worker 那天要扩成扫 Redis，见 jobs.py）。"""
+    """`GET /jobs` 新的在前；Redis 可用时还会合并其他 worker 的任务。"""
     app = create_app(components.settings, Secrets(rag_api_key=None))
     app.state.components = components
     client = TestClient(app)
@@ -211,7 +214,6 @@ _MULTI = "# 第一章\n\n开头\n\n## 1.1 节\n\n中间\n\n### 1.1.1 小节\n\n�
 def _parsed(client: TestClient, components: Components, name: str = "手册.md") -> str:
     """上传 + 解析一份三级标题的文档，返回 doc_id。"""
     item = _upload(client, name, _MULTI).json()["uploads"][0]
-    components.ingest_slot = asyncio.Semaphore(1)
     job = components.jobs.spawn(kind="parse", request={"doc_id": item["doc_id"]})
     asyncio.run(components.run_parse_job(job, item["doc_id"]))
     assert job.status == "done", job.error
@@ -457,7 +459,6 @@ def test_the_index_job_chunks_and_writes_this_document(
     )
     components.index = _Index()
     components.heavy = SimpleNamespace(embedder=_Embedder(), errors={})
-    components.ingest_slot = asyncio.Semaphore(1)
     job = components.jobs.spawn(kind="index", request={"doc_id": doc_id})
 
     asyncio.run(components.run_index_job(job, doc_id))
@@ -537,7 +538,6 @@ def test_a_fetched_link_can_be_parsed_right_away(
         0
     ]["doc_id"]
 
-    components.ingest_slot = asyncio.Semaphore(1)
     job = components.jobs.spawn(kind="parse", request={"doc_id": doc_id})
     asyncio.run(components.run_parse_job(job, doc_id))
 
@@ -680,7 +680,6 @@ def test_the_detail_reports_what_each_stage_produced(
     )
     components.index = _Index()
     components.heavy = SimpleNamespace(embedder=_Embedder(), errors={})
-    components.ingest_slot = asyncio.Semaphore(1)
     job = components.jobs.spawn(kind="index", request={"doc_id": doc_id})
     asyncio.run(components.run_index_job(job, doc_id))
     assert job.status == "done", job.error

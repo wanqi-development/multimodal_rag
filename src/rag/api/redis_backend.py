@@ -115,6 +115,48 @@ class RedisBackend:
             return None
         return payload if isinstance(payload, dict) else None
 
+    async def zadd(self, key: str, member: str, *, score: float, ttl_s: int) -> bool:
+        if self._client is None:
+            return False
+        try:
+            await self._client.zadd(key, {member: score})
+            await self._client.expire(key, ttl_s)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def zrevrange(self, key: str, *, start: int, end: int) -> list[str]:
+        if self._client is None:
+            return []
+        try:
+            rows = await self._client.zrevrange(key, start, end)
+            return [str(row) for row in rows]
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def set_if_absent(self, key: str, value: str, *, ttl_s: int) -> bool:
+        if self._client is None:
+            return False
+        try:
+            return bool(await self._client.set(key, value, nx=True, ex=ttl_s))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def delete_if_value(self, key: str, value: str) -> bool:
+        if self._client is None:
+            return False
+        try:
+            deleted = await self._client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] "
+                "then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                key,
+                value,
+            )
+            return bool(deleted)
+        except Exception:  # noqa: BLE001
+            return False
+
     async def close(self) -> None:
         if self._client is not None:
             # 关连接失败没什么可做的（进程都要退了），压掉就好

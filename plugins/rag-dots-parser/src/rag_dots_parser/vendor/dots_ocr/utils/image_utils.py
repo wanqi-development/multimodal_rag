@@ -8,8 +8,8 @@ import fitz
 import requests
 from PIL import Image
 
-from rag.ingest.dots_ocr.utils.consts import IMAGE_FACTOR, MAX_PIXELS, MIN_PIXELS
-from rag.ingest.dots_ocr.utils.doc_utils import fitz_doc_to_image
+from rag_dots_parser.vendor.dots_ocr.utils.consts import IMAGE_FACTOR, MAX_PIXELS, MIN_PIXELS
+from rag_dots_parser.vendor.dots_ocr.utils.doc_utils import fitz_doc_to_image
 
 
 def round_by_factor(number: int, factor: int) -> int:

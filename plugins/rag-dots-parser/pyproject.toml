@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-dots-parser"
+version = "0.1.0"
+description = "Optional dots.ocr parser adapter for multimodal_rag"
+requires-python = ">=3.13,<3.14"
+
+[tool.setuptools.packages.find]
+where = ["src"]

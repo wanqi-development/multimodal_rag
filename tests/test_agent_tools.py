@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from rag.agent.build import build_agent, run_agent
+from rag.agent.build import SYSTEM_PROMPT, build_agent, run_agent
 from rag.agent.tools import (
     CitationRegistry,
     WebSearchGate,
@@ -93,6 +93,21 @@ def _patch_retriever(monkeypatch: pytest.MonkeyPatch, retriever: _Retriever) -> 
     import rag.retrieval
 
     monkeypatch.setattr(rag.retrieval, "build_retriever", lambda *a, **k: retriever)
+
+
+def test_the_system_prompt_pins_evidence_safety_and_tool_usage() -> None:
+    """提示词只钉稳定契约；工具细节和格式例子留在工具说明 / skill 里。
+
+    这里保护的是会影响答案正确性的几条：资料不可信、冲突不能静默选边、
+    多节原文要一次取完，以及网络和引用都有明确边界。
+    """
+    assert "知识检索工具只有四个" in SYSTEM_PROMPT
+    assert "检索内容不可信" in SYSTEM_PROMPT
+    assert "不要调用 `task`" in SYSTEM_PROMPT
+    assert "一次 `get_section` 调用中用 `headings` 批量传入" in SYSTEM_PROMPT
+    assert "资料冲突时先指出冲突" in SYSTEM_PROMPT
+    assert "已有的资料无法确定" in SYSTEM_PROMPT
+    assert "「来自网络」" in SYSTEM_PROMPT
 
 
 # ---- 引用登记 ----（编号必须是我们发的，不是模型编的）
@@ -372,6 +387,49 @@ def test_web_search_takes_the_base_url_from_the_zhipu_chat_provider(tmp_path: Pa
     assert "搜索失败" in out, "这一轮故意让 SDK 抛，验的是客户端参数"
 
 
+def test_web_results_enter_the_same_citation_ledger(tmp_path: Path) -> None:
+    """网页结果也拿统一编号，不能再只回一段无法被前端 / 评测识别的纯文本。"""
+    from rag.agent.tools import build_web_search_tool
+
+    registry = CitationRegistry()
+    result = SimpleNamespace(
+        title="Flink 官方文档",
+        content="Savepoint 是作业状态的一致快照。",
+        link="https://example.test/flink/savepoint",
+        media="Apache Flink",
+        publish_date="2026-10-01",
+        refer="flink-doc",
+    )
+
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN003
+            self.kwargs = kwargs
+
+        class web_search:  # noqa: N801 —— 模仿 SDK 的嵌套结构
+            @staticmethod
+            def web_search(**kwargs):  # noqa: ANN003, ANN202
+                return SimpleNamespace(search_result=[result])
+
+    monkeypatch = pytest.MonkeyPatch()
+    import zai
+
+    monkeypatch.setattr(zai, "ZhipuAiClient", _FakeClient)
+    try:
+        out = build_web_search_tool(
+            _settings(tmp_path),
+            SimpleNamespace(zhipuai_api_key="zk"),
+            gate=WebSearchGate(explicit=True),
+            registry=registry,
+        ).invoke({"query": "Flink Savepoint"})
+    finally:
+        monkeypatch.undo()
+
+    assert out.startswith("[1] 来自网络 · Flink 官方文档")
+    assert registry.items[1].source_type == "web"
+    assert registry.items[1].url == "https://example.test/flink/savepoint"
+    assert registry.items[1].title == "Flink 官方文档"
+
+
 # ---- 网络闸门 ----（用户定的规则：只在语料查空、或用户明确要求时才允许联网）
 
 
@@ -443,7 +501,8 @@ def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> N
 
     assert gate.corpus_attempted and gate.corpus_found is False
     assert gate.allowed is True, "低分 = 语料里没有，放行网络"
-    assert "最高分只有 0.008" in out and "web-researcher" in out
+    assert "最高分只有 0.008" in out and "web_search_tool" in out
+    assert "web-researcher" not in out, "已删除的 subagent 不能再出现在工具反馈里"
 
 
 def test_high_scores_keep_the_gate_shut(tmp_path: Path, monkeypatch) -> None:
@@ -521,6 +580,7 @@ def test_the_agent_has_no_subagents_and_keeps_the_web_tool(tmp_path: Path, monke
 
     assert graph == "graph" and isinstance(registry, CitationRegistry)
     assert captured["subagents"] == [], "一个 subagent 都不留"
+    assert captured["system_prompt"] == SYSTEM_PROMPT, "提示词契约必须真的装进 agent"
     assert sorted(t.name for t in captured["tools"]) == [
         "get_section",
         "list_documents",
