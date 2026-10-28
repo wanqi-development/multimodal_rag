@@ -23,10 +23,26 @@ storage:
     cache_dir: ${RAG_BLOB_CACHE:-./data/cache/blobs}
 
 deployment:
-  # single-node：SQLite + local（默认）
-  # server：PostgreSQL 必需，单 worker
-  # scale-out：PostgreSQL + MinIO + Redis 必需，workers >= 2
-  profile: ${RAG_DEPLOYMENT_PROFILE:-single-node}
+  # local-lite：Milvus Lite + SQLite + local，单 worker；无需 Docker 或其他服务
+  # docker-single：Docker Milvus + SQLite + 独立 MinIO bucket，单 worker
+  # multiworker：Docker Milvus + PostgreSQL + Redis + MinIO，缺一即拒绝启动
+  #
+  profile: ${RAG_DEPLOYMENT_PROFILE:-docker-single}
+  # 三个 profile 的本地状态根：<state_root>/<profile>/。
+  state_root: ${RAG_STATE_ROOT:-./data}
+  # demo 等特殊状态域可以显式指定；普通三档留空。
+  state_dir: ""
+  # 三档的 Milvus collection 必须不同，避免连同一个 Docker Milvus 时串数据。
+  local_lite_collection: ${RAG_COLLECTION_LOCAL_LITE:-rag_local_lite_v1}
+  docker_single_collection: ${RAG_COLLECTION_DOCKER_SINGLE:-rag_docker_single_v1}
+  multiworker_collection: ${RAG_COLLECTION_MULTIWORKER:-rag_multiworker_v1}
+  # 应用 bucket 与 Milvus 内部 bucket 分离。
+  docker_single_bucket: ${MINIO_BUCKET_DOCKER_SINGLE:-rag-docker-single}
+  multiworker_bucket: ${MINIO_BUCKET_MULTIWORKER:-rag-multiworker}
+  milvus_internal_bucket: ${MINIO_BUCKET_MILVUS_INTERNAL:-milvus-bucket}
+  # multiworker 的 PG / Redis 命名空间也必须独立。
+  multiworker_pg_schema: ${RAG_PG_SCHEMA_MULTIWORKER:-rag_multiworker}
+  multiworker_redis_prefix: "${RAG_REDIS_PREFIX_MULTIWORKER:-rag:multiworker:}"
   # 外部容器/进程副本数；两个单 worker 容器时设 2
   replicas: ${RAG_DEPLOYMENT_REPLICAS:-1}
   ingest_lease_s: ${RAG_INGEST_LEASE_S:-86400}
@@ -421,7 +437,7 @@ graph:
 api:
   # FastAPI 服务（`rag serve`）。默认只听本机，要对外就改 RAG_API_HOST。
   host: ${RAG_API_HOST:-127.0.0.1}
-  port: ${RAG_API_PORT:-8000}
+  port: ${RAG_API_PORT:-8001}
   workers: ${RAG_API_WORKERS:-1}
   # 每分钟每个 key/IP 的请求上限（0 = 不限）。有 Redis 时是**跨 worker 共享**的计数，
   # 没有就退回进程内（那种情况下每个 worker 各算各的）。
@@ -460,12 +476,15 @@ persistence:
   # **关系型数据落哪个库**（2026-10-10 统一成一个开关）。值放 .env，这里只声明。
   #   auto（默认）—— 配了 RAG_PG_URL 就用 postgres，否则 sqlite（与从前逐字一致）
   #   postgres    —— 用 PostgreSQL（要配 RAG_PG_URL，缺了当场报错，不静默退）
-  #   sqlite      —— 用单机文件（data/documents.sqlite3 / data/model_settings.sqlite3）
+  #   sqlite      —— 用当前 profile 状态目录下的 documents/model_settings/chats SQLite
   # 管哪三份：文档注册表 + 上传件台账（documents.backend 那一组）、模型选型（models.backend）、
   #   日志索引（observability.logging.postgres；选了 sqlite 就不写库，日志只落文件）。
   # **不管** LangGraph 的会话状态 / HITL 中断 —— 它只有 PG 一个实现，由下面的 url 决定；
   #   要彻底单机就把 RAG_PG_URL 也清掉（那样它会退回进程内，重启即丢，见 docs/architecture.md）。
   backend: ${RAG_DB_BACKEND:-auto}
+  # local-lite / docker-single 的 UI 会话库；apply_deployment_profile() 会改成
+  # <state_dir>/chats.sqlite3，multiworker 仍走 PostgreSQL。
+  chat_sqlite_path: ${RAG_CHAT_SQLITE_PATH:-./data/chats.sqlite3}
   # LangGraph 的持久化（M5 用）：checkpointer 存会话状态与 **HITL 中断**
   # （落库的意义是「重启后等人批准的那个中断还在」），store 存跨会话记忆。
   # 密码在 .env 的 RAG_PG_PASSWORD，不写进这里；url 留空 = 退回进程内。

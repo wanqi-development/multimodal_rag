@@ -4,27 +4,28 @@
 # 用法：
 #   ./scripts/linux/backend.sh
 #   ./scripts/linux/backend.sh --dry-run     # 只看它会做什么
+#   ./scripts/linux/backend.sh --profile-paths  # 内部：给 web.sh 复用 profile 路径
 #
 # 顺序：从 .env 读地址/端口（RAG_API_HOST / RAG_API_PORT，缺省 127.0.0.1:8000）
-#   → 端口被占时问一句 y/n → nohup 起 `rag serve`，日志落 data/logs/、PID 记 data/run/。
+#   → 端口被占时问一句 y/n → nohup 起 `rag serve`，日志与 PID 落当前 profile。
 #
 # 为什么是「杀掉再重启」而不是「跳过已经在跑的那个」：跳过的话你面对的可能是**旧代码**
 # （这个项目上真踩过好几次），还以为自己重启过了。要么干净重来，要么干脆别动。
 #
 # 端口检测用 python 的 socket：这台机器本来就要跑 Python 后端，不额外依赖 ss/lsof/nc。
 #
-# **前端要等它起来**：那个等待在 `frontend.sh` 里（探 `/docs`，200 就算起来了）。
+# **web 要等它起来**：那个等待在 `web.sh` 里（探 `/docs`，200 就算起来了）。
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUN_DIR="$ROOT/data/run"
-LOG_DIR="$ROOT/data/logs"
 
 DRY_RUN=0
+PROFILE_PATHS=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
+        --profile-paths) PROFILE_PATHS=1 ;;
         *) echo "未知参数：$arg"; exit 2 ;;
     esac
 done
@@ -75,6 +76,40 @@ if [ -z "$BACKEND_FILE" ]; then
     exit 1
 fi
 
+profile_json() {
+    local raw
+    raw="$("$BACKEND_FILE" ${BACKEND_BASE[@]+"${BACKEND_BASE[@]}"} profile show)" || {
+        echo "✘ 读不到当前 profile；先运行 \`rag profile show\` 看配置错误。" >&2
+        return 1
+    }
+    printf '%s' "$raw" | "$PYTHON" -c '
+import json
+import pathlib
+import sys
+
+payload = json.load(sys.stdin)
+root = pathlib.Path(sys.argv[1])
+for key in ("run_dir", "log_dir"):
+    value = pathlib.Path(payload[key])
+    payload[key] = str((value if value.is_absolute() else root / value).resolve())
+print(json.dumps(payload, ensure_ascii=False))
+' "$ROOT"
+}
+
+profile_field() {
+    printf '%s' "$PROFILE_JSON" | "$PYTHON" -c \
+        'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
+}
+
+PROFILE_JSON="$(profile_json)" || exit 1
+if [ "$PROFILE_PATHS" = 1 ]; then
+    printf '%s\n' "$PROFILE_JSON"
+    exit 0
+fi
+PROFILE_NAME="$(profile_field profile)"
+RUN_DIR="$(profile_field run_dir)"
+LOG_DIR="$(profile_field log_dir)"
+
 port_pid() {  # 端口被谁占着 -> 打印 pid；没占着 -> 空
     "$PYTHON" - "$1" <<'PY'
 import socket, sys, subprocess
@@ -107,6 +142,7 @@ BACKEND_PID="$(port_pid "$BACKEND_PORT")"
 echo "仓库：$ROOT"
 echo "后端：http://$BACKEND_HOST:$BACKEND_PORT"
 echo "后端入口：$BACKEND_FILE ${BACKEND_BASE[*]}（$BACKEND_HOW）"
+echo "状态域：$PROFILE_NAME（PID $RUN_DIR，日志 $LOG_DIR）"
 
 if [ -n "$BACKEND_PID" ]; then
     echo
@@ -117,7 +153,7 @@ if [ -n "$BACKEND_PID" ]; then
         read -r -p "杀掉上面的进程再启动？（y = 杀掉并重新启动；n = 放弃启动，什么都不动）[y/n] " answer
         case "$(normalize_answer "$answer")" in
             y|yes) ;;
-            *) echo "已放弃启动。"; exit 3 ;;   # 3 = 用户主动放弃；start.sh 靠它决定前端也别起
+            *) echo "已放弃启动。"; exit 3 ;;   # 3 = 用户主动放弃；start.sh 靠它决定 web 也别起
         esac
         if [ "$BACKEND_PID" = "?" ]; then
             # 端口占着但认不出是谁（镜像里既没有 lsof 也没有 ss）—— 不能瞎杀

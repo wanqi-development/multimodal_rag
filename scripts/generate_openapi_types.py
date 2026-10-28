@@ -1,4 +1,4 @@
-"""Generate the frontend TypeScript view of FastAPI's OpenAPI schemas."""
+"""Generate the web TypeScript view of FastAPI's OpenAPI schemas."""
 
 from __future__ import annotations
 

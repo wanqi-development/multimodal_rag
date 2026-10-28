@@ -62,8 +62,8 @@ class Components:
         self.index: Any = None
         self.heavy: Any = None
         self.persistence: Any = None
-        # UI 会话的存储（chat_session / chat_message / token_usage）。没配 PG 就是 None，
-        # 那几个端点会明确回 503 —— 而不是让人对着一个连不上的地址猜。
+        # UI 会话的存储（chat_session / chat_message / token_usage）。
+        # local 档用 SQLite，multiworker 用 PostgreSQL。
         self.chats: Any = None
         self.index_error: str = ""
         self.ingest_gate: IngestGate | None = None
@@ -74,24 +74,42 @@ class Components:
     async def startup(self) -> None:
         await self.redis.connect()
         profile = self.settings.deployment.profile
-        if profile == "scale-out" and not self.redis.available:
-            raise RuntimeError(f"scale-out 要求 Redis 可用：{self.redis.reason}")
+        if profile == "multiworker" and not self.redis.available:
+            raise RuntimeError(f"multiworker 要求 Redis 可用：{self.redis.reason}")
         self.ingest_gate = IngestGate(
             self.redis,
             limit=self.settings.api.max_concurrent_ingest,
             lease_s=self.settings.deployment.ingest_lease_s,
-            require_shared=profile == "scale-out",
+            require_shared=profile == "multiworker",
         )
         from rag.persistence import build_persistence
 
         self.persistence = build_persistence(self.settings, self.secrets)
         await self.persistence.connect()
-        if profile in ("server", "scale-out") and not self.persistence.available:
-            raise RuntimeError(f"{profile} 要求 PostgreSQL 可用：{self.persistence.reason}")
-        if self.settings.persistence.postgres.url:
-            from rag.persistence import build_chat_store
+        if profile == "multiworker" and not self.persistence.available:
+            raise RuntimeError(f"multiworker 要求 PostgreSQL 可用：{self.persistence.reason}")
+        if profile in {"docker-single", "multiworker"}:
+            from rag.storage import build_blob_store
 
-            self.chats = build_chat_store(self.settings, self.persistence)
+            files = build_blob_store(backend="minio", settings=self.settings)
+            try:
+                await asyncio.to_thread(files.ping)
+            except Exception as exc:  # noqa: BLE001 —— 必选项不可用就拒绝启动
+                raise RuntimeError(f"{profile} 要求 MinIO 可用：{exc}") from exc
+        from rag.persistence import build_chat_store
+
+        self.chats = build_chat_store(self.settings, self.persistence)
+        if getattr(self.chats, "backend", "") == "sqlite":
+            try:
+                await self.chats.setup()
+            except Exception as exc:  # noqa: BLE001 —— 本地会话库是核心功能，不能静默缺失
+                raise RuntimeError(f"SQLite 会话库初始化失败：{exc}") from exc
+        from rag.profile_state import ensure_profile_state
+
+        try:
+            await asyncio.to_thread(ensure_profile_state, self.settings)
+        except Exception as exc:  # noqa: BLE001 —— 状态域不一致必须阻止启动
+            raise RuntimeError(f"profile 状态域校验失败：{exc}") from exc
         try:
             from rag.indexing import build_index
 
@@ -102,6 +120,8 @@ class Components:
             await self.index.ping(self.settings.indexing.vector.probe_timeout_s)
             await self.index.ensure_ready()
         except Exception as exc:  # noqa: BLE001 —— Milvus 挂了也要能起来看 /health
+            if profile == "multiworker":
+                raise RuntimeError(f"multiworker 要求 Milvus 可用：{exc}") from exc
             self.index_error = f"{type(exc).__name__}: {exc}"
             # **影响整个流程的第三方异常按 ERROR 记**：Milvus 挂着时检索与问答全不可用，
             # 这不是「某条日志吵」，是功能没了（uvicorn 起来但 /health degraded）
@@ -256,8 +276,8 @@ class Components:
     async def _open_session(self, session_id: str | None, *, title: str, mode: str) -> str | None:
         """这次的会话 id：给了就沿用，没给就开一段（标题取首问）。
 
-        **没配 PG 就返回 None** —— 问答照常，只是不落库。与日志同一条立场：存储是附属品，
-        不该让业务挂。写失败也一样（只在 stderr 喊一句）。
+        会话存储没建起来时返回 None —— 问答照常，只是不落库。写失败也一样
+        （只在 stderr 喊一句）。
         """
         if self.chats is None:
             return None
@@ -832,9 +852,10 @@ def _registry(settings: Settings):
 
 def create_app(settings: Settings, secrets: Secrets | None = None) -> FastAPI:
     """建应用。`settings` 由调用方给（CLI 从 yaml 读、测试直接构造）。"""
-    from rag.deployment import validate_deployment
+    from rag.deployment import apply_deployment_profile, validate_deployment
 
-    validate_deployment(settings)
+    apply_deployment_profile(settings)
+    validate_deployment(settings, secrets=secrets)
     if settings.persistence.postgres.url:
         # Windows 上 psycopg 的 async 需要 Selector 循环，而它**必须在建循环之前**设。
         # `create_app` 是 CLI 与 TestClient（启动 portal 之前）都会先走到的地方，放这里能兜住

@@ -18,6 +18,7 @@ from rag.api.app import Components, create_app
 from rag.api.media import MediaError, save_image, suffix_for
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
+from rag.deployment import apply_deployment_profile
 
 # 一个最小的 PNG 头（内容不重要，链路上只按字节落盘）
 _PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
@@ -25,10 +26,9 @@ _PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
 
 def _settings(tmp_path: Path) -> Settings:
     settings = Settings()
-    settings.ingest.uploads.dir = str(tmp_path / "uploads")
-    settings.ingest.stages.dir = str(tmp_path / "stages")
-    settings.ingest.assets.dir = str(tmp_path / "assets")
-    settings.api.media_dir = str(tmp_path / "chat" / "media")
+    settings.deployment.profile = "local-lite"
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
     return settings
 
 
@@ -46,7 +46,7 @@ def test_the_image_lands_outside_the_document_corpus(tmp_path: Path) -> None:
 
     path = save_image(settings, _PNG, name="截图.png", content_type="image/png")
 
-    assert path.is_file() and path.parent == tmp_path / "chat" / "media"
+    assert path.is_file() and path.parent == tmp_path / "media"
     assert path.parent != Path(settings.ingest.uploads.dir)
     assert "截图-" in path.name and path.suffix == ".png", "落盘名带内容哈希，真名留着看"
 
@@ -96,7 +96,7 @@ def test_upload_returns_the_server_path(client: TestClient, tmp_path: Path) -> N
     body = res.json()
     assert body["bytes"] == len(_PNG)
     assert Path(body["path"]).is_file(), "给的路径要能直接交给 /search 的 image_path"
-    assert Path(body["path"]).parent == tmp_path / "chat" / "media"
+    assert Path(body["path"]).parent == tmp_path / "media"
     assert client.get("/documents").json()["documents"] == [], "别混进文档列表"
 
 

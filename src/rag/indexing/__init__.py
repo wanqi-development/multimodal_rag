@@ -28,8 +28,8 @@ def build_index(settings: Settings) -> Index:
     里并列的独立模块，不是它的替代实现）。等真出现第二个后端再抽注册表。
     """
     cfg = settings.indexing.vector
-    if cfg.backend != "milvus":
-        raise KeyError(f"未实现的向量库后端: {cfg.backend!r}；目前只有 'milvus'")
+    if cfg.backend not in {"milvus", "milvus-lite"}:
+        raise KeyError(f"未实现的向量库后端: {cfg.backend!r}；可选：'milvus'、'milvus-lite'")
     if cfg.versions_enabled:
         return DualVersionMilvusIndex(
             cfg,

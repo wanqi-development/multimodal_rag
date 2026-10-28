@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from rag.api.redis_backend import RedisBackend
 from rag.config.schema import ApiConfig, RedisConfig, Settings
 from rag.config.settings import Secrets
 from rag.contracts import ChannelStats, Chunk, Citation, ScoredChunk
+from rag.deployment import apply_deployment_profile
 
 
 def _hit(chunk_id: str = "d1:0001") -> ScoredChunk:
@@ -375,6 +377,7 @@ class _Heavy:
 
 def _settings(**over) -> Settings:
     settings = Settings(api=ApiConfig(**over))
+    settings.deployment.profile = "local-lite"
     return settings
 
 
@@ -390,9 +393,9 @@ def _real_components(settings: Settings | None = None) -> Components:
     return item
 
 
-def _client(components: _Components) -> TestClient:
+def _client(components: _Components, *, secrets: Secrets | None = None) -> TestClient:
     """把替身塞进 app.state —— 路由通过 `get_components` 取的就是它。"""
-    app = create_app(components.settings, Secrets(rag_api_key=None))
+    app = create_app(components.settings, secrets or Secrets(rag_api_key=None))
     app.state.components = components
     # 走 TestClient 的上下文管理器会执行 lifespan（会真去连 Redis/建模型），
     # 所以这里**不进** with 块：我们只验 HTTP 层，生命周期另有用例覆盖。
@@ -485,17 +488,42 @@ def test_health_is_degraded_when_milvus_or_redis_is_down() -> None:
     assert body["status"] == "degraded"
     assert not body["milvus"]["ok"] and "拒绝连接" in body["milvus"]["detail"]
 
-    no_redis = _client(_Components(_settings(), redis_ok=False))
+    shared = _settings()
+    shared.deployment.profile = "multiworker"
+    shared.api.workers = 2
+    shared.persistence.postgres.url = "postgresql://rag@localhost/rag"
+    shared.api.redis.url = "redis://localhost:6379/0"
+    shared.storage.minio.endpoint = "http://localhost:9000"
+    apply_deployment_profile(shared)
+    shared_secrets = Secrets(
+        rag_api_key=None,
+        minio_access_key="test-access",
+        minio_secret_key="test-secret",
+    )
+    no_redis = _client(_Components(shared, redis_ok=False), secrets=shared_secrets)
     body = no_redis.get("/health").json()
     assert body["status"] == "degraded"
     assert not body["redis"]["ok"]
     assert "退回进程内" in body["redis"]["detail"], "降级要说清降成了什么"
 
-    no_pg = _Components(_settings())
+    no_pg = _Components(shared)
     no_pg.persistence = _Persistence(ok=False)
-    body = _client(no_pg).get("/health").json()
+    body = _client(no_pg, secrets=shared_secrets).get("/health").json()
     assert body["status"] == "degraded"
     assert not body["postgres"]["ok"] and "单轮" in body["postgres"]["detail"]
+
+
+def test_local_lite_health_does_not_treat_absent_services_as_degraded() -> None:
+    settings = _settings()
+    settings.deployment.profile = "local-lite"
+    components = _Components(settings, redis_ok=False)
+    components.persistence = _Persistence(ok=False)
+
+    body = _client(components).get("/health").json()
+
+    assert body["status"] == "ok"
+    assert body["redis"]["ok"] and "未启用" in body["redis"]["detail"]
+    assert body["postgres"]["ok"] and "未启用" in body["postgres"]["detail"]
 
 
 def test_health_never_triggers_model_loading() -> None:
@@ -642,9 +670,11 @@ def test_an_unknown_chunk_is_404() -> None:
 
 def test_assets_are_served_from_the_assets_dir(tmp_path) -> None:
     settings = _settings()
-    settings.ingest.assets.dir = str(tmp_path)
-    (tmp_path / "doc1").mkdir()
-    (tmp_path / "doc1" / "p1.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
+    assets = Path(settings.ingest.assets.dir)
+    (assets / "doc1").mkdir(parents=True)
+    (assets / "doc1" / "p1.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
 
     response = _client(_Components(settings)).get("/assets/doc1/p1.jpg")
 
@@ -657,9 +687,10 @@ def test_assets_refuse_to_escape_their_root(tmp_path) -> None:
     `../` 与符号链接都能绕开字符串前缀判断，所以判据必须是「解析之后的位置」。
     """
     settings = _settings()
-    root = tmp_path / "assets"
-    root.mkdir()
-    settings.ingest.assets.dir = str(root)
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
+    root = Path(settings.ingest.assets.dir)
+    root.mkdir(parents=True)
     (tmp_path / "secret.txt").write_text("不该被读到", encoding="utf-8")
     (root / "ok.txt").write_text("可以读", encoding="utf-8")
 
@@ -882,15 +913,15 @@ def test_deleting_a_session_reports_what_went() -> None:
     assert body == {"deleted": "s1"} and components.chats.deleted == ["s1"]
 
 
-def test_sessions_say_so_when_pg_is_not_configured() -> None:
-    """没配 PG 时**明确回 503**，而不是让人对着 500 猜哪里坏了。"""
+def test_sessions_say_so_when_storage_was_not_initialized() -> None:
+    """会话存储没初始化时明确回 503，而不是让人对着 500 猜哪里坏了。"""
     components = _Components(_settings())
     components.chats = None
 
     resp = _client(components).get("/sessions")
 
     assert resp.status_code == 503
-    assert "没配 PG" in resp.json()["error"]["message"], "错误体统一是 {error: {code, message}}"
+    assert "会话存储未初始化" in resp.json()["error"]["message"]
 
 
 # ---- 问答落库：这是「换台机器、换台浏览器，会话都在」的全部依据 ----
@@ -998,21 +1029,19 @@ def test_history_is_none_when_there_is_nothing_to_seed() -> None:
 def _log_settings(tmp_path) -> Settings:
     """把四个日志文件都指到 tmp（别去碰仓库里的 data/logs）。"""
     settings = _settings()
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
     cfg = settings.observability.logging
     cfg.console = False
-    for name in ("interface", "agent_run", "channel"):
-        cfg.files[name].path = str(tmp_path / f"{name}.log")
-    # agent 那三类共用 agent.log（见 obs/setup.py）：这里也这么摆，测出来才是真实形状
-    cfg.files["agent_llm"].path = cfg.files["agent_run"].path
-    cfg.files["agent_tool"].path = cfg.files["agent_run"].path
-    cfg.system.path = str(tmp_path / "system.log")
     return settings
 
 
 def _write(path, *lines: str) -> None:
     from pathlib import Path
 
-    Path(path).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
 
 
 def test_logs_tail_merges_the_four_files_in_time_order(tmp_path) -> None:

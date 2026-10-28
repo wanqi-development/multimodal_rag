@@ -774,7 +774,7 @@ def _log_run(
     started: float,
     tokens: tuple[int | None, int | None] | None = None,
 ) -> None:
-    """**agent 运行日志**（三类日志里的第二类），落到 `data/logs/agent.log`。
+    """**agent 运行日志**（三类日志里的第二类），落到当前 profile 的 `logs/agent.log`。
 
     **答案不写进日志**（它属会话数据，在 chat 表与控制台输出里）；问题那一栏受
     `logging.content` 管。

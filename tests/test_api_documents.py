@@ -21,6 +21,8 @@ from rag.config.settings import Secrets
 
 def _settings(tmp_path: Path) -> Settings:
     settings = Settings()
+    settings.deployment.profile = "local-lite"
+    settings.deployment.state_dir = str(tmp_path)
     settings.ingest.uploads.dir = str(tmp_path / "uploads")
     settings.ingest.stages.dir = str(tmp_path / "stages")
     settings.ingest.assets.dir = str(tmp_path / "assets")

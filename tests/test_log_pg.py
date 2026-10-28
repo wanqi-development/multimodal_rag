@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from rag.api.app import Components, create_app
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
+from rag.deployment import apply_deployment_profile
 from rag.obs import log as obs
 from rag.obs.log import row_of, split_ids, tail_items
 from rag.obs.pg import PgLogHandler, build_pg_handler
@@ -231,16 +232,31 @@ def test_tail_items_lifts_the_ids_and_leaves_them_out_of_the_text(tmp_path: Path
 
 
 def _client(settings: Settings) -> TestClient:
-    components = Components(settings, Secrets(rag_api_key=None))
+    secrets = Secrets(
+        rag_api_key=None,
+        minio_access_key="test",
+        minio_secret_key="test",
+    )
+    components = Components(settings, secrets)
     components.persistence = None
-    app = create_app(settings, Secrets(rag_api_key=None))
+    app = create_app(settings, secrets)
     app.state.components = components
     return TestClient(app)
 
 
-def test_search_requires_a_request_id() -> None:
+def _shared_settings() -> Settings:
     settings = Settings()
+    settings.deployment.profile = "multiworker"
+    settings.api.workers = 2
     settings.persistence.postgres.url = "postgresql://rag@127.0.0.1:5432/x"
+    settings.api.redis.url = "redis://127.0.0.1:6379/0"
+    settings.storage.minio.endpoint = "http://127.0.0.1:9000"
+    apply_deployment_profile(settings)
+    return settings
+
+
+def test_search_requires_a_request_id() -> None:
+    settings = _shared_settings()
 
     answer = _client(settings).get("/logs/search")
 
@@ -281,8 +297,7 @@ def test_search_maps_the_rows_into_the_same_shape_as_the_file_view(
     import rag.persistence.logs as logs
 
     monkeypatch.setattr(logs, "build_log_store", lambda *a, **k: _Store())
-    settings = Settings()
-    settings.persistence.postgres.url = "postgresql://rag@127.0.0.1:5432/x"
+    settings = _shared_settings()
 
     body = (
         _client(settings)

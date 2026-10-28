@@ -1,12 +1,9 @@
 # 开发环境覆盖项。只写与 base.yaml 不同的部分（深合并）。
 # 切生产用 RAG_PROFILE=prod，见 prod.yaml.example。
 
-indexing:
-  vector:
-    # 同 base.yaml：collection 名带指纹（embedding + 块表结构），换一个就得换名字
-    # rag_dev_qwen3_v2 是**纯文本**那条路留下的（Qwen3-Embedding-0.6B，1024 维）；
-    # 换成多模态之后维度是 2560，Milvus 建好表就改不了维度 —— 只能新建一个。
-    collection: rag_dev_qwen3vl_v1
+deployment:
+  # 同 base.yaml：collection 名带 embedding 指纹，dev 的 2560 维需要独立 collection。
+  docker_single_collection: rag_dev_qwen3vl_v1
 
 providers:
   embedding:

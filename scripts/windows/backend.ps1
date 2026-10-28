@@ -20,12 +20,13 @@
 把 stderr 原样透出去 → PowerShell 渲染成一片红（实测 2026-10-10）。`-m rag` 走的是
 `src/rag/__main__.py`，没有这个撞名问题。要指定解释器：`$env:RAG_PYTHON = 'D:\...\python.exe'`。
 
-**前端要等它起来**：那个等待在 `frontend.ps1` 里（探 `/docs`，200 就算起来了）。
+**web 要等它起来**：那个等待在 `web.ps1` 里（探 `/docs`，200 就算起来了）。
 分开成两个脚本就是为了这一点 —— 后端要加载 embedding 等重对象，几十秒是常态。
 #>
 [CmdletBinding()]
 param(
     [switch]$DryRun,
+    [switch]$ProfilePaths,
     [string]$BackendHost,
     [int]$BackendPort
 )
@@ -104,6 +105,31 @@ function Resolve-Backend {
     return $null
 }
 
+function Resolve-StatePath([string]$value) {
+    if ([IO.Path]::IsPathRooted($value)) {
+        return [IO.Path]::GetFullPath($value)
+    }
+    return [IO.Path]::GetFullPath((Join-Path $root $value))
+}
+
+# web.ps1 也通过 `-ProfilePaths` 复用这里的解释器探测。profile show 走的是同一份
+# load_settings()，所以 PID / 启动日志与应用日志不会各自猜一套目录。
+function Get-ProfileRuntime($entry) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $base = @($entry.Base)
+        $raw = & $entry.File @base 'profile' 'show' 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0 -or -not $raw) {
+        throw '读不到当前 profile 的运行目录；先运行 `rag profile show` 看配置错误。'
+    }
+    return (($raw -join "`n") | ConvertFrom-Json)
+}
+
 # 不用 `??`：那是 PowerShell 7 才有的，5.1 会直接语法报错（这个脚本要两边都能跑）
 if (-not $BackendPort) {
     $port = Get-EnvValue 'RAG_API_PORT'
@@ -122,9 +148,18 @@ if (-not $backendEntry) {
     exit 1
 }
 
+$profileRuntime = Get-ProfileRuntime $backendEntry
+if ($ProfilePaths) {
+    $profileRuntime | ConvertTo-Json -Compress
+    exit 0
+}
+$runDir = Resolve-StatePath $profileRuntime.run_dir
+$logDir = Resolve-StatePath $profileRuntime.log_dir
+
 Write-Host "仓库：$root"
 Write-Host "后端：http://${BackendHost}:${BackendPort}"
 Write-Host "后端入口：$($backendEntry.File) $($backendEntry.Base -join ' ')（$($backendEntry.How)）" -ForegroundColor DarkGray
+Write-Host "状态域：$($profileRuntime.profile)（日志 $logDir）" -ForegroundColor DarkGray
 
 $occupant = Get-ListenerPid $BackendPort
 if ($occupant -gt 0) {
@@ -136,7 +171,7 @@ if ($occupant -gt 0) {
         $answer = Read-Host '杀掉上面的进程再启动？（y = 杀掉并重新启动；n = 放弃启动，什么都不动）[y/n]'
         if ($answer -notin @('y', 'Y', 'yes', 'YES')) {
             Write-Host '已放弃启动。' -ForegroundColor Yellow
-            # 3 = 「用户主动放弃」。`start.ps1` 靠它决定**前端也别起了**（0 是"起好了"）
+            # 3 = 「用户主动放弃」。`start.ps1` 靠它决定 **web 也别起了**（0 是"起好了"）
             exit 3
         }
         # 0 / 4 是系统进程，`$PID` 是本脚本自己 —— 端口判断万一出错，别把机器搞坏
@@ -154,14 +189,13 @@ if ($occupant -gt 0) {
 }
 
 $backendArgs = @($backendEntry.Base) + @('serve', '--host', $BackendHost, '--port', "$BackendPort")
-$logDir = Join-Path $root 'data\logs'
 $logFile = Join-Path $logDir 'backend-startup.log'
 if ($DryRun) {
     Write-Host "[dry-run] 会启动后端：$($backendEntry.File) $($backendArgs -join ' ')  （工作目录 $root）"
     Write-Host "[dry-run] 它的输出会同时进控制台与 $logFile"
     exit 0
 }
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+New-Item -ItemType Directory -Force -Path $logDir, $runDir | Out-Null
 
 # **输出同时进控制台与文件**（2026-10-10）：控制台那份给人看实时，文件那份给
 # 「进程秒退、窗口跟着关掉」兜底 —— 实测那次是配置校验失败（`config/dev.yaml` 的
@@ -190,5 +224,5 @@ Write-Host '✔ 后端已启动（新窗口）' -ForegroundColor Green
 Write-Host "后端接口：   http://${BackendHost}:${BackendPort}/docs"
 Write-Host "启动输出：   $logFile（窗口关了也在这里）" -ForegroundColor DarkGray
 # **必须显式 exit 0**：不写的话调用方（`start.ps1`）那边 `$LASTEXITCODE` 是 `$null`，
-# 而 `$null -ne 0` 在 PowerShell 里为**真** —— 会被当成"后端失败"，前端就不起了（实测踩过）。
+# 而 `$null -ne 0` 在 PowerShell 里为**真** —— 会被当成"后端失败"，web 就不起了（实测踩过）。
 exit 0

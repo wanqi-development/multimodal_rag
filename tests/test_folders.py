@@ -16,6 +16,7 @@ from rag.api.app import Components, create_app
 from rag.api.folders import FolderError, FolderStore
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
+from rag.deployment import apply_deployment_profile
 
 
 @pytest.fixture
@@ -149,9 +150,9 @@ def test_a_broken_file_means_no_folders(store: FolderStore) -> None:
 
 def _settings(tmp_path: Path) -> Settings:
     settings = Settings()
-    settings.ingest.uploads.dir = str(tmp_path / "uploads")
-    settings.ingest.stages.dir = str(tmp_path / "stages")
-    settings.ingest.assets.dir = str(tmp_path / "assets")
+    settings.deployment.profile = "local-lite"
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
     return settings
 
 

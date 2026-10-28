@@ -42,6 +42,7 @@ docs/backlog.md
 
 # dots.ocr 跑出来的产物：整本页图 + 逐页 json/md（8.1MB），是运行输出不是源码
 src/rag/ingest/dots_ocr/output/
+plugins/rag-dots-parser/src/rag_dots_parser/vendor/dots_ocr/output/
 
 # HuggingFace Hub 风格的分片缓存（sha256 命名的 blob），不是源码
 blobs/

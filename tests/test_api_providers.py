@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from rag.api.app import Components, create_app
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
+from rag.deployment import apply_deployment_profile
 from rag.persistence import secrets as S
 
 KEY = "sk-live-xyz"
@@ -23,8 +24,10 @@ KEY = "sk-live-xyz"
 
 def _settings(tmp_path: Path) -> Settings:
     settings = Settings()
+    settings.deployment.profile = "local-lite"
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
     settings.models.backend = "sqlite"
-    settings.models.sqlite_path = str(tmp_path / "models.sqlite3")
     return settings
 
 
@@ -77,7 +80,7 @@ def test_put_stores_a_ciphertext_and_returns_only_a_fingerprint(
     assert row["has_key"] is True and row["api_key_fingerprint"] == S.fingerprint(KEY)
     assert row["base_url"] == "https://gw/v1" and row["can_set_key"] is True
     # **主库 + WAL 一起扫**：落的是密文、明文不落盘（WAL 模式，只扫主库会假阴性）
-    blob = b"".join(p.read_bytes() for p in tmp_path.glob("models.sqlite3*"))
+    blob = b"".join(p.read_bytes() for p in tmp_path.glob("model_settings.sqlite3*"))
     assert KEY.encode() not in blob and b"v1:" in blob
 
 

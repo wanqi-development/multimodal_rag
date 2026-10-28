@@ -45,11 +45,11 @@ def _session_view(row: dict) -> SessionView:
 
 
 def _chats(components):
-    """会话存储。**没配 PG 就没得谈** —— 明确回 503，别让人对着 500 猜。"""
+    """会话存储。没初始化成功就明确回 503，别让人对着 500 猜。"""
     if components.chats is None:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "没配 PG（persistence.postgres.url 为空），会话没有地方存。",
+            "会话存储未初始化；查看 /health 或服务启动日志。",
         )
     return components.chats
 

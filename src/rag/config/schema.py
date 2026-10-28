@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ChatProviderConfig(BaseModel):
@@ -214,6 +214,20 @@ class VectorIndexConfig(BaseModel):
         }
     )
     bm25: Bm25Config = Field(default_factory=Bm25Config)
+
+    @model_validator(mode="after")
+    def _check_backend(self):
+        """本地 Lite 与 Docker Milvus 的能力差异在建表前收口。
+
+        Milvus Lite 3.2 支持 BM25，但 analyzer 只接受 ``standard`` / ``jieba``；
+        Docker Milvus 用的 ``chinese`` 在 Lite 建表时直接报
+        ``unknown tokenizer type``。因此后端一旦选了 Lite，默认 analyzer 要跟着切。
+        """
+        if self.backend not in {"milvus", "milvus-lite"}:
+            raise ValueError(f"未知向量库后端 {self.backend!r}；可选：milvus、milvus-lite")
+        if self.backend == "milvus-lite" and self.bm25.analyzer == "chinese":
+            self.bm25.analyzer = "jieba"
+        return self
 
 
 class SemanticChunkConfig(BaseModel):
@@ -499,7 +513,7 @@ class IngestImagesConfig(BaseModel):
     # 单次最多描述几张图，0 = 不限制。**先花几毛钱看效果**的口子：
     # 打开 describe 之前先用它跑几张，确认提示词与模型对路再全量。
     max_images: int = 0
-    # auto（听 storage.backend）| local | minio。scale-out 下自动走桶，避免每个 worker 一份缓存。
+    # auto（听 storage.backend）| local | minio。multiworker 下强制走桶，避免每个 worker 一份缓存。
     cache_backend: str = "auto"
     cache_prefix: str = "image-cache"
     # 描述缓存的落盘位置。**按图片内容哈希 + 模型 + 提示词版本做键** ——
@@ -737,7 +751,21 @@ class ApiConfig(BaseModel):
 class DeploymentConfig(BaseModel):
     """部署形态。profile 约束必需的共享后端，具体值仍在各配置块里。"""
 
-    profile: str = "single-node"  # single-node | server | scale-out
+    profile: str = "local-lite"  # local-lite | docker-single | multiworker
+    # 所有 profile 的本地状态都放在 <state_root>/<profile>/ 下。
+    state_root: str = "./data"
+    # 特例入口（demo 固定使用 ./data/demo）；普通三档留空，由 state_root 派生。
+    state_dir: str = ""
+    # 由 apply_deployment_profile() 填入 <state_dir>/run，启动脚本与 PID 使用。
+    run_dir: str = ""
+    local_lite_collection: str = "rag_local_lite_v1"
+    docker_single_collection: str = "rag_docker_single_v1"
+    multiworker_collection: str = "rag_multiworker_v1"
+    docker_single_bucket: str = "rag-docker-single"
+    multiworker_bucket: str = "rag-multiworker"
+    milvus_internal_bucket: str = "milvus-bucket"
+    multiworker_pg_schema: str = "rag_multiworker"
+    multiworker_redis_prefix: str = "rag:multiworker:"
     # 外部容器/进程副本数；容器里通常 workers=1、replicas=2
     replicas: int = 1
     # 分布式灌库槽位的租约。正常释放走 finally；进程崩溃时靠它回收。
@@ -761,6 +789,8 @@ class PersistenceConfig(BaseModel):
 
     # 统一开关：base.yaml 里是 `${RAG_DB_BACKEND:-auto}`，值放 .env
     backend: str = "auto"
+    # local-lite / docker-single 的 UI 会话库（chat_session / chat_message / token_usage）。
+    chat_sqlite_path: str = "./data/chats.sqlite3"
 
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
 

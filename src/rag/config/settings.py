@@ -131,9 +131,10 @@ def load_settings(profile: str | None = None, directory: Path | None = None) -> 
     data = _read_yaml(directory / "base.yaml")
     data = _deep_merge(data, _read_yaml(directory / f"{profile}.yaml"))
     settings = Settings.model_validate(data)
-    from rag.deployment import validate_deployment
+    from rag.deployment import apply_deployment_profile, validate_deployment
 
-    validate_deployment(settings)
+    canonical = apply_deployment_profile(settings)
+    validate_deployment(settings, secrets=get_secrets() if canonical == "multiworker" else None)
     return settings
 
 
