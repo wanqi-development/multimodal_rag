@@ -59,6 +59,13 @@
 .input input { flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: transparent; color: inherit; font: inherit; padding: 9px 0; }
 .input i { color: var(--muted); }
 .input kbd { font: 11px ui-monospace, monospace; color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; background: var(--surface-2); }
+.topk-select {
+  flex: 0 0 auto; border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--muted); font-family: inherit;
+  font-size: 11px; line-height: 1.4; padding: 4px 5px; cursor: pointer;
+}
+.topk-select:hover { border-color: var(--border-strong); color: var(--text); }
+.topk-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .btn {
   display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: var(--r);
@@ -729,6 +736,7 @@ details.tools code { background: var(--surface-3); padding: 1px 6px; border-radi
 }
 @media (max-width: 520px) {
   .search-composer kbd { display: none; }
+  .search-composer input { flex-basis: 80px; }
   .search-composer.has-image { flex-wrap: wrap; padding: 6px 8px; row-gap: 5px; }
   .search-composer.has-image > svg { display: none; }
   .search-composer.has-image .search-attachment {

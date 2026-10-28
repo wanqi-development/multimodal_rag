@@ -11,7 +11,7 @@ import { openChunk } from '../state'
 // 既花了本地的重排时间，又让人以为「页面自己会查东西」。要查就自己按一下。
 const query = ref('')
 const topK = ref(8)
-const rerank = ref(true)
+const rerank = true
 const loading = ref(false)
 const error = ref('')
 const hits = ref<Hit[]>([])
@@ -95,7 +95,7 @@ async function run(): Promise<void> {
     const body = await search({
       query: query.value,
       top_k: topK.value,
-      rerank: rerank.value,
+      rerank,
       ...(imagePath.value ? { image_path: imagePath.value } : {}),
     })
     hits.value = body.hits
@@ -180,7 +180,9 @@ onUnmounted(() => {
           class="hidden-file"
           @change="onPickImage"
         />
-        <kbd>/</kbd>
+        <select v-model.number="topK" class="topk-select" aria-label="返回结果数量">
+          <option v-for="n in [3, 5, 8, 12, 20]" :key="n" :value="n">Top-k {{ n }}</option>
+        </select>
       </div>
       <button
         class="btn primary search-submit"
@@ -190,22 +192,10 @@ onUnmounted(() => {
         {{ loading ? '检索中…' : '检索' }}
       </button>
     </form>
-    <div class="seg" role="group" aria-label="参数">
-      <button class="on">top-k {{ topK }}</button>
-      <button :class="{ on: rerank }" @click="rerank = !rerank">重排</button>
-    </div>
-    <label class="hint">
-      top-k
-      <select v-model.number="topK" aria-label="top-k">
-        <option v-for="n in [3, 5, 8, 12, 20]" :key="n" :value="n">{{ n }}</option>
-      </select>
-    </label>
   </header>
 
   <div class="main-body" @paste="onPaste">
     <div class="chips">
-      <span class="chip on">hybrid + bm25</span>
-      <span class="chip">{{ rerank ? '重排开' : '重排关' }}</span>
       <span class="hint right">j / k 选择 · o 打开原文 · Esc 关闭</span>
     </div>
 
@@ -232,12 +222,12 @@ onUnmounted(() => {
 
     <div v-else-if="searched" class="empty">
       <b>没有命中</b>
-      换个说法、放宽 top-k，或者把重排关掉看看原始召回 —— 也可以用「对话」让它自己决定查哪一路。
+      换个说法或放宽 Top-k；如果搜的是图片，可以补充文字描述后再试。
     </div>
 
     <div v-else class="empty">
       <b>输入检索词，或粘贴一张图片</b>
-      这条链路<b class="inline">不调大模型</b>：本地 embedding + 本地重排，几秒钟给你原始片段。
+      直接返回相关原文片段。
       要成段结论、要接着上文追问，就切「对话」。
     </div>
 
