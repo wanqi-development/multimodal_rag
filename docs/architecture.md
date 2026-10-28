@@ -1044,7 +1044,7 @@ querynode 的 DML channel 不可服务）每次查询要**等 9013ms 才回 503*
 
 | 项 | 之前 | 现在 |
 |---|---|---|
-| 落点 | Milvus collection `<collection>_docs` | 表 `document_registry`（PG；单机 SQLite `data/documents.sqlite3`） |
+| 落点 | Milvus collection `<collection>_docs` | 表 `document_registry`（PG；单机 SQLite `<state_dir>/documents.sqlite3`） |
 | 状态 | 靠 `_docs` 里有没有那一行 | 表里一列 `stage`：`uploaded → parsed → reviewed → chunked → indexed` |
 | 列表页 | 逐份 `path_of`（O(N²)）+ `file_hash` + 读三份产物 JSON | **只读 `stage` 一列**（一次 `select`），不碰产物、不算哈希 |
 | 详情页 | 现算产物摘要 + 查 Milvus | 现算产物摘要（灯如实反映产物是否过期）+ 读表里那一行 |
@@ -1934,8 +1934,9 @@ Windows 版还多一个 `-Backend`（只起后端，与 `start.sh --backend` 对
 **踩过的坑**：参数 `$Backend` 与「解析出来的后端入口」变量**不能同名** ——
 PowerShell 变量名大小写不敏感，撞上之后赋值哈希表会报
 「无法将 Hashtable 转换成 SwitchParameter」（实测）。所以那个变量叫 `$backendEntry`。
-Linux 版把日志落 `data/logs/`、PID 记 `data/run/`（停：`kill $(cat data/run/backend.pid)`）；
-Windows 版各自开一个窗口，窗口里的输出**同时 tee 进 `data/logs/backend-startup.log`**，
+Linux 版把日志落当前 profile 的 `<state_dir>/logs/`、PID 记 `<state_dir>/run/`
+（例如停：`kill $(cat data/docker-single/run/backend.pid)`）；Windows 版各自开一个窗口，
+窗口里的输出**同时 tee 进当前 profile 的 `<state_dir>/logs/backend-startup.log`**，
 而且窗口**不再自动关**（`-NoExit`）—— 进程秒退的时候，栈既留在窗口里也留在文件里
 （2026-10-10 加：那次配置校验失败一闪而过，什么都没抓到，见下面「启动失败那份日志」）。
 
@@ -1956,8 +1957,10 @@ Windows 版各自开一个窗口，窗口里的输出**同时 tee 进 `data/logs
    （改这个文件时注意别把 BOM 弄丢）。
 3. **`.cmd` 只能是 ASCII**：cmd.exe 按 OEM 码页读批处理，中文 `REM` 会被当命令执行
    （实测报「'程」），所以 `start.cmd` 里全是英文注释。
-4. **Vite 默认只监听 `localhost`，在 Windows 上落成 `::1`** → 脚本印的 `127.0.0.1:5173`
-   连不上（`ConnectError`）。`vite.config.ts` 里显式 `host: '127.0.0.1'` 绑死 IPv4。
+4. **Vite 默认只监听 `localhost`，在 Windows 上落成 `::1`** → 脚本印的 IPv4 地址
+   连不上（`ConnectError`）。现在 `vite.config.ts` 与启动脚本共用
+   `RAG_WEB_HOST` / `RAG_WEB_PORT`，默认显式绑 `127.0.0.1:5174`；
+   `strictPort` 保证端口被占时直接失败，不会悄悄漂到下一个端口。
 5. bash 版的 y/n 判断**先规整输入**（去空白与 CR）：管道喂进去的 `y\r` 不规整就匹配不上，
    表现成「明明是 y 却取消了」。
 
@@ -2077,14 +2080,15 @@ Windows 版各自开一个窗口，窗口里的输出**同时 tee 进 `data/logs
 
 顺手补的两处：**流式 agent 也写运行日志**（`stream_agent` / `stream_resume` 收尾时补记，
 跑完与停在闸门两种都算）—— 在这之前界面发起的每次运行在日志里都查不到（当时落 PG 的
-`agent_run_log`，2026-10-06 起落 `data/logs/agent.log`，见 §13.4）；
+`agent_run_log`，2026-10-06 起落 `agent.log`，2026-10-27 以后跟随当前 profile
+落到 `<state_dir>/logs/agent.log`，见 §13.4）；
 导航按钮补 `aria-label` / `title` —— 窄窗口下收起时只剩图标，按钮没有可访问名称。
 
 真机验收（2026-10-06）：agent 问答 8 步时间线 + 7 条引用，答案分「能确定 / 可推断 / 没有」
 三段；刷新后会话被接回来；新建+删除会话刷新后仍一致；PG 里查到
 `thread=9434f8cfd986 steps=14 retrieved=36 cited=7 status=answered`。
 
-### 12.10 会话落 PG：三张表（2026-10-06，P2 第三批之第一批）
+### 12.10 会话落库：三张表（2026-10-06；2026-10-26 增加本地 SQLite）
 
 **为什么不是 localStorage**：使用者要「换台机器、换台浏览器，会话都在」。
 浏览器本地存储做不到，而且多实例部署时每个实例看到的会话都不一样。
@@ -2114,8 +2118,9 @@ token_usage    一次问答一行：model / calls / input_tokens / output_tokens
    （`pending_actions`），取不到就把状态降级 —— 已经批过的自然就没有卡片了。
 3. **token 单开一张表**，不与对话记录混。粒度是「一次问答」：按会话 / 按天 / 按模型
    都能聚合；agent 一轮里发生几次模型调用，用 `calls` 记下来。
-4. **DDL 显式触发**（`rag chats init`）：建表是写操作，不该藏在启动路径里。
-   写入失败不影响问答。
+4. **存储随 profile 选**：local-lite / docker-single 使用
+   `persistence.chat_sqlite_path`（默认 `data/<profile>/chats.sqlite3`），启动时自动建表并启用
+   WAL；multiworker 使用 PG，仍可显式跑 `rag chats init`。写入失败不影响问答。
 
 **一个真机才炸出来的坑**：连接池配的是 `dict_row`，`fetchone()` 返回字典。
 第一版按逐位下标取，单测全绿（替身返回元组）而真库直接 `KeyError: 0` ——
@@ -2125,11 +2130,15 @@ token_usage    一次问答一行：model / calls / input_tokens / output_tokens
 total_tokens=1500 / calls=4` → `update_pending` 把中断那行补成 `answered`
 （token 累加）→ 删会话后 `summary` 全归零（级联真的带走了消息与 token 行）。
 
+本地 SQLite 回归（2026-10-26）：重建 store 后列表与详情仍在；
+`created_at` 解析为带时区时间；中断行可由 `update_pending` 原地补齐；
+删除会话后消息与 token 行都被外键级联清空。
+
 ### 12.11 问答落库：谁写、token 从哪来、引用怎么写（2026-10-06）
 
 **服务端在问答结束时写**，客户端不回传任何东西：`/chat` 与 `/agent`（含 `resume`）
 收一个可选 `session_id`，响应与 `done` 事件把它带回来。换台机器、换个浏览器，
-会话都在 —— 这是把会话放进 PG 的全部理由。
+会话都在 —— 这是把会话交给服务端关系库而不是浏览器存储的全部理由。
 
 三个真机上才看清的点：
 
@@ -2873,7 +2882,7 @@ rerank 拿同一批 hybrid 候选就把它们比下去了。根因还是那两�
                         └─→ agent.log（同 id；CLI 里则是 run-xxxx）
 ```
 
-| 类别 | 文件（`data/logs/` 下） | 一行是什么 | 行上有什么 |
+| 类别 | 文件（当前 profile 的 `<state_dir>/logs/` 下） | 一行是什么 | 行上有什么 |
 |---|---|---|---|
 | `interface` | `interface.log` | 一次 HTTP 请求 | `method / path / status / 耗时 / 身份[ / 响应字节 / ip=]`，失败再带 `⚠error` |
 | `channel` | `channel.log` | 一次查询 × 每一路通道 | `（查询或 hash 前 8）/ channel / 召回 / 入选 / 耗时 [ / 过滤 ]`，失败再带 `⚠error` |
@@ -2882,9 +2891,11 @@ rerank 拿同一批 hybrid 候选就把它们比下去了。根因还是那两�
 | `agent_tool` | `agent.log` | **一次工具调用** | `工具#n / 工具名 / 入参（值）/ 出参（值）/ 耗时`（失败带 `⚠`）；**入参出参恒给内容**，见下面第 3 条 |
 | `system` | `system.log` | 其余：LangChain / pymilvus / httpx / uvicorn / 其他 `rag.*` | 同一套格式，带 `req=` / `run=`（**不含**上面几类，不重复落） |
 
-**另有一份 `startup-error.log`**：它**不是**业务日志的一个类别（`rag logs tail --kind`
+**另有一份 `<state_dir>/logs/startup-error.log`**：它**不是**业务日志的一个类别（`rag logs tail --kind`
 里没有它，也不进 PG），而是 `rag` 每次**启动读配置失败**时的现场 —— 完整栈按时间追加，
-由 `cli/main.py` 的 `_record_startup_error()` 写。为什么非单独有一份不可：配置坏掉是
+由 `cli/main.py` 的 `_record_startup_error()` 写。它只读启动前已可用的
+`RAG_DEPLOYMENT_PROFILE` / `RAG_STATE_ROOT` 来选当前状态域，因此即使完整配置校验失败，
+也不会把两个 profile 的失败栈混在同一个文件里。为什么非单独有一份不可：配置坏掉是
 唯一一类恰好发生在 `configure_logging` **之前**的失败，那一刻四个文件一个 handler 都
 没装，栈只到 stderr；而 `rag serve` 被 `scripts/windows/backend.ps1` 起在新窗口里，
 窗口一关就什么都不剩。实测 2026-10-10：`config/dev.yaml` 的 `ingest.images` 成了空节点
@@ -3095,15 +3106,50 @@ Selector 循环里，为一份索引背这个约束不值得）。
 
 Milvus standalone 需要三个组件：**etcd + MinIO + milvus**。
 
-### 14.0 部署档位（2026-10-23）
+### 14.0 部署档位（2026-10-26 改为三档 canonical profile）
 
-| profile | 数据库 | 文件 | Redis | workers |
+| profile | 向量库 | 关系库 | 文件 / bucket | Redis | workers |
 |---|---|---|---|---|
-| `single-node` | SQLite | local | 可选（不可用则进程内） | 1 |
-| `server` | PostgreSQL | local / MinIO | 可选 | 1 |
-| `scale-out` | PostgreSQL | MinIO | **必需** | `max(workers, replicas) >= 2` |
+| `local-lite` | `rag_local_lite_v1`（Lite 文件） | `data/local-lite/*.sqlite3` | `data/local-lite/**` | 不允许 | 严格 1 |
+| `docker-single` | `rag_docker_single_v1` | `data/docker-single/*.sqlite3` | `rag-docker-single` | 不允许 | 严格 1 |
+| `multiworker` | `rag_multiworker_v1` | PG schema `rag_multiworker` | `rag-multiworker` | **必需** | `max(workers, replicas) >= 2` |
 
-`deployment.profile` 在 `load_settings()` 与 `create_app()` 都校验；不满足组合直接报错。
+profile 只接受 `local-lite` / `docker-single` / `multiworker` 三个 canonical 名称。
+`load_settings()` 会先按 profile 强制基础设施组合，再在 `create_app()` 二次校验；
+不满足组合直接报错。
+
+`local-lite` 是本机零服务档：Milvus Lite 仍由 `pymilvus` 调用，但数据写在
+`RAG_STATE_ROOT/local-lite/milvus.db`（默认 `./data/local-lite/milvus.db`），
+不启动 Docker 或网络端口。
+实测 Milvus Lite 3.2.2 支持 dense/sparse、BM25 Function 与 `hybrid_search`，但 analyzer
+只接受 `standard` / `jieba`，Docker Milvus 默认的 `chinese` 会在建表时直接报错；
+因此 `local-lite` 自动改用 `jieba`。Lite 的数据库锁是进程级的：同一数据库不能一边跑
+API 一边另起 CLI 灌库，切换或清理通常要停进程。
+
+`docker-single` 保留真实 Milvus 服务端的 hybrid 行为。Docker Milvus standalone 本身
+已经依赖 MinIO，因此应用复用同一 MinIO 实例的 `rag-docker-single` bucket，不新增
+另一个对象存储进程；关系库仍用独立的 SQLite 文件。
+`multiworker` 的 PostgreSQL / Redis / MinIO / Docker Milvus 是四项硬要求，缺一项就拒绝启动。
+Milvus 内部 bucket `milvus-bucket` 与两个应用 bucket 完全分离。
+UI 对话记录也跟随状态域：本地两档用各自目录下的 `chats.sqlite3`
+（启动自动建表、WAL），multiworker 继续用 PG
+`chat_session / chat_message / token_usage`。这样本地对话页不再返回“没配 PG”的 503，
+普通快问答与会话列表重启后都还在；LangGraph Agent 的 checkpointer 仍是另一层。
+
+每个 profile 还会写状态 marker：
+
+- 本地：`<state_dir>/state.json`
+- MinIO：bucket 根下 `_profile.json`
+- marker 记录 profile、namespace id、collection、元数据后端、bucket/schema/Redis prefix；
+  任一项不一致都拒绝启动。
+`rag profile show` 查看解析结果，`rag profile check` 只读校验，
+`rag profile import-legacy` 可把旧 `rag` bucket + PG schema 显式复制到 docker-single，
+源数据不删不改。
+启动脚本也复用 `rag profile show` 得到的 `run_dir` / `log_dir`：PID、Linux 的
+`backend.out.log` / `web.out.log` 与 Windows 的 `backend-startup.log` 都跟随当前 profile，
+不再写共享的 `data/run`、`data/logs`。
+启动时还会实际探活：Redis `PING`、PostgreSQL 连接与建 pool、MinIO bucket 检查（不存在则自建）；
+任一失败都直接终止 startup，而不是把 `/health` 标红后继续半降级运行。
 `rag serve --workers N` 多 worker 时用 import-string 工厂让每个子进程重读配置；
 两个单 worker 容器通过 `deployment.replicas=2` 表达总副本数。
 
@@ -3115,9 +3161,9 @@ Milvus standalone 需要三个组件：**etcd + MinIO + milvus**。
 多 worker 的共享状态：
 
 - `JobStore`：任务 JSON + Redis sorted-set 索引，列表能看见其他 worker；
-- `IngestGate`：Redis `SET NX` 槽位 + 租约，finally 按 token 释放；scale-out 下 Redis
+- `IngestGate`：Redis `SET NX` 槽位 + 租约，finally 按 token 释放；multiworker 下 Redis
   丢失会拒绝退回单进程；
-- VLM 描述缓存：scale-out 自动改用 MinIO，一个图片哈希一个 key，不存在 JSON 合并竞争；
+- VLM 描述缓存：multiworker 强制改用 MinIO，一个图片哈希一个 key，不存在 JSON 合并竞争；
 - 限流：沿用原 Redis 计数。
 
 ```yaml

@@ -33,7 +33,7 @@ class IngestGate:
     async def hold(self) -> AsyncIterator[None]:
         if not self._redis.available:
             if self._require_shared:
-                raise RuntimeError("scale-out 灌库闸门需要 Redis，但 Redis 当前不可用")
+                raise RuntimeError("multiworker 灌库闸门需要 Redis，但 Redis 当前不可用")
             async with self._local:
                 yield
             return
@@ -50,7 +50,7 @@ class IngestGate:
                 break
             if not await self._redis.ping():
                 if self._require_shared:
-                    raise RuntimeError("scale-out 灌库闸门失去 Redis，拒绝退回单进程")
+                    raise RuntimeError("multiworker 灌库闸门失去 Redis，拒绝退回单进程")
                 async with self._local:
                     yield
                 return

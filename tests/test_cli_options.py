@@ -307,7 +307,9 @@ def test_a_broken_config_leaves_the_stack_behind(tmp_path, monkeypatch) -> None:
 
     import rag.cli.main as cli
 
-    monkeypatch.chdir(tmp_path)  # STARTUP_ERROR_LOG 是相对路径，跟着 cwd 走
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RAG_DEPLOYMENT_PROFILE", "local-lite")
+    monkeypatch.setenv("RAG_STATE_ROOT", "./state")
 
     def boom() -> Settings:
         raise RuntimeError("配置坏了（用例）")
@@ -317,7 +319,7 @@ def test_a_broken_config_leaves_the_stack_behind(tmp_path, monkeypatch) -> None:
     result = CliRunner().invoke(cli.app, ["config"])
 
     assert result.exit_code != 0
-    log = tmp_path / "data" / "logs" / "startup-error.log"
+    log = tmp_path / "state" / "local-lite" / "logs" / "startup-error.log"
     assert log.is_file(), "启动失败的栈必须落到盘上（窗口关了也查得到）"
     text = log.read_text(encoding="utf-8")
     assert "启动失败：RuntimeError" in text
@@ -331,6 +333,8 @@ def test_the_startup_error_log_appends_instead_of_overwriting(tmp_path, monkeypa
     import rag.cli.main as cli
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RAG_DEPLOYMENT_PROFILE", "local-lite")
+    monkeypatch.setenv("RAG_STATE_ROOT", "./state")
     seen = {"n": 0}
 
     def boom() -> Settings:
@@ -342,6 +346,8 @@ def test_the_startup_error_log_appends_instead_of_overwriting(tmp_path, monkeypa
     runner.invoke(cli.app, ["config"])
     runner.invoke(cli.app, ["config"])
 
-    text = (tmp_path / "data" / "logs" / "startup-error.log").read_text(encoding="utf-8")
+    text = (tmp_path / "state" / "local-lite" / "logs" / "startup-error.log").read_text(
+        encoding="utf-8"
+    )
     assert "第 1 次失败" in text
     assert "第 2 次失败" in text

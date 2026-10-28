@@ -136,21 +136,58 @@ cp .env.example .env             # Windows: Copy-Item .env.example .env
 
 | profile | 必需后端 | 说明 |
 |---|---|---|
-| `single-node` | SQLite + local | 默认；单进程 |
-| `server` | PostgreSQL | 单 worker；文件可 local 或 MinIO |
-| `scale-out` | PostgreSQL + MinIO + Redis | 总副本数 `max(workers, replicas) >= 2`；任务、灌库闸门、VLM 缓存共享 |
+| `local-lite` | Milvus Lite + SQLite + `data/local-lite/` | 无 Docker、无中间件；严格单 worker |
+| `docker-single` | Docker Milvus + SQLite + `rag-docker-single` | 复用 Milvus 栈自带 MinIO；无 PG/Redis；单 worker |
+| `multiworker` | Docker Milvus + `rag-multiworker` + PostgreSQL + Redis | 四项必选；总副本数 `max(workers, replicas) >= 2` |
 
-`scale-out` 启动前会校验后端组合，不会静默退回单进程。模型仍会在每个 worker 各加载一份。
+启动前会按 profile 强制完整状态域：每档的 SQLite、MinIO bucket、Milvus collection、
+PG schema、Redis prefix、缓存与日志都不能共用。
+`local-lite` 清空 PG、Redis、MinIO；`docker-single` 只允许自己的 MinIO bucket；
+`multiworker` 缺任一共享后端都拒绝启动。模型仍会在每个 worker 各加载一份。
+
+一台机器完全不想装 Docker 时：
+
+```powershell
+$env:RAG_DEPLOYMENT_PROFILE = "local-lite"
+rag serve
+```
+
+本地库默认落在 `data/local-lite/milvus.db`，可用 `RAG_STATE_ROOT` 改父目录。
+
+三档状态目录由 `RAG_STATE_ROOT` 统一派生：
+
+```text
+data/local-lite/       # Milvus Lite、SQLite、uploads、stages、assets、run、logs、workspace
+data/docker-single/    # SQLite、缓存、run、logs、workspace
+data/multiworker/      # 本地缓存、run、logs、workspace；主数据在 PG/MinIO
+```
+
+用 `rag profile show` 查看当前实际路径，`rag profile check` 校验本地与 bucket 的
+`state.json` / `_profile.json` 是否一致，`rag profile init` 幂等创建缺失标记。
+启动脚本的 PID 与启动输出也落在当前 profile 的 `run/`、`logs/`，不会跨档串线。
+
+三档状态完全隔离：切到 `local-lite` 后看不到 `docker-single` / `multiworker` 里的
+文档和会话，这是正常结果，不是数据库丢失。需要复用已有数据时必须显式复制；当前
+`rag profile import-legacy` 只负责旧共享状态到 `docker-single`，通用的跨档复制仍在
+backlog #31。
+
+> **Milvus Lite 首次初始化时的 `AllocTimestamp` 日志**：在全新的 `local-lite`
+> 状态域第一次创建 collection 时，pymilvus 会调用 Milvus Lite 尚未实现的
+> `AllocTimestamp` 来等待 `dense` / `sparse` 索引构建，日志中因此可能出现两次
+> `Method not implemented!` ERROR。索引随后仍会正常创建，服务也会继续出现
+> `Application startup complete`；collection 建立后再次启动不会重复出现。判断启动
+> 是否成功以 `/health` 返回 200 和 `Application startup complete` 为准，不要只看这
+> 两条预期的兼容性告警。
 
 ### 3. 依赖服务
 
 | 服务 | 必需？ | 起法 |
 |---|---|---|
-| Milvus（etcd + MinIO + milvus） | **要**（灌库与检索都靠它） | `cd deploy && docker compose up -d` |
+| Milvus（etcd + MinIO + milvus） | `local-lite` 不要；其他两档要 | `cd deploy && docker compose up -d` |
 | OCR 产线 | 扫描件才要 | `deploy/paddleocr-vl.yaml`，按 `RAG_PDF_PARSER` 选一个（dots / mineru / paddleocr） |
-| PostgreSQL | 不要（单机走 SQLite） | 多 worker / 多机才配 `RAG_PG_URL` |
-| MinIO | 不要（单机走本地盘） | 多 worker 才把 `RAG_STORAGE_BACKEND` 切 `minio` |
-| Redis / Neo4j | `scale-out` 要 Redis；Neo4j 不要 | Redis 管限流、跨 worker 任务列表、灌库槽位；Neo4j 是可选图谱通道 |
+| PostgreSQL | `multiworker` 必选 | 配 `RAG_PG_URL` |
+| MinIO | `docker-single` / `multiworker` 必选 | 复用 Docker Milvus 的 MinIO；应用使用独立 bucket |
+| Redis / Neo4j | `multiworker` 要 Redis；Neo4j 不要 | Redis 管限流、跨 worker 任务列表、灌库槽位；Neo4j 是可选图谱通道 |
 
 ### 4. 本地模型
 
@@ -172,17 +209,19 @@ scripts\start.cmd              # Windows：后端 → 等 /docs 就绪 → 前�
 
 # 调后端时不想拖一个 Vite 起来：
 scripts\windows\backend.cmd    ./scripts/linux/backend.sh
-scripts\windows\frontend.cmd   ./scripts/linux/frontend.sh
+scripts\windows\web.cmd        ./scripts/linux/web.sh
 ```
 
 **前端会等后端 `/docs` 能应答之后再起** —— 后端要加载 embedding 等重对象，几十秒是常态；
 等就绪的上限默认 120 秒，可用 `RAG_BACKEND_WAIT_S` 或 `-WaitSeconds N` 调整。
 
-起来之后：页面 <http://127.0.0.1:5173>（热更新），接口文档 <http://127.0.0.1:8000/docs>。
+起来之后：Vite 页面默认 <http://127.0.0.1:5174>（热更新，由
+`RAG_WEB_HOST` / `RAG_WEB_PORT` 控制），接口文档
+<http://127.0.0.1:8000/docs>。
 生产用 `cd web && pnpm.cmd build`（或 `npm.cmd run build`）再 `rag serve` —— 它会自动把
 `web/dist` 挂到 `/`，一个进程就够。
 
-多 worker：先设置 `RAG_DEPLOYMENT_PROFILE=scale-out`、`RAG_API_WORKERS=2`，再
+多 worker：先设置 `RAG_DEPLOYMENT_PROFILE=multiworker`、`RAG_API_WORKERS=2`，再
 `rag serve --workers 2`。两个单 worker 容器则设 `RAG_DEPLOYMENT_REPLICAS=2`；
 `--reload` 与多 worker 不能同时开。
 
@@ -211,6 +250,7 @@ rag agent  "Flink 的 Savepoint 是什么"  # 对话式 agent（多轮加 --thre
 | `rag serve` | 起 FastAPI 服务（有 `web/dist` 就一并托管页面） |
 | `rag eval` | 跑黄金集（`--judge` 再加生成侧判定，花钱） |
 | `rag registry` / `rag storage` / `rag models` | 文档注册表（含 `reconcile` 索引对账与 `prune` 旧版本清理）/ 文件落点（含把本地已有文件推上桶）/ 模型选型 |
+| `rag profile` | 查看或校验当前 profile 的完整状态域；`import-legacy` 显式复制旧共享状态 |
 | `rag logs` / `rag chats` / `rag sessions` | 日志 / UI 会话记录 / LangGraph 会话 |
 | `rag graph` | 知识图谱通道（**由插件提供**，默认关） |
 
@@ -237,7 +277,7 @@ plugins/        三个扩展点（检索通道 / CLI 命令 / PDF parser）的�
 config/         base.yaml 与 dev.yaml（值放 .env）
 deploy/         Milvus 与 OCR 产线的 compose
 eval/           黄金集（跑出来的报告落在 eval/reports/，不进库）
-tests/          pytest（953 个用例；需要真 Milvus / OCR 的集成用例默认跳过）
+tests/          pytest（977 个用例；需要真 Milvus / OCR 的集成用例默认跳过）
 ```
 
 > `plugins/rag-dots-parser/` 是 **dots.ocr 官方仓库整包拿过来的第三方样例代码**（含它自己的

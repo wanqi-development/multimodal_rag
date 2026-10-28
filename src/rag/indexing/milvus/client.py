@@ -15,6 +15,7 @@ import asyncio
 import json
 from collections.abc import Iterator
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 from pymilvus import AnnSearchRequest, MilvusClient, RRFRanker
@@ -97,6 +98,8 @@ class MilvusIndex:
         )
 
     def _ensure_ready_sync(self) -> None:
+        if self._cfg.backend == "milvus-lite":
+            Path(self._cfg.uri).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         if not self._client.has_collection(self._cfg.collection):
             self._client.create_collection(
                 self._cfg.collection,

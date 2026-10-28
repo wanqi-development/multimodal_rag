@@ -124,7 +124,7 @@ def test_redis_ingest_gate_is_shared_across_instances() -> None:
     asyncio.run(scenario())
 
 
-def test_scale_out_gate_refuses_to_fall_back_without_redis() -> None:
+def test_multiworker_gate_refuses_to_fall_back_without_redis() -> None:
     redis = RedisBackend.__new__(RedisBackend)
     redis._client = None
     redis._cfg = type("Cfg", (), {"url": "", "key_prefix": "rag:"})()

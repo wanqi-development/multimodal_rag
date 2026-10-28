@@ -1,8 +1,10 @@
-# 60 秒 demo：自带语料，一分钱不花
+# 本地可复现 demo：自带语料，不碰真实数据
 
 这个 demo 的目的是**让别人在几分钟内看到这东西真的能跑** —— 灌进去三篇文档，问几个问题，
-看引用能不能回到原文。语料在 `demo/corpus/`（三篇我们自己的短文档，约 4500 字，切出 **14 块**），
-答案是我们**故意埋**在里面的，所以每次跑的结果都可复现。
+看引用能不能回到原文。语料在 `demo/corpus/`（三篇我们自己的短文档，约 4500 字，切出
+**14 块**），答案是我们**故意埋**在里面的，所以每次跑的结果都可复现。基础设施固定走
+local-lite，不需要 Docker；embedding / 重排 / VLM 不产生调用费，但问答与 agent 仍会调用
+配置的 chat 供应商。
 
 ## 为什么单独开一个档（`config/demo.yaml`）
 
@@ -12,6 +14,7 @@
 |---|---|---|
 | embedding | 线上 `qwen3-vl-embedding`（2560 维，**按量计费**） | 本地 `Qwen3-Embedding-0.6B`（1024 维，免费） |
 | 图片描述 | 开（每张图一次 VLM，**按量计费**） | 关 |
+| 向量库 | 远端 Docker Milvus | 本地 Milvus Lite（`data/demo/milvus.db`） |
 | collection | `rag_dev_qwen3vl_v1`（你真实的语料） | `rag_demo_qwen3_v1`（独立，可随时删） |
 | 本地落点 | `data/…` | 全在 `data/demo/` 下 |
 | 关系库 | PG（若配了） | 单机 SQLite（`data/demo/documents.sqlite3`） |
@@ -21,7 +24,6 @@ demo 档里那几个值**写死、不吃 `.env` 插值**：本机 `.env` 里恰�
 
 ## 前置
 
-* Milvus 起着（`deploy/docker-compose.yml`）；
 * `.models/` 下有两个本地模型（README「本地模型」一节有下载方式）；
 * 问句那一半要一个 chat 供应商的 key（`.env` 三件套），与 `rag ask` 的要求一样。
 
@@ -48,7 +50,9 @@ scripts\demo.cmd -Reset          # 清掉上次的 demo 数据再重灌（collec
 3. `rag ingest demo/corpus` —— 切分 + 入库（复用第 1 步的产物）；
 4. 三个问题 + 一个**该被拒答**的问题。
 
-## 实测（2026-10-12，本机，Milvus 在远端虚拟机上）
+## 历史实测（2026-10-12，Docker Milvus；local-lite 切换前）
+
+> 这组数字早于 local-lite 改造，只保留作对照，不再代表当前纯本地路径。
 
 | 步骤 | 耗时 | 备注 |
 |---|---|---|
@@ -60,7 +64,7 @@ scripts\demo.cmd -Reset          # 清掉上次的 demo 数据再重灌（collec
 | 每次问答 | **20.1–21.9 秒** | 同上，多一次 chat 调用 |
 | **`-Reset` 全流程**（清数据 → 解析 → 核对 → 入库 → 四个问题） | **140.2 秒** | 退出码 0；这就是"从零跑一遍"的真实感受 |
 
-**为什么每条查询要十几秒**：Milvus 在远端虚拟机上（`.env` 的 `MILVUS_URI`），一次 hybrid 检索
+**为什么旧版每条查询要十几秒**：Milvus 在远端虚拟机上（`.env` 的 `MILVUS_URI`），一次 hybrid 检索
 实测 **约 10 秒**；本地精排 bge-reranker-base 约 **4 秒**。而且每个 `rag` 命令都是新进程，
 每次都要重新加载一遍本地模型。页面版省得掉"重新加载模型"那一段（后端进程常驻），
 但 Milvus 那 10 秒省不掉 —— **录屏时建议只走「一次检索 + 一次问答 + 点开引用」，别塞满四个问题。**
@@ -111,7 +115,7 @@ RAG_PROFILE=demo ./scripts/start.sh
 
 | 时间 | 画面 | 要点 |
 |---|---|---|
-| 0–5s | 打开 <http://127.0.0.1:5173> | 左侧导航 + 依赖灯（Milvus / 模型）全绿 |
+| 0–5s | 打开 <http://127.0.0.1:5174> | 左侧导航 + 依赖灯（Milvus / 模型）全绿 |
 | 5–25s | 检索页输入「Aurora 网关默认给每个租户多少 QPS？」 | 命中卡第 1 条就是「默认配额」，分数 0.9999 |
 | 25–40s | 点开详情抽屉 | 能看到标题层级、页码行号与正文原文 —— **引用能回到原文**是重点 |
 | 40–75s | 对话页问「2026-08 那次断电事故的根因是什么，哪个版本修的？」 | 流式答案 + `[1]` 引用可点回原文 |
@@ -123,7 +127,8 @@ RAG_PROFILE=demo ./scripts/start.sh
 
 demo 的数据只在两处，删掉不影响你别的语料：
 
-* collection `rag_demo_qwen3_v1` —— `scripts\demo.cmd -Reset`（或 `./scripts/linux/demo.sh --reset`）；
+* Milvus Lite 文件 `data/demo/milvus.db` 与 collection `rag_demo_qwen3_v1` ——
+  `scripts\demo.cmd -Reset`（或 `./scripts/linux/demo.sh --reset`）；
 * 本地文件 `data/demo/` —— 直接删目录（`-Reset` 也会一起删）。
 
 **`-Reset` 为什么两处都要删**：只删 collection 不够。增量判断看的是**文档注册表**

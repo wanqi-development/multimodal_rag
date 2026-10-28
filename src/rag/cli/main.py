@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,7 @@ import typer
 
 from rag import __version__
 from rag.cli.models import models_app
+from rag.cli.profile import profile_app
 from rag.cli.registry import registry_app
 from rag.cli.runtime import _probe_milvus, _run_async
 from rag.cli.storage import storage_app
@@ -208,13 +210,27 @@ def _apply_channels(settings, spec: str) -> None:
 
 # **启动失败也要留下栈**（2026-10-10）：配置坏掉是唯一一类恰好发生在日志系统建立
 # **之前**的失败 —— `configure_logging` 自己就得先读 settings，所以那一刻四个 .log
-# 一个 handler 都没装上。路径写死成与 `observability.logging` 同一层的那份默认，
-# 不依赖配置能不能读出来（读不出来正是要记的那件事）。
-STARTUP_ERROR_LOG = Path("./data/logs/startup-error.log")
+# 一个 handler 都没装上。这里只读在 settings 之前就能拿到的 profile / state_root，
+# 因而仍能落进当前状态域；不要求整份配置校验成功。
+def _startup_error_log() -> Path:
+    from dotenv import dotenv_values
+
+    from rag.deployment import canonical_profile
+
+    values = dotenv_values(".env")
+    profile = canonical_profile(
+        os.environ.get("RAG_DEPLOYMENT_PROFILE")
+        or values.get("RAG_DEPLOYMENT_PROFILE")
+        or "docker-single"
+    )
+    if not profile or "/" in profile or "\\" in profile or profile in {".", ".."}:
+        profile = "unknown-profile"
+    state_root = os.environ.get("RAG_STATE_ROOT") or values.get("RAG_STATE_ROOT") or "./data"
+    return Path(state_root).expanduser() / profile / "logs" / "startup-error.log"
 
 
 def _record_startup_error(exc: BaseException) -> None:
-    """把启动期的异常栈追加进 `data/logs/startup-error.log`；**再失败也不许抛**。
+    """把启动期异常栈追加进当前 profile 的 `logs/startup-error.log`；**再失败也不许抛**。
 
     为什么自己写一份：`rag serve` 被 `scripts/windows/backend.ps1` 用 `Start-Process`
     起在新窗口里，进程秒退窗口就跟着关 —— 只打到 stderr 的栈会一起消失。实测那次
@@ -227,14 +243,15 @@ def _record_startup_error(exc: BaseException) -> None:
     text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     header = f"==== {stamp} 启动失败：{type(exc).__name__} ====\n"
+    path = _startup_error_log()
     try:
-        STARTUP_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with STARTUP_ERROR_LOG.open("a", encoding="utf-8") as handle:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
             handle.write(header + text + "\n")
     except OSError as write_failed:  # 只读盘 / 没权限：就只能靠 stderr 了
-        typer.echo(f"（写 {STARTUP_ERROR_LOG} 也失败了：{write_failed}）", err=True)
+        typer.echo(f"（写 {path} 也失败了：{write_failed}）", err=True)
         return
-    typer.echo(f"（启动失败的完整栈已写入 {STARTUP_ERROR_LOG}）", err=True)
+    typer.echo(f"（启动失败的完整栈已写入 {path}）", err=True)
 
 
 def _settings_for_startup() -> Settings:
@@ -1129,7 +1146,7 @@ def sessions_prune(
 # ---- 日志（三类，各落一个文件）----
 
 logs_app = typer.Typer(
-    help="日志：接口 / agent 运行 / 查询通道，三类各落一个文件（data/logs/ 下）",
+    help="日志：接口 / agent 运行 / 查询通道，三类各落一个文件（当前 profile 的 logs/ 下）",
     no_args_is_help=True,
 )
 app.add_typer(logs_app, name="logs")
@@ -1142,32 +1159,25 @@ app.add_typer(chats_app, name="chats")
 @chats_app.command("init")
 def chats_init() -> None:
     """建会话三张表（幂等）。**这是一次写操作**，所以要显式触发。"""
-    from rag.persistence import build_chat_store, build_persistence, ensure_compatible_event_loop
-    from rag.persistence.chat import SCHEMA
+    from rag.persistence import build_chat_store, ensure_compatible_event_loop
+    from rag.persistence.backend import resolve_backend
 
     settings = load_settings()
-    if not settings.persistence.postgres.url:
-        typer.secho(
-            "没配 PG（persistence.postgres.url 为空），会话没有地方存。", fg=typer.colors.YELLOW
-        )
-        raise typer.Exit(code=1)
-    ensure_compatible_event_loop()
+    backend = resolve_backend(settings, settings.persistence.backend)
+    if backend == "postgres":
+        ensure_compatible_event_loop()
 
-    async def _run() -> str:
-        persistence = build_persistence(settings, get_secrets())
-        if not await persistence.connect():
-            return persistence.reason or "连不上"
-        await build_chat_store(settings, persistence).setup()
-        await persistence.close()
-        return ""
+    async def _run() -> None:
+        await build_chat_store(settings).setup()
 
-    reason = _run_async(_run(), settings)
-    if reason:
-        typer.secho(f"建表失败：{reason}", fg=typer.colors.RED)
-        raise typer.Exit(code=1)
-    tables = "、".join(statement.split()[5] for statement in SCHEMA if "create table" in statement)
+    _run_async(_run(), settings)
+    where = (
+        f"sqlite:{settings.persistence.chat_sqlite_path}"
+        if backend == "sqlite"
+        else f"postgres schema {settings.persistence.postgres.schema_name}"
+    )
     typer.secho(
-        f"会话表已就绪：{tables}（schema {settings.persistence.postgres.schema_name}）",
+        f"会话表已就绪：chat_session、chat_message、token_usage（{where}）",
         fg=typer.colors.GREEN,
     )
 
@@ -1175,22 +1185,15 @@ def chats_init() -> None:
 @chats_app.command("list")
 def chats_list(limit: int = typer.Option(20, "--limit", "-n", help="看最近几段")) -> None:
     """列最近几段会话：标题 / 模式 / 轮数 / token。**只读。**"""
-    from rag.persistence import build_chat_store, build_persistence, ensure_compatible_event_loop
+    from rag.persistence import build_chat_store, ensure_compatible_event_loop
+    from rag.persistence.backend import resolve_backend
 
     settings = load_settings()
-    if not settings.persistence.postgres.url:
-        typer.secho("没配 PG，没有会话可列。", fg=typer.colors.YELLOW)
-        raise typer.Exit(code=1)
-    ensure_compatible_event_loop()
+    if resolve_backend(settings, settings.persistence.backend) == "postgres":
+        ensure_compatible_event_loop()
 
     async def _run() -> list[dict[str, Any]]:
-        persistence = build_persistence(settings, get_secrets())
-        if not await persistence.connect():
-            raise RuntimeError(persistence.reason or "连不上")
-        try:
-            return await build_chat_store(settings, persistence).list(limit=limit)
-        finally:
-            await persistence.close()
+        return await build_chat_store(settings).list(limit=limit)
 
     try:
         rows = asyncio.run(_run())
@@ -1506,9 +1509,9 @@ def serve(
     端点：`/health`、`/search`、`/chat`（`stream=true` 走 SSE）、`/ingest`（202 + job_id）、
     `/jobs/{id}`。鉴权走 `X-API-Key`（`.env` 的 `RAG_API_KEY`；没配就只允许本机）。
 
-    `single-node` 默认单 worker；`scale-out` 要求 PostgreSQL + MinIO + Redis 且 workers>=2。
-    多 worker 时任务列表、灌库槽位与 VLM 缓存走共享后端；embedding/rerank 模型仍会在
-    每个 worker 各加载一份，这是内存代价。
+    `local-lite` / `docker-single` 严格单 worker；`multiworker` 要求 Docker Milvus +
+    PostgreSQL + MinIO + Redis 且总副本数 >= 2。多 worker 时任务列表、灌库槽位与 VLM
+    缓存走共享后端；embedding/rerank 模型仍会在每个 worker 各加载一份，这是内存代价。
 
     **loop 必须显式指到我们的工厂**：uvicorn ≥0.36 不再看事件循环策略，它在 Windows 上
     自己建 `ProactorEventLoop`，而 psycopg 的 async 在那上面直接拒绝启动（实测）。详见
@@ -1524,8 +1527,9 @@ def serve(
         settings.api.port = port or settings.api.port
     if workers is not None:
         settings.api.workers = workers
-    from rag.deployment import validate_deployment
+    from rag.deployment import apply_deployment_profile, validate_deployment
 
+    apply_deployment_profile(settings)
     validate_deployment(settings)
     if reload and settings.api.workers > 1:
         raise typer.BadParameter("--reload 不能和 --workers > 1 同时使用", param_hint="--workers")
@@ -1585,6 +1589,7 @@ def _mount_plugin_commands() -> None:
 _mount_plugin_commands()
 
 app.add_typer(models_app, name="models")
+app.add_typer(profile_app, name="profile")
 app.add_typer(registry_app, name="registry")
 app.add_typer(storage_app, name="storage")
 

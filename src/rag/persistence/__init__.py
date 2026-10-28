@@ -5,6 +5,7 @@
 """
 
 from rag.persistence.chat import ChatStore, build_chat_store
+from rag.persistence.chat_sqlite import SqliteChatStore
 from rag.persistence.pg import (
     PgPersistence,
     build_persistence,
@@ -20,6 +21,7 @@ from rag.persistence.sessions import (
 
 __all__ = [
     "ChatStore",
+    "SqliteChatStore",
     "PgPersistence",
     "SessionStore",
     "SessionSummary",

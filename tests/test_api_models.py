@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from rag.api.app import Components, create_app
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
+from rag.deployment import apply_deployment_profile
 from rag.persistence.model_settings import SqliteModelSettingStore
 
 
@@ -21,8 +22,10 @@ def _client(tmp_path: Path, settings: Settings) -> TestClient:
 
 def _settings(tmp_path: Path) -> Settings:
     settings = Settings()
+    settings.deployment.profile = "local-lite"
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
     settings.models.backend = "sqlite"
-    settings.models.sqlite_path = str(tmp_path / "models.sqlite3")
     return settings
 
 

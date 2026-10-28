@@ -20,10 +20,12 @@ rag serve                       # 127.0.0.1:8000
 # 终端 2：前端（开发模式，带热更新）
 cd web
 pnpm.cmd install                # 注意用 .cmd：这台机器的 .ps1 被执行策略挡着
-pnpm.cmd dev                    # http://127.0.0.1:5173
+pnpm.cmd dev                    # http://127.0.0.1:5174
 ```
 
 开发期走 **Vite 代理**（`vite.config.ts` 里列了后端那几条路径）→ 后端不用加 CORS。
+监听地址可用仓库根 `.env` 的 `RAG_WEB_HOST` / `RAG_WEB_PORT` 覆盖；
+直接 `cd web && pnpm dev` 也会读取这份根 `.env`。
 生产构建 `pnpm.cmd build` 产出 `web/dist/`，`rag serve` 会**自动把它挂到 `/`**（见 `api/app.py`），
 那时一个进程就够了。
 

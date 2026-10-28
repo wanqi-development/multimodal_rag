@@ -233,6 +233,11 @@ class MinioBlobStore:
                 ) from exc
             self._bucket_checked = True
 
+    def ping(self) -> bool:
+        """启动探活：连得上且桶可用（不存在则自举创建）。"""
+        self._ensure_bucket()
+        return True
+
     def put(self, key: str, data: bytes) -> None:
         from minio.error import S3Error
 

@@ -112,6 +112,7 @@
 | 语义切分自研 vs `SemanticChunker` | 同语料同模型：自研 6.5s vs 官方 16.3s（慢 2.5 倍），且官方**没有尺寸护栏**（切完最大块 799 字，超阈值近一倍） | ADR 22 |
 | xlsx 不用 pandas | 它被本机应用控制策略挡着，且这里用不上它的分析能力 → 改 `openpyxl` 逐行读 | `pyproject.toml` |
 | 双版本索引真机探针 | legacy 245 块；复制一份文档的 100 块/已有向量到临时版本化 collection；活动 filter 查回 100，hybrid 命中目标 doc；测试 collection 已清理，legacy 未改 | CHANGELOG 2026-10-23「索引双版本并行」 |
+| Milvus Lite 本地兼容 | 3.2.2 实测：`jieba` analyzer、BM25 Function、dual-version collection、dense/sparse + `hybrid_search` 均通过；Docker 端的 `chinese` analyzer 在 Lite 建表时不受支持 | `tests/test_milvus_lite.py`、§14.0 |
 
 ## 5. agent 侧的行为记录（真机）
 

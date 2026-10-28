@@ -36,36 +36,51 @@ async def health(components=Depends(get_components)) -> HealthResponse:
     一个笼统的 `ok` 只能回答「能不能用」，回答不了「哪里坏了」—— 后者才是运维要看的。
     """
     settings = components.settings
+    local_profile = settings.deployment.profile in {"local-lite", "docker-single"}
     milvus = DependencyView(ok=False, detail=f"不可用：{components.index_error}")
     if components.index is not None:
         try:
             # 只读：`count()` 是一次查询，不建表、不写
             blocks = await components.index.count()
             milvus = DependencyView(
-                ok=True, detail=f"{settings.indexing.vector.collection}：{blocks} 个块"
+                ok=True,
+                detail=(
+                    f"{settings.indexing.vector.backend} / "
+                    f"{settings.indexing.vector.collection}：{blocks} 个块"
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             milvus = DependencyView(ok=False, detail=f"{type(exc).__name__}: {exc}")
 
-    redis_ok = await components.redis.ping()
+    redis_available = await components.redis.ping()
+    redis_ok = redis_available or (local_profile and not settings.api.redis.url)
     redis = DependencyView(
         ok=redis_ok,
         detail=(
             f"已连接（前缀 {components.redis.prefix}）：限流与任务状态跨 worker 共享"
-            if redis_ok
-            else f"{components.redis.reason or '不可用'}；限流与任务状态已退回进程内"
+            if redis_available
+            else (
+                "未启用（单 worker profile）：限流与任务状态在进程内"
+                if redis_ok
+                else f"{components.redis.reason or '不可用'}；限流与任务状态已退回进程内"
+            )
         ),
     )
 
     persistence = components.persistence
-    pg_ok = bool(persistence and await persistence.ping())
+    pg_available = bool(persistence and await persistence.ping())
+    pg_ok = pg_available or (local_profile and not settings.persistence.postgres.url)
     postgres = DependencyView(
         ok=pg_ok,
         detail=(
             f"已连接（schema {components.settings.persistence.postgres.schema_name}）："
             f"多轮会话与中断状态落库"
-            if pg_ok
-            else f"{(persistence.reason if persistence else '未启用')}；多轮会话退回单轮"
+            if pg_available
+            else (
+                "未启用（单 worker profile）：多轮状态在进程内，重启即丢"
+                if pg_ok
+                else f"{(persistence.reason if persistence else '未启用')}；多轮会话退回单轮"
+            )
         ),
     )
 
@@ -102,13 +117,15 @@ async def health(components=Depends(get_components)) -> HealthResponse:
             "workers": settings.api.workers,
             "replicas": settings.deployment.replicas,
             "collection": settings.indexing.vector.collection,
+            "vector_backend": settings.indexing.vector.backend,
             "embedding": settings.providers.embedding.backend,
             "rerank": settings.retrieval.rerank.enabled,
             "graph": settings.graph.enabled,
             "channels": [item.name for item in settings.retrieval.channels if item.enabled],
             "rate_limit_per_min": settings.api.rate_limit_per_min,
             "ingest_gate": (ingest_gate.backend if ingest_gate is not None else "未启动"),
-            "job_store": "redis" if redis_ok else "process",
+            "job_store": "redis" if redis_available else "process",
+            "chat_store": getattr(components.chats, "backend", "postgres"),
             "vision_cache": vision_cache,
         },
     )
@@ -324,7 +341,7 @@ async def logs_tail(
 ) -> LogTailResponse:
     """最近几行日志 —— **读文件**，所以 CLI 进程写出来的那些也在里面。
 
-    与 `/logs/stream` 的分工：这里是**历史**（读 `data/logs/*.log`，开-读-关），
+    与 `/logs/stream` 的分工：这里是**历史**（读当前 profile 的 `logs/*.log`，开-读-关），
     那边是**实时**（进程内缓冲，只覆盖 API 自己）。两边合起来才是页面上看到的完整流水。
     """
     files = _log_files(components.settings)

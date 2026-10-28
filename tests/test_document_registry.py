@@ -14,6 +14,7 @@ from rag.api.app import Components, create_app
 from rag.config.schema import Settings
 from rag.config.settings import Secrets
 from rag.contracts import DocRecord, reached
+from rag.deployment import apply_deployment_profile
 from rag.persistence.documents import SqliteDocumentStore
 
 
@@ -25,11 +26,9 @@ def _store(tmp_path: Path) -> SqliteDocumentStore:
 
 def _settings(tmp_path: Path) -> Settings:
     settings = Settings()
-    settings.ingest.uploads.dir = str(tmp_path / "uploads")
-    settings.ingest.stages.dir = str(tmp_path / "stages")
-    settings.ingest.assets.dir = str(tmp_path / "assets")
-    settings.documents.backend = "sqlite"
-    settings.documents.sqlite_path = str(tmp_path / "documents.sqlite3")
+    settings.deployment.profile = "local-lite"
+    settings.deployment.state_dir = str(tmp_path)
+    apply_deployment_profile(settings)
     return settings
 
 

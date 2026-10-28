@@ -395,8 +395,14 @@ async def _record_usage(conn: Any, session_id: str, seq: int, usage: dict[str, A
     )
 
 
-def build_chat_store(settings: Any, persistence: Any = None) -> ChatStore:
-    """按配置建一个 ChatStore。有长驻 persistence 就用它的池。"""
+def build_chat_store(settings: Any, persistence: Any = None) -> Any:
+    """按关系库开关建会话存储：本地档 SQLite，multiworker 用 PG。"""
+    from rag.persistence.backend import resolve_backend
+
+    if resolve_backend(settings, settings.persistence.backend) == "sqlite":
+        from rag.persistence.chat_sqlite import SqliteChatStore
+
+        return SqliteChatStore(settings.persistence.chat_sqlite_path)
     from rag.persistence.pg import build_persistence
 
     if persistence is not None and getattr(persistence, "available", False):

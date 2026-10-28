@@ -7,14 +7,16 @@
     scripts\demo.cmd -DryRun         # 只打印要做什么，一个字都不写
     scripts\demo.cmd -Reset          # 先删掉 demo collection 再重灌（清干净重来）
 
-**它不花钱、也不碰你现有的数据**：
+**它不启动 Docker、不碰你现有的数据**：
 
   * embedding 与重排都是**本地**模型 —— config/demo.yaml 里把值写死了，不吃 .env 的插值，
     所以不会因为本机 .env 指向线上（dev 档就是 qwen3-vl，按量计费）而悄悄花钱；
-  * 检索用的是单独的 collection（rag_demo_qwen3_v1），与你库里的语料互不干扰；
+  * 检索用独立的 Milvus Lite 文件 + collection，与你库里的语料互不干扰；
   * 语料产物、上传件、文档注册表全部落在 data/demo/ 下，不与你自己的 data/ 重叠。
 
-前置：Milvus 起着（deploy/docker-compose.yml）；.models/ 下有两个本地模型（见 README）。
+问答与 agent 仍会调用 chat 供应商，是否计费取决于该供应商。
+
+前置：.models/ 下有两个本地模型（见 README）。demo 固定走 local-lite，不需要启动 Docker。
 问句那一半要一个 chat 供应商的 key（.env 的三件套），与 `rag ask` 的要求一样。
 
 **档位必须走真实环境变量**：`.env` 里写 RAG_PROFILE 不生效（config/demo.yaml 的注释里写了

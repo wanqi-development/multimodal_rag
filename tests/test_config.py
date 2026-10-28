@@ -30,7 +30,7 @@ def test_base_config_loads() -> None:
     assert settings.providers.embedding.model == ".models/Qwen3-Embedding-0.6B"
     assert settings.providers.embedding.dim == 1024
     # collection 名带指纹：换模型、或换块表结构，都得换名字重建（Milvus 不能改 schema）
-    assert settings.indexing.vector.collection == "rag_qwen3_v2"
+    assert settings.indexing.vector.collection == "rag_docker_single_v1"
 
 
 def test_dev_profile_overrides_base() -> None:
@@ -54,7 +54,7 @@ def test_the_model_slots_exist_and_default_to_follow_the_existing_config() -> No
     """
     settings = load_settings(profile="dev", directory=CONFIG_DIR)
 
-    assert settings.models.backend == "auto", "有 PG 用 PG，没有就用单机 SQLite"
+    assert settings.models.backend == "sqlite", "默认 docker-single 是零中间件的单机档"
     assert list(settings.models.slots) == [
         "chat.fast",
         "chat.agent",
@@ -71,7 +71,7 @@ def test_the_model_slots_exist_and_default_to_follow_the_existing_config() -> No
     )
     # base 里未被 dev 覆盖的项要保留
     assert settings.providers.embedding.batch_size == 32
-    assert settings.ingest.assets.dir == "./data/assets"
+    assert settings.ingest.assets.dir == "./data/docker-single/assets"
 
 
 def test_dev_profile_turns_image_descriptions_on() -> None:
@@ -161,7 +161,7 @@ def test_env_interpolation_falls_back_to_default(monkeypatch: pytest.MonkeyPatch
 
 def test_missing_config_dir_uses_schema_defaults(tmp_path: Path) -> None:
     settings = load_settings(profile="dev", directory=tmp_path)
-    assert settings.indexing.vector.collection == "rag_v1"
+    assert settings.indexing.vector.collection == "rag_local_lite_v1"
 
 
 def test_dotenv_is_used_as_interpolation_fallback(
