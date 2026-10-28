@@ -393,9 +393,9 @@ def _real_components(settings: Settings | None = None) -> Components:
     return item
 
 
-def _client(components: _Components) -> TestClient:
+def _client(components: _Components, *, secrets: Secrets | None = None) -> TestClient:
     """把替身塞进 app.state —— 路由通过 `get_components` 取的就是它。"""
-    app = create_app(components.settings, Secrets(rag_api_key=None))
+    app = create_app(components.settings, secrets or Secrets(rag_api_key=None))
     app.state.components = components
     # 走 TestClient 的上下文管理器会执行 lifespan（会真去连 Redis/建模型），
     # 所以这里**不进** with 块：我们只验 HTTP 层，生命周期另有用例覆盖。
@@ -495,7 +495,12 @@ def test_health_is_degraded_when_milvus_or_redis_is_down() -> None:
     shared.api.redis.url = "redis://localhost:6379/0"
     shared.storage.minio.endpoint = "http://localhost:9000"
     apply_deployment_profile(shared)
-    no_redis = _client(_Components(shared, redis_ok=False))
+    shared_secrets = Secrets(
+        rag_api_key=None,
+        minio_access_key="test-access",
+        minio_secret_key="test-secret",
+    )
+    no_redis = _client(_Components(shared, redis_ok=False), secrets=shared_secrets)
     body = no_redis.get("/health").json()
     assert body["status"] == "degraded"
     assert not body["redis"]["ok"]
@@ -503,7 +508,7 @@ def test_health_is_degraded_when_milvus_or_redis_is_down() -> None:
 
     no_pg = _Components(shared)
     no_pg.persistence = _Persistence(ok=False)
-    body = _client(no_pg).get("/health").json()
+    body = _client(no_pg, secrets=shared_secrets).get("/health").json()
     assert body["status"] == "degraded"
     assert not body["postgres"]["ok"] and "单轮" in body["postgres"]["detail"]
 

@@ -21,7 +21,8 @@ dependencies = [
     # 索引与检索
     "pymilvus>=3.0,<4",
     # local-lite 档的内嵌 Milvus 引擎；pymilvus 只是客户端，不包含本地数据库实现。
-    "milvus-lite>=3.2,<4",
+    # chinese extra 会带上 jieba：Milvus Lite 的 BM25 JiebaAnalyzer 在运行时必须 import 它。
+    "milvus-lite[chinese]>=3.2,<4",
     "fastembed>=0.8,<0.9",
     # 默认 embedding 后端（providers.embedding.backend=sentence-transformers）。
     # 它会带 torch 进来 —— 比 ONNX 重得多，但换来 32768 的窗口，
