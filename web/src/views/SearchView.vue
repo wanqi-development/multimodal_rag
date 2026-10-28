@@ -19,8 +19,9 @@ const stats = ref<Stats[]>([])
 const selected = ref('')
 const searched = ref(false)
 const box = ref<HTMLInputElement | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
 
-// ---- 以图搜图（2026-10-08）----
+// ---- 图片检索 ----
 // 图**先传到服务端**（`/search/image` 回路径），再拿路径调 `/search`。分开两步是有意的：
 // `/search` 要过线上 embedding（按量计费），而「传了图还没点搜」是常态 —— 分开之后
 // 重搜、换词、调 top_k 都不用重传图上。
@@ -30,12 +31,19 @@ const imagePath = ref('')
 const imageUrl = ref('')
 const imageName = ref('')
 const uploading = ref(false)
+let uploadGeneration = 0
 
-function clearImage(): void {
+function resetImageState(): void {
   if (imageUrl.value) URL.revokeObjectURL(imageUrl.value)
   imageUrl.value = ''
   imagePath.value = ''
   imageName.value = ''
+}
+
+function clearImage(): void {
+  uploadGeneration += 1
+  uploading.value = false
+  resetImageState()
 }
 
 async function onPickImage(event: Event): Promise<void> {
@@ -46,8 +54,9 @@ async function onPickImage(event: Event): Promise<void> {
   await sendImage(file)
 }
 
-/** 粘贴 / 拖进来的图也走同一条：截个图直接搜是最常用的一种。 */
+/** 粘贴或文件选择进来的图走同一条：截个图直接搜是最常用的一种。 */
 function onPaste(event: ClipboardEvent): void {
+  if (uploading.value || loading.value) return
   const file = Array.from(event.clipboardData?.files ?? [])[0]
   if (!file || !file.type.startsWith('image/')) return
   event.preventDefault()
@@ -55,18 +64,23 @@ function onPaste(event: ClipboardEvent): void {
 }
 
 async function sendImage(file: File): Promise<void> {
+  const generation = ++uploadGeneration
+  resetImageState()
+  imageUrl.value = URL.createObjectURL(file)
+  imageName.value = file.name || '粘贴的图片'
   uploading.value = true
   error.value = ''
   try {
     const body = await uploadSearchImage(file)
-    clearImage()
+    if (generation !== uploadGeneration) return
     imagePath.value = body.path
-    imageName.value = file.name || '粘贴的图'
-    imageUrl.value = URL.createObjectURL(file)
+    imageName.value = file.name || '粘贴的图片'
   } catch (exc) {
+    if (generation !== uploadGeneration) return
+    resetImageState()
     error.value = (exc as Error).message
   } finally {
-    uploading.value = false
+    if (generation === uploadGeneration) uploading.value = false
   }
 }
 
@@ -124,30 +138,58 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('rag:focus-search', focusBox)
+  clearImage()
 })
 </script>
 
 <template>
-  <!-- `@paste` 挂在 header 上：焦点在检索框里粘贴时事件会冒泡上来 -->
+  <!-- 顶部与结果区都接 paste：焦点在输入框或结果区时都能直接 Ctrl+V 附图。 -->
   <header class="main-head" @paste="onPaste">
-    <div class="input">
-      <Search :size="16" aria-hidden="true" />
-      <input ref="box" v-model="query" aria-label="检索词" @keyup.enter="run()" />
-      <kbd>/</kbd>
-    </div>
-    <button class="btn primary" :disabled="loading" @click="run()">
-      {{ loading ? '检索中…' : '检索' }}
-    </button>
-    <!-- 以图搜图：图**先传到服务端**（回路径），再拿路径调 `/search` ——
-         分开两步是因为 `/search` 要过线上 embedding（按量计费），而「传了图还没点搜」是常态 -->
-    <label class="btn" :title="imageName || '上传一张图来搜（也可以直接粘贴）'">
-      <ImageIcon :size="14" aria-hidden="true" />
-      {{ uploading ? '上传中…' : imagePath ? '换一张' : '以图搜图' }}
-      <input type="file" accept="image/*" class="hidden-file" @change="onPickImage" />
-    </label>
-    <button v-if="imagePath" class="btn ghost" title="去掉这张图" @click="clearImage()">
-      <X :size="14" aria-hidden="true" />去掉图
-    </button>
+    <form class="search-form" @submit.prevent="run()">
+      <div class="input search-composer" :class="{ 'has-image': imageUrl }">
+        <Search :size="16" aria-hidden="true" />
+        <div v-if="imageUrl" class="search-attachment">
+          <img :src="imageUrl" :alt="imageName" />
+          <span class="search-attachment-name" aria-live="polite">
+            {{ uploading ? '图片上传中…' : imageName }}
+          </span>
+          <button type="button" class="attachment-remove" title="移除图片" aria-label="移除图片" @click="clearImage()">
+            <X :size="13" aria-hidden="true" />
+          </button>
+        </div>
+        <input
+          ref="box"
+          v-model="query"
+          aria-label="检索词或图片"
+          :placeholder="imageUrl ? '可补充文字描述这张图' : '输入关键词，或按 Ctrl+V 粘贴图片'"
+        />
+        <button
+          type="button"
+          class="attachment-pick"
+          title="添加图片（也可以直接按 Ctrl+V 粘贴）"
+          aria-label="添加图片"
+          :disabled="uploading || loading"
+          @click="fileInput?.click()"
+        >
+          <ImageIcon :size="16" aria-hidden="true" />
+        </button>
+        <input
+          ref="fileInput"
+          type="file"
+          accept="image/*"
+          class="hidden-file"
+          @change="onPickImage"
+        />
+        <kbd>/</kbd>
+      </div>
+      <button
+        class="btn primary search-submit"
+        type="submit"
+        :disabled="loading || uploading || (!query.trim() && !imagePath)"
+      >
+        {{ loading ? '检索中…' : '检索' }}
+      </button>
+    </form>
     <div class="seg" role="group" aria-label="参数">
       <button class="on">top-k {{ topK }}</button>
       <button :class="{ on: rerank }" @click="rerank = !rerank">重排</button>
@@ -160,12 +202,7 @@ onUnmounted(() => {
     </label>
   </header>
 
-  <div class="main-body">
-    <!-- 选中的图：确认搜的是这一张（blob URL 只在本地，不上传第二次） -->
-    <div v-if="imageUrl" class="picked-image">
-      <img :src="imageUrl" :alt="imageName" />
-      <span class="hint">{{ imageName }} · 只有图也能搜；文字会一起参与</span>
-    </div>
+  <div class="main-body" @paste="onPaste">
     <div class="chips">
       <span class="chip on">hybrid + bm25</span>
       <span class="chip">{{ rerank ? '重排开' : '重排关' }}</span>
@@ -199,7 +236,7 @@ onUnmounted(() => {
     </div>
 
     <div v-else class="empty">
-      <b>输入检索词</b>
+      <b>输入检索词，或粘贴一张图片</b>
       这条链路<b class="inline">不调大模型</b>：本地 embedding + 本地重排，几秒钟给你原始片段。
       要成段结论、要接着上文追问，就切「对话」。
     </div>

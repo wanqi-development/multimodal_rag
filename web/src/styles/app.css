@@ -502,14 +502,38 @@ details.tools code { background: var(--surface-3); padding: 1px 6px; border-radi
   padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--surface-2);
 }
 
-/* 检索页选中的那张图：确认搜的是它（图是本地 blob URL，不会为了预览再传一次） */
-.picked-image {
-  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
-  border-bottom: 1px solid var(--border); background: var(--surface-2);
+/* 检索输入把文字和图片放在同一个框里；图片只是输入的一部分，不再单独占一个动作按钮。 */
+.search-form {
+  display: flex; align-items: center; gap: var(--gap);
+  flex: 1 1 360px; min-width: 0;
 }
-.picked-image img {
-  max-height: 72px; max-width: 140px; border-radius: var(--r-sm); border: 1px solid var(--border);
+.search-composer { flex: 1 1 auto; }
+.search-composer.has-image > svg { color: var(--accent); }
+.search-attachment {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 1 auto;
+  max-width: 210px; min-width: 0;
+  padding: 2px 3px 2px 2px; border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2);
 }
+.search-attachment img {
+  width: 26px; height: 26px; flex: 0 0 auto; object-fit: cover;
+  border-radius: calc(var(--r-sm) - 2px);
+}
+.search-attachment-name {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--muted); font-size: 11px;
+}
+.attachment-remove, .attachment-pick {
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  width: 28px; height: 28px; padding: 0; border-radius: var(--r-sm);
+}
+.attachment-remove:hover, .attachment-pick:hover { background: var(--surface-3); color: var(--text); }
+.attachment-remove:focus-visible, .attachment-pick:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+.attachment-pick:disabled { opacity: .45; cursor: default; }
+.search-submit { flex: 0 0 auto; }
 .doc-actions select, .outline-table select {
   font: inherit; padding: 3px 6px; border: 1px solid var(--border);
   border-radius: var(--r-sm); background: var(--surface); color: inherit;
@@ -701,4 +725,14 @@ details.tools code { background: var(--surface-3); padding: 1px 6px; border-radi
 }
 @media (max-width: 820px) {
   .detail { position: fixed; inset: 0 0 0 auto; width: min(420px, 92vw); box-shadow: -8px 0 24px rgba(0, 0, 0, .18); z-index: 20; }
+  .search-form { flex-basis: 100%; }
+}
+@media (max-width: 520px) {
+  .search-composer kbd { display: none; }
+  .search-composer.has-image { flex-wrap: wrap; padding: 6px 8px; row-gap: 5px; }
+  .search-composer.has-image > svg { display: none; }
+  .search-composer.has-image .search-attachment {
+    order: -1; flex: 1 1 100%; max-width: none;
+  }
+  .search-composer.has-image input { padding: 4px 0; }
 }
