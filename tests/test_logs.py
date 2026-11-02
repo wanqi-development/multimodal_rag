@@ -73,7 +73,7 @@ def test_one_line_prints_one_readable_summary_per_kind() -> None:
         "interface",
         {
             "method": "POST",
-            "path": "/chat",
+            "path": "/agent",
             "status": 200,
             "duration_ms": 4123.4,
             "identity": "ip:127.0.0.1",
@@ -81,7 +81,7 @@ def test_one_line_prints_one_readable_summary_per_kind() -> None:
     )
     # 「这是哪一类」由 logger 名承担（`rag.interface` / `rag.channel` / …），
     # 消息里不再重复一个方括号前缀
-    assert interface.startswith("POST /chat 200 4123ms ip:127.0.0.1")
+    assert interface.startswith("POST /agent 200 4123ms ip:127.0.0.1")
 
     agent = one_line(
         "agent_run",
@@ -179,17 +179,17 @@ def test_each_kind_gets_its_own_file_and_system_gets_the_rest(tmp_path: Path) ->
     assert logger.propagate is True, "还要能冒泡到 root（控制台）"
 
     record_interface(
-        method="POST", path="/search", status=200, duration_ms=12.0, identity="ip:127.0.0.1"
+        method="POST", path="/agent", status=200, duration_ms=12.0, identity="ip:127.0.0.1"
     )
     record_agent_run(run_id="r-1", question="Flink 是什么")
     logging.getLogger("pymilvus.client").warning("重试第 3 次")
 
-    assert "POST /search 200" in (tmp_path / "interface.log").read_text("utf-8")
+    assert "POST /agent 200" in (tmp_path / "interface.log").read_text("utf-8")
     assert "状态=answered" in (tmp_path / "agent.log").read_text("utf-8")
-    assert "POST /search 200" not in (tmp_path / "agent.log").read_text("utf-8"), "两类不串"
+    assert "POST /agent 200" not in (tmp_path / "agent.log").read_text("utf-8"), "两类不串"
     system = (tmp_path / "system.log").read_text("utf-8")
     assert "重试第 3 次" in system, "第三方库的日志要进系统文件"
-    assert "POST /search 200" not in system, "业务日志不在系统文件里再来一份"
+    assert "POST /agent 200" not in system, "业务日志不在系统文件里再来一份"
 
 
 def test_a_tool_line_gives_args_and_output_not_just_their_lengths(tmp_path: Path) -> None:
@@ -372,7 +372,7 @@ def test_api_keys_never_land_in_the_logs() -> None:
     with _captured() as out:
         record_interface(
             method="GET",
-            path="/search",
+            path="/agent",
             status=200,
             duration_ms=1.0,
             identity=identity_of(secret, None),

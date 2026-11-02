@@ -1,0 +1,142 @@
+"""HyDE 双路检索与开关行为。"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from rag.config.schema import FusionConfig
+from rag.contracts import ChannelStats, Chunk, ScoredChunk
+from rag.retrieval.hyde import HyDERetriever, configured_hyde
+
+
+def _hit(chunk_id: str, score: float) -> ScoredChunk:
+    return ScoredChunk(
+        chunk=Chunk(chunk_id=chunk_id, doc_id=chunk_id, text=f"{chunk_id} 正文"),
+        score=score,
+        channel="milvus",
+        rank=0,
+    )
+
+
+class _Retriever:
+    name = "raw"
+
+    def __init__(self, hits: list[ScoredChunk]) -> None:
+        self.hits = hits
+        self.calls: list[dict[str, Any]] = []
+        self.last_stats = [
+            ChannelStats(channel="milvus", candidates=len(hits), kept=len(hits), latency_ms=1)
+        ]
+
+    async def retrieve(self, query: str, top_k: int, filters=None, image=None):
+        self.calls.append({"query": query, "top_k": top_k, "filters": filters, "image": image})
+        return self.hits
+
+
+class _Reranker:
+    name = "test-reranker"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def rerank(self, query: str, hits: list[ScoredChunk], top_n: int):
+        self.calls += 1
+        return list(reversed(hits))[:top_n]
+
+
+def test_hyde_uses_original_and_hypothetical_queries_and_reranks_once() -> None:
+    original = _Retriever([_hit("a", 0.9), _hit("shared", 0.8)])
+    hypothetical = _Retriever([_hit("shared", 0.9), _hit("b", 0.8)])
+    reranker = _Reranker()
+    calls: list[str] = []
+
+    async def generate(question: str) -> str:
+        calls.append(question)
+        return "假设资料段落"
+
+    retriever = HyDERetriever(
+        original,
+        hypothetical,
+        reranker,
+        FusionConfig(candidates_per_channel=10),
+        generate=generate,
+    )
+    hits = asyncio.run(retriever.retrieve("用户问题", 5))
+
+    assert calls == ["用户问题"]
+    assert original.calls[0]["query"] == "用户问题"
+    assert hypothetical.calls[0]["query"] == "假设资料段落"
+    assert reranker.calls == 1
+    assert {hit.chunk.chunk_id for hit in hits} == {"a", "b", "shared"}
+    assert any(stat.channel == "hyde-fusion" for stat in retriever.last_stats)
+
+
+def test_hyde_skips_generation_for_an_image_query() -> None:
+    original = _Retriever([_hit("image", 0.9)])
+    hypothetical = _Retriever([])
+    called = False
+
+    async def generate(question: str) -> str:
+        nonlocal called
+        called = True
+        return "不应生成"
+
+    retriever = HyDERetriever(
+        original,
+        hypothetical,
+        None,
+        FusionConfig(),
+        generate=generate,
+    )
+    hits = asyncio.run(retriever.retrieve("", 5, image=Path("query.png")))
+
+    assert not called
+    assert [hit.chunk.chunk_id for hit in hits] == ["image"]
+    assert hypothetical.calls == []
+
+
+def test_hyde_generation_failure_falls_back_to_original_query() -> None:
+    original = _Retriever([_hit("a", 0.9)])
+    hypothetical = _Retriever([])
+
+    async def generate(question: str) -> str:
+        raise RuntimeError("LLM down")
+
+    retriever = HyDERetriever(
+        original,
+        hypothetical,
+        None,
+        FusionConfig(),
+        generate=generate,
+    )
+    hits = asyncio.run(retriever.retrieve("用户问题", 5))
+
+    assert [hit.chunk.chunk_id for hit in hits] == ["a"]
+    assert hypothetical.calls == []
+    assert any(stat.channel == "hyde" and stat.error for stat in retriever.last_stats)
+
+
+def test_configured_hyde_is_none_when_switched_off() -> None:
+    settings = SimpleNamespace(
+        retrieval=SimpleNamespace(transform=SimpleNamespace(hyde=False, hyde_max_chars=600))
+    )
+
+    assert configured_hyde(settings, object()) is None
+
+
+def test_retriever_rejects_hyde_enabled_without_generator() -> None:
+    from rag.config.schema import Settings
+    from rag.indexing import build_index
+    from rag.retrieval import build_retriever
+
+    settings = Settings()
+    settings.retrieval.transform.hyde = True
+    settings.retrieval.rerank.enabled = False
+
+    with pytest.raises(ValueError, match="HyDE"):
+        build_retriever(settings, build_index(settings), object())

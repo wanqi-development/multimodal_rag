@@ -1,14 +1,13 @@
-"""给 agent 用的工具：**四个**，全部是下层能力的薄包装，不新写检索逻辑。
+"""给 Agent 用的工具，全部是下层能力的薄包装，不新写检索逻辑。
 
-2026-10-08 使用者定的口径：**通道查询只有一条路 —— `search_knowledge`**。
-关键词、图片、图谱都不再单独开工具：
+2026-10-30 起按证据来源拆给不同子 Agent：
 
 * 关键词 —— 就是 Milvus 那一路里的 sparse 腿（dense + sparse 在服务端融合），
   不再有一条"只走词频"的独立通道；将来换 Elasticsearch 是**换通道**，不是加工具；
 * 图片 —— 图与文由同一个多模态 embedding 编进同一空间，检索时走的是同一条通道，
   要看图块就给 `search_knowledge(modality="image")`；
-* 图谱 —— 是一路**通道**（Neo4j，`complement_only`），由检索层融合，
-  不再是一个让模型分头调、自己用文字拼的工具。
+* 图谱 —— `search_relationships` 只开图谱通道，交给 relationship-graph 子 Agent；
+* 网络 —— 搜索与网页抓取留在主 Agent，统一引用编号，仍受同一个闸门约束。
 
 三条设计约束，都来自前面的实测：
 
@@ -17,12 +16,13 @@
 2. **引用编号由我们发**，不是模型编。每次工具调用返回的条目拿到**全局递增**的 `[n]`，
    同时把 `n → Citation` 记进 `EvidenceLedger`；最终答案里的 `[n]` 直接查这张表 ——
    否则模型自己编的编号与我们的引用表必然对不上。
-3. **这四个业务工具只读**。文件工具由 deepagents backend 提供；ToolPolicy 先决定
+3. **所有证据工具只读**。文件工具由 deepagents backend 提供；ToolPolicy 先决定
    哪些能力可见，给了 workspace 时 `write_file` / `edit_file` 再由 HITL 拦住。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -46,19 +46,17 @@ CitationRegistry = EvidenceLedger
 
 @dataclass
 class WebSearchGate:
-    """网络搜索的闸门（2026-10-05 用户定的规则）。
+    """网络搜索与网页抓取的闸门。
 
-    **只在两种情况下放行**：
-
-    1. 用户明确要求联网（CLI 的 `--web` / API 的 `web=true` → `explicit`）；
-    2. 语料检索**查过且什么都没拿到**（`corpus_attempted and not corpus_found`）。
+    只有用户明确允许时才执行。内部证据不足时闸门只记录事实并提示模型先询问用户，
+    不自动联网。
 
     为什么做成闸门而不是写进提示词：这个项目一贯的立场是「能力靠机制，不靠模型自觉」——
     嘱咐它「记得先查语料」是赌它听话；而网络答案是**不可溯源到语料**的，混进回答里就破坏了
     「每句话都能点开」这条底线（§9.6 / §11.6 都是这个立场）。
 
-    「查过没有」由语料那几个工具自己记（`note_corpus`）——**空手而归也算查过**，
-    而「还没查就想联网」要拦住。
+    「查过没有」由内部证据工具自己记（`note_corpus`），用于提示模型该先问用户；
+    它不会改变 `allowed` 的结果。
     """
 
     explicit: bool = False
@@ -72,19 +70,21 @@ class WebSearchGate:
 
     @property
     def allowed(self) -> bool:
-        return self.explicit or (self.corpus_attempted and not self.corpus_found)
+        return self.explicit
 
     def refusal(self) -> str:
         """被拦住时给模型的话：**说清为什么，以及下一步该干什么**。"""
         if not self.corpus_attempted:
             return (
-                "还没查语料。先用 search_knowledge 查一遍；只有它没结果"
-                "（或者用户明确要求联网）时才能用网络搜索。"
+                "用户还没有明确允许联网。先调用内部子 Agent 取证；"
+                "内部证据不足时，在答案里询问用户是否允许联网，不要直接搜索或抓取网页。"
             )
-        return (
-            "语料里已经检索到内容了，本次回答请以语料为准（网络答案无法溯源到语料）。"
-            "如果用户明确要求联网，让他加 --web（CLI）或 web=true（API）。"
-        )
+        if self.corpus_found:
+            return (
+                "内部证据已经足够，本次回答请以内部证据为准。"
+                "如果用户仍明确要求核对网络，再让用户打开联网授权。"
+            )
+        return "内部证据不足。先询问用户是否允许联网，用户确认后才能调用网络工具。"
 
 
 def build_tools(
@@ -95,16 +95,29 @@ def build_tools(
     gate: WebSearchGate | None = None,
 ) -> list[Any]:
     """建这一批工具。``heavy`` 里带着 embedder / reranker（**不在这里重建模型**）。"""
-    from rag.retrieval import build_retriever
+    from rag.retrieval import build_retriever, configured_hyde
 
     async def _search(
         query: str,
         top_k: int,
         *,
         modality: str | None = None,
+        channels: list[str] | None = None,
     ) -> str:
         local = settings.model_copy(deep=True)
-        retriever = build_retriever(local, heavy.index, heavy.embedder, heavy.reranker)
+        if channels:
+            wanted = set(channels)
+            for item in local.retrieval.channels:
+                item.enabled = item.name in wanted
+            if not any(item.enabled for item in local.retrieval.channels):
+                return f"没有可用的检索通道：{', '.join(sorted(wanted))}。"
+        retriever = build_retriever(
+            local,
+            heavy.index,
+            heavy.embedder,
+            heavy.reranker,
+            hyde=configured_hyde(local, heavy.chat),
+        )
         filters = {"modality": modality} if modality else None
         hits = await retriever.retrieve(query, top_k, filters=filters)
         # 「语料里有没有相关内容」：**不能只看结果空不空** —— 语义检索永远返回 top-k，
@@ -144,17 +157,17 @@ def build_tools(
             text += (
                 f"\n\n（提示：以上结果的最高分只有 {best:.3f}，"
                 f"低于「算作相关」的阈值 {settings.agent.web_min_corpus_score} —— "
-                "语料里很可能没有这个问题的内容：可以换关键词再试，"
-                "或者按规则调用 web_search_tool 查网络。）"
+                "内部证据很可能不足：可以换关键词再试；仍不足时请询问用户是否允许联网，"
+                "不要自行调用 web_search_tool。）"
             )
         return text
 
     @tool
     async def search_knowledge(query: str, top_k: int = 8, modality: str | None = None) -> str:
-        """检索语料库：多通道并发 → 融合 → 重排，一次调用就是全部召回。
+        """检索文档语料：多通道并发 → 融合 → 重排，一次调用就是文档侧全部召回。
 
-        语义（融合向量）、关键词（Milvus 内建 BM25）、以及配置里启用的其他通道
-        （图谱等）都在这一次调用里一起融合完 —— **不要为某一路再单独查一遍**。
+        语义（融合向量）、关键词（Milvus 内建 BM25）以及文档类附加通道都在这一次调用里
+        融合完。关系图谱由 `search_relationships` 单独负责，不混进文档子 Agent。
 
         Args:
             query: 检索词。把问题改写成适合检索的样子，保留专有名词与编号。
@@ -162,7 +175,29 @@ def build_tools(
             modality: 只看某种模态：`image`（图片描述块）/ `text` / `table`。
                 问「图里画了什么」时给 `image`。
         """
-        return await _search(query, max(1, min(top_k, 20)), modality=modality)
+        channels = [
+            item.name for item in settings.retrieval.channels if item.enabled and item.name != "kg"
+        ]
+        return await _search(
+            query,
+            max(1, min(top_k, 20)),
+            modality=modality,
+            channels=channels,
+        )
+
+    @tool
+    async def search_relationships(query: str, top_k: int = 10) -> str:
+        """只查询知识图谱通道，返回实体关系、路径及其原始证据。
+
+        Args:
+            query: 包含人物、部门、组织或关系问题。保留完整姓名和部门名。
+            top_k: 最多返回几条关系证据，默认 10，最多 20。
+        """
+        return await _search(
+            query,
+            max(1, min(top_k, 20)),
+            channels=["kg"],
+        )
 
     @tool
     async def list_documents() -> str:
@@ -195,11 +230,86 @@ def build_tools(
 
     return [
         search_knowledge,
+        search_relationships,
         list_documents,
         get_section,
         # key 由它自己从 Secrets 取（见函数说明）：build_tools 不该被塞一堆机密
         build_web_search_tool(settings, gate=gate, registry=registry),
+        build_web_fetch_tool(settings, gate=gate, registry=registry),
     ]
+
+
+def build_web_fetch_tool(
+    settings: Settings,
+    *,
+    gate: WebSearchGate | None = None,
+    registry: CitationRegistry | None = None,
+) -> BaseTool:
+    """抓取一个公开网页并只返回正文摘要。
+
+    复用 ingest 的 URL 安全校验：只允许 http/https、每一跳都拒绝非公网地址。
+    网页抓取不落上传目录，也不触发 OCR / VLM；它只为主 Agent 提供当轮证据。
+    """
+
+    @tool
+    async def web_fetch_tool(url: str) -> str:
+        """读取一个公开网页的正文，用于核对搜索结果是引用内容。
+
+        只能在用户明确允许联网后使用；优先抓网络搜索返回的链接，不要枚举站点。
+
+        Args:
+            url: 完整的 http/https 地址。
+        """
+        if gate is not None and not gate.allowed:
+            return f"现在不能抓取网页：{gate.refusal()}"
+
+        from bs4 import BeautifulSoup
+
+        from rag.ingest.fetch import FetchError, fetch_url
+        from rag.ingest.loaders.base import decode_text
+
+        max_bytes = max(1, int(settings.ingest.uploads.max_mb)) * 1_000_000
+        try:
+            fetched = await asyncio.to_thread(
+                fetch_url,
+                url,
+                max_bytes=max_bytes,
+                timeout_s=15.0,
+                max_images=0,
+            )
+        except FetchError as exc:
+            return f"网页抓取失败：{exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"网页抓取失败：{type(exc).__name__}: {exc}"
+
+        suffix = fetched.name.rsplit(".", 1)[-1].lower() if "." in fetched.name else ""
+        if suffix in {"html", "htm"}:
+            soup = BeautifulSoup(fetched.data, "html.parser")
+            for node in soup(["script", "style", "noscript"]):
+                node.decompose()
+            title = (soup.title.get_text(" ", strip=True) if soup.title else "") or fetched.name
+            text = soup.get_text("\n", strip=True)
+        elif suffix in {"md", "markdown", "txt"}:
+            title = fetched.name
+            text = decode_text(fetched.data)
+        else:
+            return (
+                f"抓到了 {fetched.name}，但它不是可直接阅读的网页正文。"
+                "PDF、Office 或图片文件请走文档导入流程。"
+            )
+
+        text = text.strip()
+        if not text:
+            return "网页抓取成功，但没有提取到正文（可能需要登录或依赖 JavaScript 渲染）。"
+        ledger = registry or EvidenceLedger()
+        number = ledger.issue_web(
+            url=fetched.final_url,
+            title=title,
+            snippet=text[:80],
+        )
+        return f"[{number}] 来自网络 · {title}\n链接：{fetched.final_url}\n{text[:6000]}"
+
+    return web_fetch_tool
 
 
 def _section(
@@ -303,8 +413,7 @@ def build_web_search_tool(
 
     智谱 SDK（`zai-sdk`）**懒加载**：即使它缺失/损坏，也不影响后端启动。
 
-    `gate` 是那道网络闸门（见 `WebSearchGate`）：语料查过且有结果、用户又没明确要求联网时，
-    这里**直接拒绝**并把理由带回去。
+    `gate` 是那道网络闸门（见 `WebSearchGate`）：只有用户明确允许联网时才执行。
     """
     if secrets is None:
         from rag.config import get_secrets
@@ -319,8 +428,7 @@ def build_web_search_tool(
     def web_search_tool(query: str) -> str:
         """用网络搜索引擎检索信息，用于回答一般性/知识性问题。
 
-        **只有两种情况下能用**：① 用户明确要求联网；② 语料检索查过、什么都没拿到。
-        其余时候请先用语料回答（网络答案无法溯源到语料）。
+        只有在用户明确允许联网后才能调用。内部证据不足时，先询问用户。
 
         Args:
             query: 搜索查询语句。

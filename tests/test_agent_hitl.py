@@ -213,8 +213,16 @@ def test_compiled_graph_exposes_only_policy_tools(tmp_path: Path) -> None:
     )
 
     readonly_tools = set(readonly_model._seen_tools[-1])
-    assert {"search_knowledge", "read_file", "grep"} <= readonly_tools
-    assert {"task", "write_file", "edit_file", "delete", "execute"}.isdisjoint(readonly_tools)
+    assert {
+        "task",
+        "web_search_tool",
+        "web_fetch_tool",
+        "read_file",
+        "grep",
+    } <= readonly_tools
+    assert {"search_knowledge", "write_file", "edit_file", "delete", "execute"}.isdisjoint(
+        readonly_tools
+    )
 
     report_model = _RecordingModel()
     report_graph, report_registry = build_agent(
@@ -232,8 +240,8 @@ def test_compiled_graph_exposes_only_policy_tools(tmp_path: Path) -> None:
     )
 
     report_tools = set(report_model._seen_tools[-1])
-    assert {"write_file", "edit_file"} <= report_tools
-    assert {"task", "delete", "execute"}.isdisjoint(report_tools)
+    assert {"task", "write_file", "edit_file"} <= report_tools
+    assert {"search_knowledge", "delete", "execute"}.isdisjoint(report_tools)
 
 
 def test_policy_denial_happens_before_hitl(tmp_path: Path) -> None:

@@ -1,0 +1,124 @@
+"""不依赖固定数据集的通用评测原语。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+
+from rag.eval import (
+    EvaluationRow,
+    JudgeVerdict,
+    build_report,
+    judge_case,
+    ndcg_at_k,
+    recall_at_k,
+    reciprocal_rank,
+    used_citations,
+)
+from rag.eval.judge import parse_verdict
+
+
+def test_recall_counts_only_within_k() -> None:
+    ranks = [1, 3, 0, 8]
+
+    assert recall_at_k(ranks, 3) == 0.5
+    assert recall_at_k(ranks, 8) == 0.75
+    assert recall_at_k([], 5) == 0.0
+
+
+def test_missing_hits_pull_the_average_down() -> None:
+    assert reciprocal_rank([1, 0]) == 0.5
+    assert reciprocal_rank([0, 0]) == 0.0
+
+
+def test_ndcg_prefers_relevant_material_ranked_higher() -> None:
+    assert ndcg_at_k([1], 8) == pytest.approx(1.0)
+    assert ndcg_at_k([2], 8) < ndcg_at_k([1], 8)
+    assert ndcg_at_k([0], 8) == 0.0
+
+
+def test_verdict_survives_code_fences_and_string_booleans() -> None:
+    verdict = parse_verdict(
+        "结果如下：\n```json\n"
+        '{"citations": [{"index": "[1]", "supported": "true"}], '
+        '"points": [{"point": "甲", "covered": "false"}], "refused": false}\n```'
+    )
+
+    assert verdict.error == ""
+    assert verdict.citations[0]["index"] == 1
+    assert verdict.citations[0]["supported"] is True
+    assert verdict.points[0]["covered"] is False
+    assert verdict.citation_accuracy == 1.0
+    assert verdict.point_coverage == 0.0
+
+
+def test_unparseable_judge_output_is_an_error_not_a_pass() -> None:
+    verdict = parse_verdict("我觉得还不错")
+
+    assert verdict.error
+    assert verdict.citations == []
+    assert verdict.citation_accuracy is None
+
+
+def test_only_citations_used_by_the_answer_are_selected() -> None:
+    citations = [{"index": index, "text": f"片段{index}"} for index in (1, 2, 3)]
+
+    assert [item["index"] for item in used_citations("结论 [2]", citations)] == [2]
+
+
+def test_judge_case_accepts_arbitrary_question_and_answer_points() -> None:
+    prompts: list[str] = []
+
+    async def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        return json.dumps(
+            {
+                "citations": [{"index": 1, "supported": True}],
+                "points": [{"point": "要点", "covered": True}],
+                "refused": False,
+            }
+        )
+
+    verdict = asyncio.run(
+        judge_case(
+            ask,
+            question="任意问题",
+            answer="答案 [1]",
+            citations=[{"index": 1, "text": "证据"}],
+            answer_points=("要点",),
+        )
+    )
+
+    assert verdict.citation_accuracy == 1.0
+    assert verdict.point_coverage == 1.0
+    assert "任意问题" in prompts[0] and "要点" in prompts[0]
+
+
+def test_report_keeps_macro_and_micro_citation_accuracy_separate() -> None:
+    rows = [
+        EvaluationRow(
+            id="one-good",
+            question="甲",
+            retrieval_case=True,
+            rank=1,
+            verdict=JudgeVerdict(citations=[{"index": 1, "supported": True}]),
+        ),
+        EvaluationRow(
+            id="eight-bad",
+            question="乙",
+            retrieval_case=True,
+            rank=0,
+            verdict=JudgeVerdict(
+                citations=[{"index": index, "supported": False} for index in range(1, 9)]
+            ),
+        ),
+    ]
+
+    summary = build_report(rows, top_k=8)["summary"]
+
+    assert summary["retrieval_cases"] == 2
+    assert summary["retrieval"]["recall@8"] == 0.5
+    assert summary["citation_accuracy"] == 0.5
+    assert summary["citation_accuracy_micro"] == pytest.approx(1 / 9)

@@ -5,7 +5,6 @@ import {
   Files,
   MessagesSquare,
   ScrollText,
-  Search,
   Sidebar,
   SidebarClose,
   type LucideIcon,
@@ -22,7 +21,6 @@ import {
 } from '../state'
 
 const ICONS: Record<string, LucideIcon> = {
-  search: Search,
   'messages-square': MessagesSquare,
   files: Files,
   'scroll-text': ScrollText,
@@ -33,7 +31,6 @@ const ICONS: Record<string, LucideIcon> = {
 // **设置页**（模型选型）2026-10-10 暂时下线，条目撤掉；页面与接口留着，要做时再加回来
 // （见 docs/backlog.md 第 2 条）。
 const items: { id: PageId; label: string; icon: string; soon?: string }[] = [
-  { id: 'search', label: '检索', icon: 'search' },
   { id: 'chat', label: '对话', icon: 'messages-square' },
   { id: 'documents', label: '文档', icon: 'files' },
   { id: 'logs', label: '日志', icon: 'scroll-text' },

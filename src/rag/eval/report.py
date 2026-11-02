@@ -4,9 +4,8 @@
 Markdown 是给人在 PR/聊天里看的 —— 只留 JSON 等于每次都要写脚本才看得懂，
 只留 Markdown 等于没法比较。
 
-报告里**一定要打出「没命中的那些**召回的是什么**」**：期望落空有两种完全不同的原因 ——
-检索没找着（该调检索），或者黄金集的期望写歪了（该改判据）。不打出召回内容，这两种
-分不出来，最后会变成「指标掉了但不知道为什么」。
+报告与数据来源解耦：调用方把检索排名、答案、引用判定和 ragas 分数填进
+``EvaluationRow``，这里只负责汇总和落盘。
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from rag.eval.metrics import summarize
-from rag.eval.runner import CaseResult
+from rag.eval.models import EvaluationRow
 
 
 def _mean(values: list[float]) -> float | None:
@@ -26,7 +25,7 @@ def _mean(values: list[float]) -> float | None:
 
 
 def build_report(
-    rows: Sequence[CaseResult],
+    rows: Sequence[EvaluationRow],
     *,
     meta: dict[str, Any] | None = None,
     top_k: int = 8,

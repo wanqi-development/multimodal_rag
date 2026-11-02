@@ -15,11 +15,13 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Eye,
   FileText,
   Folder as FolderIcon,
   FolderInput,
   FolderPlus,
   Link2,
+  ListFilter,
   Maximize2,
   Minimize2,
   Pencil,
@@ -250,10 +252,10 @@ const locked = computed(() => Boolean(current.value?.stages.indexed))
 function stagesOf(row: DocumentRow | null): { label: string; done: boolean }[] {
   const stages = row?.stages
   return [
+    { label: '已上传', done: Boolean(row) },
     { label: '已解析', done: Boolean(stages?.parsed) },
     { label: '已核对', done: Boolean(stages?.reviewed) },
-    { label: '已切分', done: Boolean(stages?.chunked) },
-    { label: '已入库', done: Boolean(stages?.indexed) },
+    { label: '已切分入库', done: Boolean(stages?.indexed) },
   ]
 }
 
@@ -281,6 +283,15 @@ const folders = ref<Folder[]>([])
 const openFolders = ref<Set<string>>(new Set())
 /** 勾选的文档：批量「移动到…」用 */
 const picked = ref<Set<string>>(new Set())
+type StageFilter = 'all' | 'uploaded' | 'parsed' | 'reviewed' | 'indexed'
+const stageFilter = ref<StageFilter>('all')
+const STAGE_FILTERS: { id: StageFilter; label: string }[] = [
+  { id: 'all', label: '全部' },
+  { id: 'uploaded', label: '已上传' },
+  { id: 'parsed', label: '已解析' },
+  { id: 'reviewed', label: '已核对' },
+  { id: 'indexed', label: '已切分入库' },
+]
 /** 「移动到…」的下拉开着没有 */
 const moveOpen = ref(false)
 /** 正在输入的那一格：`parent` = 新建在哪个目录下，`edit` = 在改哪个目录的名字 */
@@ -307,7 +318,9 @@ function childrenOf(parent: string | null): Folder[] {
 }
 
 function docsIn(folderId: string): DocumentRow[] {
-  return docs.value.filter((row) => (row.folder || '') === folderId)
+  return docs.value.filter(
+    (row) => (row.folder || '') === folderId && matchesStageFilter(row),
+  )
 }
 
 /** 这个目录连子目录一共几份 —— 折叠着的时候也要看得出里面有多少东西。 */
@@ -351,6 +364,34 @@ const treeRows = computed<TreeRow[]>(() => {
 })
 
 const unfiled = computed(() => docsIn('').length)
+const visibleDocs = computed(() => docs.value.filter(matchesStageFilter))
+const showTree = computed(
+  () => docs.value.length > 0 || folders.value.length > 0 || naming.value !== null,
+)
+
+function currentStage(row: DocumentRow): Exclude<StageFilter, 'all'> {
+  if (!row.stages.parsed) return 'uploaded'
+  if (!row.stages.reviewed) return 'parsed'
+  if (!row.stages.indexed) return 'reviewed'
+  return 'indexed'
+}
+
+function matchesStageFilter(row: DocumentRow): boolean {
+  return stageFilter.value === 'all' || currentStage(row) === stageFilter.value
+}
+
+function setStageFilter(next: StageFilter): void {
+  stageFilter.value = next
+  picked.value = new Set()
+}
+
+function selectAllVisible(): void {
+  picked.value = new Set(visibleDocs.value.map((row) => row.doc_id))
+}
+
+function clearPicked(): void {
+  picked.value = new Set()
+}
 
 /** 「移动到…」的候选：未分类 + 所有目录（按树序摊平、带缩进）。 */
 const moveTargets = computed(() => [
@@ -432,6 +473,11 @@ function togglePick(docId: string): void {
   if (next.has(docId)) next.delete(docId)
   else next.add(docId)
   picked.value = next
+}
+
+function onDocLine(row: DocumentRow): void {
+  if (stageFilter.value !== 'all') togglePick(row.doc_id)
+  else void open(row.doc_id)
 }
 
 /** 把这几份文档挪进一个目录（`folderId` 为空串 = 未分类）。下拉与拖拽走同一条。 */
@@ -874,6 +920,27 @@ function onReviewKey(event: KeyboardEvent): void {
           </button>
         </header>
 
+        <div class="doc-filter">
+          <span class="filter-title"><ListFilter :size="13" aria-hidden="true" />当前阶段</span>
+          <div class="filter-options" role="group" aria-label="按当前阶段筛选">
+            <button
+              v-for="item in STAGE_FILTERS"
+              :key="item.id"
+              type="button"
+              :aria-pressed="stageFilter === item.id"
+              @click="setStageFilter(item.id)"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+          <div class="filter-actions">
+            <button type="button" :disabled="!visibleDocs.length" @click="selectAllVisible">
+              全选当前结果
+            </button>
+            <button type="button" :disabled="!picked.size" @click="clearPicked">取消全选</button>
+          </div>
+        </div>
+
         <div v-if="picked.size" class="pick-bar">
           <span>已选 {{ picked.size }} 份</span>
           <div class="move-wrap" @click.stop>
@@ -886,16 +953,20 @@ function onReviewKey(event: KeyboardEvent): void {
               </li>
             </ul>
           </div>
-          <button class="btn ghost small" @click="picked = new Set()">
+          <button class="btn ghost small" @click="clearPicked">
             <X :size="13" aria-hidden="true" />取消
           </button>
         </div>
 
-        <div v-if="!docs.length" class="empty">
-          <b>还没有文档</b>
-          先「上传」一份：PDF / Word / Markdown / 表格都行。
+        <div v-if="stageFilter !== 'all' && !visibleDocs.length" class="filter-empty">
+          当前状态下没有文档。
         </div>
-        <ul v-else class="doc-rows tree">
+
+        <div v-if="!showTree" class="empty">
+          <b>还没有文档</b>
+          可以先创建目录，或上传 PDF / Word / Markdown / 表格。
+        </div>
+        <ul v-else class="doc-rows tree" :class="{ selecting: stageFilter !== 'all' }">
           <li v-for="(row, index) in treeRows" :key="rowKey(row, index)" class="tree-item">
             <!-- 正在输入名字的那一格：新建与改名共用 -->
             <div v-if="row.kind === 'input'" class="folder-row" :style="indent(row.depth)">
@@ -967,10 +1038,12 @@ function onReviewKey(event: KeyboardEvent): void {
               class="doc-line"
               :class="{
                 on: row.doc.doc_id === currentId,
+                picked: picked.has(row.doc.doc_id),
                 dragging: dragging.includes(row.doc.doc_id),
               }"
               :style="indent(row.depth)"
               draggable="true"
+              @click="onDocLine(row.doc)"
               @dragstart="startDrag($event, row.doc.doc_id)"
               @dragend="endDrag"
             >
@@ -982,7 +1055,7 @@ function onReviewKey(event: KeyboardEvent): void {
                 @click.stop
                 @change="togglePick(row.doc.doc_id)"
               />
-              <span class="doc-main" @click="open(row.doc.doc_id)">
+              <span class="doc-main">
                 <span class="doc-name" :title="displayName(row.doc)">
                   {{ displayName(row.doc) }}
                 </span>
@@ -1000,6 +1073,15 @@ function onReviewKey(event: KeyboardEvent): void {
                   >
                 </span>
               </span>
+              <button
+                type="button"
+                class="doc-open"
+                :aria-label="`打开 ${displayName(row.doc)}`"
+                title="打开文档"
+                @click.stop="open(row.doc.doc_id)"
+              >
+                <Eye :size="14" aria-hidden="true" />
+              </button>
             </div>
           </li>
         </ul>

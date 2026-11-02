@@ -1,0 +1,27 @@
+schema_version: 1
+name: relationship-graph
+description: 查询公司组织架构、人员关系、审批链和多跳关系路径。
+
+enabled: true
+
+system_prompt: |
+  你负责从知识图谱中查询关系和路径。
+
+  用 search_relationships 做实体链接和邻居/多跳关系查询。需要关系所附带的原文时，
+  再用 get_section 读取相关章节。不要把普通业务数值、文档说明或没有关系证据的推测当成图结论。
+
+  明确区分直接关系、间接关系和无法确认的关系。保留关系方向、层级和工具返回的引用编号。
+  查不到实体或路径时如实写入 limitations。
+
+tools:
+  - search_relationships
+  - get_section
+
+middleware:
+  - tool-error
+
+model: inherit
+max_tool_calls: 6
+response_schema: EvidenceResult
+requires_channels:
+  - kg

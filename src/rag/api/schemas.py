@@ -57,36 +57,6 @@ class StatsView(BaseModel):
     error: str | None = None
 
 
-class SearchRequest(BaseModel):
-    query: str = ""
-    # 以图搜图：服务端本地路径（真正对外时这里会换成 multipart 上传，见 §12 的说明）
-    image_path: str | None = None
-    top_k: int = Field(10, ge=1, le=100)
-    filters: dict[str, Any] | None = None
-    # **只跑列出来的那几路**（名字取自 `retrieval.channels[].name`，如 `milvus` / `kg`）；
-    # 给空或不给 = 走配置里启用的全部。名字不认识回 422。
-    channels: list[str] | None = None
-    rerank: bool | None = None
-
-
-class SearchResponse(BaseModel):
-    query: str
-    hits: list[HitView]
-    stats: list[StatsView] = Field(default_factory=list)
-
-
-class ChatRequest(BaseModel):
-    question: str = Field(min_length=1)
-    top_k: int = Field(8, ge=1, le=50)
-    stream: bool = False
-    filters: dict[str, Any] | None = None
-    channels: list[str] | None = None
-    rerank: bool | None = None
-    graph: bool | None = None
-    # 会话 id：给了就接在那一段后面，没给就开一段新的（标题取首问）
-    session_id: str | None = None
-
-
 class CitationView(BaseModel):
     index: int
     source_type: str = "corpus"
@@ -96,17 +66,6 @@ class CitationView(BaseModel):
     title: str = ""
     snippet: str = ""
     heading_path: str = ""
-
-
-class ImageUploadView(BaseModel):
-    """上传一张图给「以图搜图」。**只回路径** —— 检索由 `/search` 的 `image_path` 发起。
-
-    `path` 是**服务端路径**（页面把它原样回传给 `/search`），`name` 是落盘名（带哈希）。
-    """
-
-    path: str
-    name: str = ""
-    bytes: int = 0
 
 
 class TranscribeResponse(BaseModel):
@@ -119,18 +78,6 @@ class TranscribeResponse(BaseModel):
     # 真正用的模型名：换供应商/换型号时，页面上那句提示能说清是谁转的
     model: str = ""
     chars: int = 0
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    citations: list[CitationView] = Field(default_factory=list)
-    hits: list[HitView] = Field(default_factory=list)
-    stats: list[StatsView] = Field(default_factory=list)
-    rounds: int = 1
-    grade: dict[str, Any] = Field(default_factory=dict)
-    mode: str = "plain"
-    usage: dict[str, Any] | None = None
-    session_id: str | None = None
 
 
 class IngestRequest(BaseModel):
@@ -149,12 +96,12 @@ class AgentRequest(BaseModel):
     message: str = Field(min_length=1)
     # 会话 id：给了就是多轮（历史落在 PG 的 checkpointer 里，重启也还在）
     thread_id: str | None = None
-    # **用户明确要求联网**：放行网络搜索。默认只在「语料检索查过且什么都没拿到」时才允许
-    # （网络答案无法溯源到语料，见 agent/tools.py 的 WebSearchGate）
+    # **用户明确允许联网**：放行网络搜索与网页抓取。内部证据不足时只询问用户，
+    # 不自动联网（见 agent/tools.py 的 WebSearchGate）。
     web: bool = False
     # `true` 走 SSE：`token` / `tool` / `interrupt` / `done` 四种事件。默认不下发中间过程
     stream: bool = False
-    # 与 `/chat` 同一个语义：这一段对话落在哪个 `chat_session` 上
+    # 这一段对话落在哪个 `chat_session` 上
     session_id: str | None = None
 
 
@@ -206,7 +153,7 @@ class SessionUsageView(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    # 这一共发生了多少次模型调用（agent 一轮会有好几次，快问答是 1）
+    # 这一共发生了多少次模型调用
     calls: int = 0
 
 
@@ -215,7 +162,7 @@ class SessionView(BaseModel):
 
     session_id: str
     title: str = ""
-    mode: str = "chat"
+    mode: str = "agent"
     thread_id: str | None = None
     turns: int = 0
     created_at: datetime | None = None

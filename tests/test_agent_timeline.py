@@ -17,19 +17,21 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from rag.agent.build import _stream_graph
+from rag.agent.build import _stream_graph, _tool_activity
 from rag.config.schema import FileLogConfig, LoggingConfig, Settings
 from rag.obs.setup import configure_logging
 
 # ---- v3 信封与替身 ----
 
 
-def _env(method: str, data: Any, seq: int = 1) -> dict[str, Any]:
+def _env(
+    method: str, data: Any, seq: int = 1, *, namespace: tuple[str, ...] = ()
+) -> dict[str, Any]:
     return {
         "type": "event",
         "method": method,
         "seq": seq,
-        "params": {"namespace": [], "timestamp": 0, "data": data},
+        "params": {"namespace": list(namespace), "timestamp": 0, "data": data},
     }
 
 
@@ -181,6 +183,14 @@ def test_v3_stream_becomes_tokens_tools_and_timeline_lines(logs: Path) -> None:
     tool = next(event for event in events if event["type"] == "tool")
     assert tool["name"] == "search_knowledge"
     assert tool["args"] == {"query": "水位线是什么", "top_k": 5}
+    assert [event["message"] for event in events if event["type"] == "status"] == [
+        "正在理解问题…",
+        "正在思考如何规划查询…",
+        "正在组织答案…",
+        "正在检索公司知识库…",
+        "工具已完成，正在分析结果…",
+        "正在思考如何整理证据并回答…",
+    ]
 
     text = _agent_log(logs)
     assert "模型#1 deepseek-flash 输入=4097 输出=94 共=4191 缓存=3963" in text
@@ -188,9 +198,21 @@ def test_v3_stream_becomes_tokens_tools_and_timeline_lines(logs: Path) -> None:
     # **工具行不吃 content 开关**（2026-10-10 使用者定）：关着也把入参、出参写出来
     assert "工具#1 search_knowledge 入参=query=水位线是什么,top_k=5 出参=命中 8 块" in text
     assert "query=6字" not in text and "出参=6字" not in text, "工具行不该只报「多少字」"
+    assert "scope=main" in text
     assert "模型#2 deepseek-flash 输入=100 输出=7 共=107" in text
     # 汇总行在最后一条（token 是逐次累加：4097+100 / 94+7）
     assert "状态=answered token=4197/101" in text.strip().splitlines()[-1]
+
+
+def test_status_maps_delegated_subagents_to_human_readable_activity() -> None:
+    assert _tool_activity("task", {"subagent_type": "policy-document"}) == (
+        "正在检索公司制度与文档…"
+    )
+    assert _tool_activity("task", {"subagent_type": "relationship-graph"}) == (
+        "正在查询组织架构与关系…"
+    )
+    assert _tool_activity("task", {"subagent_type": "business-data"}) == ("正在查询业务系统数据…")
+    assert _tool_activity("custom_tool", {}) == "正在调用工具：custom_tool…"
 
 
 def test_the_tool_line_shows_values_while_the_question_stays_gated(logs: Path) -> None:
@@ -221,6 +243,9 @@ def test_v3_interrupt_comes_from_the_state_snapshot(logs: Path) -> None:
 
     kinds = [event["type"] for event in events]
     assert kinds[-1] == "interrupt" and "done" not in kinds
+    assert [event["message"] for event in events if event["type"] == "status"][-1] == (
+        "等待你确认操作…"
+    )
     assert events[-1]["interrupt"] == pending
     assert "状态=interrupted" in _agent_log(logs)
 
@@ -257,19 +282,59 @@ def _many_tools(count: int) -> list[dict[str, Any]]:
     return events
 
 
-def test_the_run_stops_after_the_tool_budget(logs: Path) -> None:
-    """工具调用到上限就**收手**，并在答案里说清是「到了上限」。
+def _nested_tools(count: int) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for index in range(count):
+        identity = f"n{index}"
+        events.append(
+            _env(
+                "tools",
+                {
+                    "event": "tool-started",
+                    "tool_call_id": identity,
+                    "tool_name": "get_section",
+                    "input": {"doc_id": "d1", "heading": f"第{index}节"},
+                },
+                namespace=("policy-document",),
+            )
+        )
+        events.append(
+            _env(
+                "tools",
+                {"event": "tool-finished", "tool_call_id": identity, "output": "正文"},
+                namespace=("policy-document",),
+            )
+        )
+    return events
 
-    这条线的由来（2026-10-08 实测）：一次问答里模型做了 8 次 `get_section`，一节一节翻材料，
-    6 次模型往返、输入 token 12.3 万、61 秒。收手之后不再往下消费流 —— 后面每多要一次工具，
-    都要把整段上下文再发一遍。**说清是「我们收的手」很重要**：不写那句，看起来就像模型答不出来。
-    """
+
+def test_the_run_reaches_its_budget_without_discarding_the_final_answer(logs: Path) -> None:
+    """主预算到线只发收尾状态；已有最终答案仍要正常返回，不能强制拼“中断”文案。"""
     from rag.agent.build import MAX_TOOL_CALLS
 
-    events = _collect(_Agent(_many_tools(MAX_TOOL_CALLS + 3), state=None))
+    state = SimpleNamespace(
+        values={"messages": [HumanMessage(content="问题"), AIMessage(content="已有答案 [1]")]}
+    )
+    events = _collect(_Agent(_many_tools(MAX_TOOL_CALLS + 3), state=state))
 
     tools = [event for event in events if event["type"] == "tool"]
-    assert len(tools) == MAX_TOOL_CALLS, "到线就停，后面那三次不该再被消费"
+    assert len(tools) == MAX_TOOL_CALLS + 3, "真实拦截由 Middleware 做，流层不能吞掉收尾"
+    assert any(
+        event["type"] == "status" and "工具预算已用完" in event["message"] for event in events
+    )
     done = events[-1]
     assert done["type"] == "done"
-    assert "上限" in done["answer"] and str(MAX_TOOL_CALLS) in done["answer"]
+    assert done["answer"].startswith("已有答案 [1]")
+    assert "这次先停在这里" not in done["answer"]
+
+
+def test_nested_subagent_tools_do_not_consume_the_main_agent_budget(logs: Path) -> None:
+    from rag.agent.build import MAX_TOOL_CALLS
+
+    state = SimpleNamespace(
+        values={"messages": [HumanMessage(content="问题"), AIMessage(content="子 Agent 已完成")]}
+    )
+    events = _collect(_Agent(_nested_tools(MAX_TOOL_CALLS + 5), state=state))
+
+    assert not any(event["type"] == "status" and event.get("phase") == "budget" for event in events)
+    assert "scope=subagent" in _agent_log(logs)

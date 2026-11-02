@@ -1,11 +1,6 @@
 <script setup lang="ts">
-// 对话页：两条路共用一套外壳。
-//
-//   快问答（`/chat`）—— 我们写死的链路，单轮、无历史、便宜、几秒钟
-//   深度 agent（`/agent`）—— 模型自己决定查几次、派给哪个子 agent，多轮、贵、慢
-//
-// **有历史就只能走 agent**：`/chat` 没有历史，接不上上下文就是接不上，这不是策略问题。
-// 所以「切回快问答」在有历史时是禁用的，想换就得开新对话（不然用户被锁在最贵那条路上）。
+// 对话页：所有问答统一进入主 Agent。主 Agent 负责意图识别、选择专业子 Agent，
+// 网络搜索和网页抓取仍由它直接调用。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   History,
@@ -14,7 +9,6 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
-  SearchCheck,
   Square,
   Trash2,
   TriangleAlert,
@@ -23,17 +17,14 @@ import {
 import {
   resumeAgent,
   streamAgent,
-  streamChat,
   transcribeAudio,
   type AgentEvent,
-  type ChatEvent,
 } from '../api'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import { citeText, renderMarkdown } from '../markdown'
 import {
   dropSession,
   loadMoreSessions,
-  mode,
   newConversation,
   openChunk,
   openSession,
@@ -48,31 +39,25 @@ import {
   setSessionsWidth,
   SESSIONS_MAX_W,
   SESSIONS_MIN_W,
-  setMode,
-  status,
   thread,
   toggleSessionsPane,
   turns,
-  WEAK_SCORE,
-  type Mode,
   type Turn,
 } from '../state'
 
 const draft = ref('')
-/** 明确要求联网（对应 `/agent` 的 `web=true`）。agent 默认只在语料查不到时才联网。 */
+/** 用户明确允许联网（对应 `/agent` 的 `web=true`）。内部证据不足时 Agent 会先询问。 */
 const web = ref(false)
 /** 正在读某一段会话（取消息是异步的，空着的时候得让人知道是在读、不是没有）。 */
 const loadingSession = ref(false)
 /** 读会话失败的原因。**必须显示出来** —— 静默失败看起来就是「这一段没有历史」。 */
 const historyError = ref('')
 const box = ref<HTMLInputElement | null>(null)
-/** 下拉里的「只看 agent」：会话多了之后，想找某一段 agent 会话比翻 60 条快。 */
-const onlyAgent = ref(false)
-const visibleSessions = computed(() =>
-  onlyAgent.value ? sessions.value.filter((item) => item.mode === 'agent') : sessions.value,
-)
+const visibleSessions = computed(() => sessions.value)
 let controller: AbortController | null = null
 let scroller: HTMLElement | null = null
+const clock = ref(Date.now())
+let clockTimer: number | null = null
 
 // ---- 语音输入：录一段 → 转文字 → **填进输入框，不自动发**（使用者 2026-10-08 定）----
 // 三种模态里先做语音这一条：图片那条要动生成链路，另起一轮。
@@ -205,13 +190,6 @@ function toggleRecording(): void {
   else void startRecording()
 }
 
-/**
- * 有历史就锁死 agent —— **但 PG 报挂了就不锁**：那时历史根本取不回来，
- * 继续锁着只会让每个问题都 503，还得让用户自己想到去点「新对话」。
- */
-const lockedToAgent = computed(() => thread.value !== null && status.value.postgres !== false)
-const effectiveMode = computed<Mode>(() => (lockedToAgent.value ? 'agent' : mode.value))
-
 function scrollToEnd(): void {
   scroller?.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' })
 }
@@ -223,15 +201,13 @@ function begin(question: string): { turn: Turn; signal: AbortSignal } {
   const turn = reactive<Turn>({
     question,
     answer: '',
-    hits: [],
-    stats: [],
     citations: [],
     error: '',
     running: true,
-    mode: effectiveMode.value,
+    activity: '正在连接 Agent…',
+    activitySince: Date.now(),
     thread: null,
     interrupt: null,
-    weak: false,
   })
   turns.value.push(turn)
   draft.value = ''
@@ -243,6 +219,7 @@ function begin(question: string): { turn: Turn; signal: AbortSignal } {
 
 function finish(turn: Turn): void {
   turn.running = false
+  if (!turn.interrupt) turn.activity = ''
   controller = null
   // 轮次是**服务端落的库**（问答结束时它自己写），这里只把列表刷新一下
   void refreshSessions()
@@ -254,7 +231,18 @@ function onAgent(turn: Turn, event: AgentEvent): void {
   if (event.type === 'token') {
     turn.answer += event.text ?? ''
     scrollToEnd()
+  } else if (event.type === 'status') {
+    const next = event.message ?? ''
+    if (next && next !== turn.activity) {
+      turn.activity = next
+      turn.activitySince = Date.now()
+    }
+    scrollToEnd()
   } else if (event.type === 'interrupt') {
+    if (!turn.activity) {
+      turn.activity = '等待你确认操作…'
+      turn.activitySince = Date.now()
+    }
     turn.interrupt = event.action_requests
       ? { action_requests: event.action_requests, review_configs: event.review_configs }
       : null
@@ -267,26 +255,17 @@ function onAgent(turn: Turn, event: AgentEvent): void {
     turn.usage = event.usage ?? null
     if (event.thread_id) remember(turn, event.thread_id)
     if (event.session_id) sessionId.value = event.session_id
+    turn.activity = ''
   } else if (event.type === 'error') {
     turn.error = event.message ?? 'agent 跑挂了'
+    turn.activity = ''
   }
 }
 
-function onChat(turn: Turn, event: ChatEvent): void {
-  if (event.type === 'retrieval') {
-    turn.hits = event.hits ?? []
-    turn.stats = event.stats ?? []
-  } else if (event.type === 'token') {
-    turn.answer += event.text ?? ''
-    scrollToEnd()
-  } else if (event.type === 'done') {
-    turn.citations = event.citations ?? []
-    turn.usage = event.usage ?? null
-    if (event.session_id) sessionId.value = event.session_id
-    turn.weak = isWeak(turn)
-  } else if (event.type === 'error') {
-    turn.error = event.message ?? '生成失败'
-  }
+function activityElapsed(turn: Turn): string {
+  if (!turn.activitySince) return ''
+  const seconds = Math.max(0, Math.floor((clock.value - turn.activitySince) / 1000))
+  return seconds < 1 ? '刚刚' : `${seconds} 秒`
 }
 
 /** 会话 id 是本会话的锚：下一轮追问、以及中断后的批准都靠它。 */
@@ -295,34 +274,21 @@ function remember(turn: Turn, id: string): void {
   thread.value = id
 }
 
-/**
- * 证据够不够。判据是「一条都没召回」或「最高分低于 WEAK_SCORE」——
- * 那个数与后端的联网闸门是同一个（见 state.ts 的说明）。
- */
-function isWeak(turn: Turn): boolean {
-  if (turn.error) return false
-  const top = turn.hits[0]
-  return !top || top.score < WEAK_SCORE
-}
-
-async function ask(question?: string): Promise<void> {
+async function ask(question?: string, options?: { web?: boolean }): Promise<void> {
   const text = (question ?? draft.value).trim()
   if (!text || controller) return
   const { turn, signal } = begin(text)
   try {
-    if (turn.mode === 'agent') {
-      await streamAgent(
-        { message: text, thread_id: thread.value, web: web.value, session_id: sessionId.value },
-        (event) => onAgent(turn, event),
-        signal,
-      )
-    } else {
-      await streamChat(
-        { question: text, session_id: sessionId.value },
-        (event) => onChat(turn, event),
-        signal,
-      )
-    }
+    await streamAgent(
+      {
+        message: text,
+        thread_id: thread.value,
+        web: options?.web ?? web.value,
+        session_id: sessionId.value,
+      },
+      (event) => onAgent(turn, event),
+      signal,
+    )
   } catch (exc) {
     if ((exc as Error).name !== 'AbortError') turn.error = (exc as Error).message
   } finally {
@@ -337,6 +303,8 @@ async function decide(turn: Turn, kind: string): Promise<void> {
   const decisions = pending.action_requests.map(() => ({ type: kind }))
   turn.interrupt = null
   turn.running = true
+  turn.activity = '正在继续处理…'
+  turn.activitySince = Date.now()
   const ctl = new AbortController()
   controller = ctl
   try {
@@ -352,17 +320,6 @@ async function decide(turn: Turn, kind: string): Promise<void> {
   }
 }
 
-/**
- * 证据不足时人工升级。**不自动切** —— 自动升级等于替用户决定多花三五倍的钱和几十秒，
- * 而「证据不足」这个判断本身也会看走眼；让他按一下。
- */
-async function escalate(turn: Turn): Promise<void> {
-  if (controller) return
-  turn.weak = false
-  setMode('agent')
-  await ask(turn.question)
-}
-
 function stop(): void {
   controller?.abort()
   controller = null
@@ -371,6 +328,7 @@ function stop(): void {
 function startOver(): void {
   stop()
   newConversation()
+  web.value = false
 }
 
 /**
@@ -482,7 +440,7 @@ function sourcesHtml(turn: Turn): string {
 }
 
 /**
- * 点答案里的 `[2]` → 右侧抽屉看原文（复用检索页那套 `openChunk`）。
+ * 点答案里的 `[2]` → 右侧抽屉看原文。
  *
  * 事件用**委托**：这段 HTML 是 `v-html` 塞进去的，Vue 绑不上它里面的元素。
  * 从历史恢复的那几轮没有引用映射（服务端只存正文与来源清单，不存 chunk 对应关系），
@@ -510,6 +468,9 @@ function onCite(turn: Turn, event: MouseEvent): void {
 
 onMounted(() => {
   scroller = document.getElementById('chat-scroll')
+  clockTimer = window.setInterval(() => {
+    clock.value = Date.now()
+  }, 1000)
   window.addEventListener('rag:focus-search', () => box.value?.focus())
   window.addEventListener('rag:ask-about-chunk', askAboutChunk)
   // 打开就把最近一段接回来 —— 会话在服务端，「刷新之后还在」靠这一步
@@ -528,43 +489,21 @@ onMounted(() => {
   })()
 })
 onUnmounted(() => {
+  if (clockTimer !== null) window.clearInterval(clockTimer)
   window.removeEventListener('rag:ask-about-chunk', askAboutChunk)
 })
 </script>
 
 <template>
   <header class="main-head">
-    <div class="seg" role="group" aria-label="问答模式">
-      <button
-        :class="{ on: effectiveMode === 'chat' }"
-        :disabled="lockedToAgent"
-        :title="
-          lockedToAgent
-            ? '本会话已有历史：快问答没有上下文，接不上。想换就点「新对话」。'
-            : '定制链路：单轮、几秒钟、便宜'
-        "
-        @click="setMode('chat')"
-      >
-        快问答
-      </button>
-      <button
-        :class="{ on: effectiveMode === 'agent' }"
-        title="模型自己决定查几次、派给哪个子 agent：慢、贵，但能多轮追问"
-        @click="setMode('agent')"
-      >
-        深度 agent
-      </button>
-    </div>
-
-    <button class="btn ghost" title="清空记录与上下文，模式也重置回快问答" @click="startOver()">
+    <button class="btn ghost" title="清空当前页并开始一段新会话" @click="startOver()">
       <Plus :size="16" aria-hidden="true" />新对话
     </button>
     <!-- 会话列表**默认就展示**（左列），所以这里不再放「会话」按钮；收起/展开在那一列自己头上 -->
     <button
-      v-if="effectiveMode === 'agent'"
       class="btn"
       :class="{ primary: web }"
-      title="明确要求联网。默认只在语料里查不到时才允许联网（网络答案无法溯源到语料）。"
+      title="明确允许本轮使用网络搜索与网页抓取；内部证据不足时 Agent 也会先询问。"
       @click="web = !web"
     >
       <Zap :size="16" aria-hidden="true" />{{ web ? '已允许联网' : '允许联网' }}
@@ -596,13 +535,7 @@ onUnmounted(() => {
         <p v-if="sessionsError" class="banner err">读会话列表失败：{{ sessionsError }}</p>
         <p v-if="!sessions.length" class="hint">还没有历史 —— 聊过一轮就会出现在这里。</p>
         <template v-else>
-          <label class="hint">
-            <input v-model="onlyAgent" type="checkbox" />
-            只看 agent
-          </label>
-          <p v-if="!visibleSessions.length" class="hint">
-            没有 agent 会话（这 {{ sessions.length }} 段都是快问答）。
-          </p>
+          <p v-if="!visibleSessions.length" class="hint">还没有会话。</p>
           <!-- 一行 = 「选这段」按钮 + 「删这段」按钮**并列**。不能把删除按钮嵌进选择按钮里：
                那是非法 HTML，内层的点击在部分浏览器里不触发。 -->
           <div
@@ -614,7 +547,7 @@ onUnmounted(() => {
             <button type="button" class="session-pick" @click="reopen(item.session_id)">
               <b>{{ item.title }}</b>
               <span class="hint">
-                {{ item.mode === 'agent' ? '深度 agent' : '快问答' }} · {{ item.turns }} 轮 ·
+                {{ item.mode === 'agent' ? 'Agent' : '历史会话' }} · {{ item.turns }} 轮 ·
                 {{ item.usage.total_tokens }} token · {{ when(item.updated_at) }}
               </span>
             </button>
@@ -671,35 +604,29 @@ onUnmounted(() => {
       <code>rag.storage</code>）。也可以点「新对话」重开一段。
     </div>
     <div v-else-if="!turns.length" class="empty">
-      <b>问语料里的东西</b>
-      快问答走定制链路：单轮、几秒钟。要接着上文追问、要它自己挑路子、要查图谱或联网，
-      切「深度 agent」。
+      <b>问公司知识库</b>
+      主 Agent 会判断问题该查制度文档、业务数据还是关系图谱；需要联网时会先征得你的同意。
     </div>
 
     <div class="thread">
       <template v-for="(turn, index) in turns" :key="index">
         <div class="msg user">{{ turn.question }}</div>
 
-        <div v-if="turn.mode === 'agent'" class="chips">
-          <span class="chip on">深度 agent</span>
+        <div class="chips">
+          <span class="chip on">Agent</span>
           <span v-if="turn.thread" class="chip">会话 {{ turn.thread }}</span>
         </div>
 
-        <details v-if="turn.stats.length" class="tools" open>
-          <summary>
-            <SearchCheck :size="16" aria-hidden="true" />
-            检索证据（{{ turn.hits.length }} 条命中 / {{ turn.stats.length }} 路通道）
-          </summary>
-          <ol>
-            <li v-for="row in turn.stats" :key="row.channel">
-              <code>{{ row.channel }}</code>
-              <span class="hint">
-                召回 {{ row.candidates }} → 入选 {{ row.kept
-                }}<template v-if="row.latency_ms"> · {{ row.latency_ms.toFixed(0) }}ms</template>
-              </span>
-            </li>
-          </ol>
-        </details>
+        <div
+          v-if="turn.activity && (turn.running || turn.interrupt)"
+          class="agent-activity"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="activity-pulse" aria-hidden="true"></span>
+          <span>{{ turn.activity }}</span>
+          <span class="hint right">{{ activityElapsed(turn) }}</span>
+        </div>
 
         <ApprovalCard
           v-if="turn.interrupt"
@@ -734,15 +661,6 @@ onUnmounted(() => {
           </span>
         </div>
 
-        <div v-if="turn.weak" class="banner warn">
-          <TriangleAlert :size="16" aria-hidden="true" />
-          <span>
-            语料里没找到足够证据（最高分
-            {{ turn.hits.length ? turn.hits[0].score.toFixed(4) : '无命中' }}，判据 &lt;
-            {{ WEAK_SCORE }}）。
-          </span>
-          <button class="btn" @click="escalate(turn)">让 agent 再查一遍</button>
-        </div>
       </template>
     </div>
   </div>

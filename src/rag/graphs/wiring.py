@@ -81,7 +81,7 @@ def build_heavy(settings: Settings, index: Any, *, chat_name: str = "default") -
 def build_retrieve(heavy: Heavy) -> RetrieveFn:
     """检索闭包。每个子查询**重新装配**一个检索器（计划可能指定了别的 channels）——
     `build_retriever` 只是接线，很便宜；重对象来自 `heavy`，不会重建。"""
-    from rag.retrieval import build_retriever
+    from rag.retrieval import build_retriever, configured_hyde
 
     async def retrieve(
         query: str,
@@ -97,7 +97,13 @@ def build_retrieve(heavy: Heavy) -> RetrieveFn:
             wanted = set(channels)
             for item in local.retrieval.channels:
                 item.enabled = item.name in wanted
-        retriever = build_retriever(local, heavy.index, heavy.embedder, heavy.reranker)
+        retriever = build_retriever(
+            local,
+            heavy.index,
+            heavy.embedder,
+            heavy.reranker,
+            hyde=configured_hyde(local, heavy.chat),
+        )
         hits = await retriever.retrieve(query, top_k, filters=filters or None)
         return hits, getattr(retriever, "last_stats", [])
 

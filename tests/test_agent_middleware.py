@@ -10,9 +10,14 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
-from rag.agent.middleware import ToolErrorMiddleware, ToolPolicy, ToolPolicyMiddleware
+from rag.agent.middleware import (
+    ToolCallBudgetMiddleware,
+    ToolErrorMiddleware,
+    ToolPolicy,
+    ToolPolicyMiddleware,
+)
 
 
 class _Request:
@@ -21,11 +26,12 @@ class _Request:
 
 
 class _ModelRequest:
-    def __init__(self, tools: list[Any]) -> None:
+    def __init__(self, tools: list[Any], state: dict[str, Any] | None = None) -> None:
         self.tools = tools
+        self.state = state or {}
 
     def override(self, **changes: Any) -> _ModelRequest:
-        return _ModelRequest(changes.get("tools", self.tools))
+        return _ModelRequest(changes.get("tools", self.tools), self.state)
 
 
 def _tool(name: str) -> SimpleNamespace:
@@ -116,6 +122,141 @@ def test_policy_passes_an_allowed_tool_to_its_handler() -> None:
     )
 
     assert called is True and out is sentinel
+
+
+def test_task_is_visible_only_when_at_least_one_subagent_is_allowed() -> None:
+    seen: list[str] = []
+
+    def handler(request: Any) -> Any:
+        seen.extend(tool.name for tool in request.tools)
+        return "ok"
+
+    ToolPolicyMiddleware(
+        ToolPolicy.readonly(allowed_subagents=frozenset({"policy-document"}))
+    ).wrap_model_call(_ModelRequest([_tool("task"), _tool("execute")]), handler)
+
+    assert seen == ["task"]
+
+
+def test_injected_agent_tools_extend_the_main_agent_allowlist() -> None:
+    seen: list[str] = []
+
+    def handler(request: Any) -> Any:
+        seen.extend(tool.name for tool in request.tools)
+        return "ok"
+
+    ToolPolicyMiddleware(
+        ToolPolicy.readonly(extra_tools=frozenset({"company_web_crawl"}))
+    ).wrap_model_call(
+        _ModelRequest([_tool("company_web_crawl"), _tool("execute")]),
+        handler,
+    )
+
+    assert seen == ["company_web_crawl"]
+
+
+def test_exact_subagent_policy_hides_default_filesystem_tools() -> None:
+    seen: list[str] = []
+
+    def handler(request: Any) -> Any:
+        seen.extend(tool.name for tool in request.tools)
+        return "ok"
+
+    ToolPolicyMiddleware(
+        ToolPolicy.exact(frozenset({"search_knowledge", "get_section"}))
+    ).wrap_model_call(
+        _ModelRequest(
+            [
+                _tool("search_knowledge"),
+                _tool("get_section"),
+                _tool("grep"),
+                _tool("read_file"),
+                _tool("EvidenceResult"),
+            ]
+        ),
+        handler,
+    )
+
+    assert seen == ["search_knowledge", "get_section", "EvidenceResult"]
+
+
+def test_tool_budget_uses_run_state_and_resets_for_each_task() -> None:
+    budget = ToolCallBudgetMiddleware(2)
+    assert budget._matches_tool_filter({"name": "search_knowledge"}) is True
+    assert budget._matches_tool_filter({"name": "EvidenceResult"}) is False
+
+    def call(index: int) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "search_knowledge",
+                    "args": {"query": "q"},
+                    "id": f"call-{index}",
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+    first = budget.after_model({"messages": [call(1)]}, None)
+    assert first["run_tool_call_count"]["__all__"] == 1
+    second = budget.after_model(
+        {"messages": [call(2)], "run_tool_call_count": first["run_tool_call_count"]},
+        None,
+    )
+    assert second["run_tool_call_count"]["__all__"] == 2
+    blocked = budget.after_model(
+        {"messages": [call(3)], "run_tool_call_count": second["run_tool_call_count"]},
+        None,
+    )
+    assert blocked["run_tool_call_count"]["__all__"] == 3
+    assert isinstance(blocked["messages"][0], ToolMessage)
+    assert "工具预算已用完" in blocked["messages"][0].content
+
+    seen: list[str] = []
+
+    def model_handler(request: Any) -> Any:
+        seen.extend(tool.name for tool in request.tools)
+        return "ok"
+
+    budget.wrap_model_call(
+        _ModelRequest(
+            [_tool("search_knowledge"), _tool("EvidenceResult")],
+            {"run_tool_call_count": {"__all__": 2}},
+        ),
+        model_handler,
+    )
+    assert seen == ["EvidenceResult"]
+
+    # 同一个 middleware 实例在第二次 task 的全新 state 中重新获得预算。
+    assert (
+        budget.wrap_model_call(
+            _ModelRequest([_tool("search_knowledge"), _tool("EvidenceResult")], {}),
+            model_handler,
+        )
+        == "ok"
+    )
+    assert seen == ["EvidenceResult", "search_knowledge", "EvidenceResult"]
+
+
+def test_task_rejects_a_subagent_outside_the_registry() -> None:
+    called = False
+
+    def handler(request: Any) -> Any:
+        nonlocal called
+        called = True
+        return ToolMessage(content="不该执行", tool_call_id="call-1")
+
+    out = ToolPolicyMiddleware(
+        ToolPolicy.readonly(allowed_subagents=frozenset({"policy-document"}))
+    ).wrap_tool_call(
+        _Request(name="task", args={"subagent_type": "general-purpose", "description": "查"}),
+        handler,
+    )
+
+    assert called is False
+    assert isinstance(out, ToolMessage) and out.status == "error"
+    assert "general-purpose" in out.content and "policy-document" in out.content
 
 
 def test_a_failing_tool_becomes_a_readable_tool_message(caplog: Any) -> None:

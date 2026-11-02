@@ -11,19 +11,11 @@ Typer CLI + 对话式 agent**。
 > 命名：仓库与发行包叫 `multimodal_rag`，导入包与 CLI 入口叫 `rag`
 > （历史上从 `multi-mode-rag` 改过来，见 [docs/architecture.md](docs/architecture.md) §21）。
 
-## 实测结果
+## 工程实测
 
-| 口径 | 数字 |
-|---|---|
-| 检索（22 题 · 默认含精排 · top-k 8） | recall@8 **86.4%** · MRR **75.6%** · nDCG@8 78.2% · top1 **68.2%** |
-| 检索（同一批 · 关掉精排） | 81.8% · 54.7% · 61.1% · 45.5% —— 精排 **+20.9pp MRR / +22.7pp top1** |
-| 生成（12 题带判据） | 引用准确率 **90.0%**（macro）· 要点覆盖率 94.4% · 漏拒 0 · 误拒 0 |
-| A/B：BM25 独立通道（27 题） | nDCG@8 75.58% → **75.36%**（关掉反而更好）→ 该通道删除 |
-| A/B：Neo4j 图谱通道（24 题） | 逐题名次变化 **0 条** → 默认关闭，不全量灌图 |
-
-口径、逐题清单、以及工程侧实测（精排耗时、PDF 解析选型、embedding 吞吐……）见
-[**docs/results.md**](docs/results.md)；「为什么这么选」的论证过程见
-[docs/architecture.md](docs/architecture.md)。
+当前不维护固定黄金集，也不发布基于 LLM 自动生成问答集的检索准确率。PDF 解析、
+精排耗时、embedding 吞吐、OCR 转发质量和存储迁移等工程数字见
+[**docs/results.md**](docs/results.md)；设计与取舍见 [docs/architecture.md](docs/architecture.md)。
 
 ## 60 秒 demo
 
@@ -52,10 +44,11 @@ scripts\demo.cmd -DryRun         # 只看它要做什么，一个字都不写
 
 | 环节 | 做法，以及为什么 |
 |---|---|
-| 工具面 | 只有 **4 个**工具：`search_knowledge`（**一次调用 = 一整轮融合检索**：所有启用通道并发 + RRF 融合 + 精排，`modality` 用来只看某类块）/ `list_documents` / `get_section` / `web_search_tool`。**刻意不做 subagent** —— 通道的并发与融合本来就在检索层做完，让模型分头调、再用文字拼结果，等于把 RRF 的分数换成模型的印象 |
-| 网络兜底 | 只当兜底，而且靠**机制**管、不靠"不给它工具"：`WebSearchGate` 在语料没查过、或语料已有结果时直接拒绝这次调用并回理由 |
-| 工具策略与人在环（HITL） | `ToolPolicyMiddleware` 在模型请求阶段裁掉禁用工具，并在执行阶段硬拒绝越权调用；`readonly` 只开放知识工具和只读文件工具，`report` 额外开放 `write_file` / `edit_file`，`task` / `delete` / `execute` 始终禁用。两个允许的写工具各挂 HITL 闸门；中断与恢复走 LangGraph 原生协议（`Command(resume={"decisions": [...]})`），**跨进程**可用（CLI 一次进程、HTTP 一次请求都行）。CLI 中断退出码是 `3`，与真失败（`1`）分开，脚本里能一句话分辨 |
-| 流式 | `stream_mode=["messages", "updates"]` → SSE 四类事件 `token` / `tool` / `interrupt` / `done`；靠 `checkpoint_ns` 把子图 token 滤掉，不把中间话术当答案吐给用户 |
+| 意图与工具面 | 主 Agent 自己担任 Supervisor：根据问题选择 `policy-document`、`relationship-graph`、`business-data` 三个专业子 Agent，并负责证据融合与最终生成。每个子 Agent 一个固定格式的 `config/agents/*.yaml`，系统提示词、工具与中间件都在同一文件里；启动时严格校验，生成 deepagents 原生 `SubAgent` |
+| 证据边界 | 制度/规则/SOP 走文档语义检索；组织架构、人员关系和审批链走图通道；员工、订单、库存等精确业务数据走公司业务 MCP 工具，**不让模型生成 SQL**。业务 MCP 未接入前 `business-data` 保持禁用 |
+| 网络兜底 | 搜索与网页抓取都是主 Agent 的直接工具，共用 `WebSearchGate`。内部证据不足时先询问用户是否允许联网；只有用户明确授权后才执行，网页抓取复用 ingest 的 URL 安全校验 |
+| 工具策略与人在环（HITL） | 主 Agent 使用 `ToolPolicyMiddleware` + 独立工具预算；子 Agent 使用 YAML `tools` 精确白名单和 `max_tool_calls` 独立预算，默认文件工具不可见。主/子工具分域计数，`EvidenceResult` 不占额；到预算后禁止继续调用但保留最终作答 |
+| 流式 | SSE 实时下发 `status` / `token` / `tool` / `interrupt` / `done`；状态条说明 Agent 正在理解、规划、检索、整理还是生成，靠 `checkpoint_ns` 把子图 token 滤掉 |
 | 引用编号 | `EvidenceLedger` 发全局递增的 `[n]`：语料块和网页结果进同一张证据表，答案里的 `[n]` 直接查表；返回给调用方时只列答案**真的引用到**的那些（召回 20 条只用 3 条时，全塞回去就看不出哪条支撑哪句话）。引用表按会话存 PG —— 答案是中断恢复**之后**才生成的，用的还是中断前发的号 |
 | 记忆与技能 | PG checkpointer（会话 / HITL 中断）+ store（跨会话记忆）；`workspace/AGENTS.md` 挂成 memory；skills 按需加载，两个源（包内 `src/rag/agent/skills/` + 用户目录，同名以用户为准） |
 | 编排 | LangGraph 两张图，都**只做编排**：`QueryGraph`（plan → 并行通道 → 融合 → 精排 → **评分不够就改写重查**）与 `IndexGraph`（解析 / 切分 / 入库三段断点续跑） |
@@ -63,7 +56,7 @@ scripts\demo.cmd -DryRun         # 只看它要做什么，一个字都不写
 ## 架构
 
 ```
-入口层   FastAPI（/search /chat /ingest /documents /logs /agent …）│ Typer CLI │ deepagents agent
+入口层   FastAPI（/agent /chat/transcribe /ingest /documents /logs …）│ Typer CLI │ deepagents agent
 编排层   LangGraph：QueryGraph（在线，带自纠错循环）│ IndexGraph（离线灌库）
 检索层   主通道 hybrid(dense + sparse，Milvus 服务端 RRF)
          增强：多路通道并发 → 客户端 RRF 融合 → cross-encoder 精排 → 装配（去重 / token 预算 / 引用编号）
@@ -105,7 +98,7 @@ Python **3.13**（`pyproject.toml` 锁了 `>=3.13,<3.14`；langgraph 官方声�
 ```bash
 conda create -n multi_modal_rag python=3.13
 conda activate multi_modal_rag
-pip install -e . --group dev     # 含 pytest / ruff；要跑评测再加 --extra eval
+pip install -e . --group dev     # 含 pytest / ruff
 pip install -e plugins/rag-dots-parser --no-deps  # 默认 PDF parser=dots
 rag --help                       # CLI 入口
 ```
@@ -131,6 +124,15 @@ cp .env.example .env             # Windows: Copy-Item .env.example .env
 | `RAG_STORAGE_BACKEND` | `local`（默认）/ `minio` | 上传件 + 中间产物 + 原始资产 + 会话图片 |
 
 想看最终生效的是什么，用 `rag config`。
+
+HyDE 是独立的检索增强开关：
+
+| 开关 | 取值 | 管什么 |
+|---|---|---|
+| `RAG_HYDE` | `false`（默认）/ `true` | 文本问题先生成假想资料，再与原问题双路召回、RRF 融合、用原问题重排 |
+
+纯图片查询自动跳过 HyDE；生成或假设腿失败时回退原问题检索。开启后每次文本查询
+会多一次 chat 调用和一次 embedding/检索调用。
 
 部署档位 `RAG_DEPLOYMENT_PROFILE` 有三档：
 
@@ -225,6 +227,9 @@ scripts\windows\web.cmd        ./scripts/linux/web.sh
 `rag serve --workers 2`。两个单 worker 容器则设 `RAG_DEPLOYMENT_REPLICAS=2`；
 `--reload` 与多 worker 不能同时开。
 
+页面问答统一走主 Agent。内部证据不足时，Agent 会明确说明缺什么并询问是否允许联网；
+页面上的“允许联网”按钮对应 `/agent` 请求里的 `web=true`。
+
 ### 6. 灌第一批语料
 
 页面上是四步：**上传 / 导入 → 解析 → 核对大纲 → 切分并入库**。命令行等价：
@@ -248,7 +253,6 @@ rag agent  "Flink 的 Savepoint 是什么"  # 对话式 agent（多轮加 --thre
 | `rag ingest <路径>` | 灌库：解析 → 切分 + 图片描述 → 写 Milvus |
 | `rag search` / `rag ask` / `rag agent` | 检索 / 带引用问答 / 对话式 agent |
 | `rag serve` | 起 FastAPI 服务（有 `web/dist` 就一并托管页面） |
-| `rag eval` | 跑黄金集（`--judge` 再加生成侧判定，花钱） |
 | `rag registry` / `rag storage` / `rag models` | 文档注册表（含 `reconcile` 索引对账与 `prune` 旧版本清理）/ 文件落点（含把本地已有文件推上桶）/ 模型选型 |
 | `rag profile` | 查看或校验当前 profile 的完整状态域；`import-legacy` 显式复制旧共享状态 |
 | `rag logs` / `rag chats` / `rag sessions` | 日志 / UI 会话记录 / LangGraph 会话 |
@@ -275,9 +279,10 @@ web/            Vue 3 + TypeScript + Vite 前端（没引 UI 组件库）
 plugins/        三个扩展点（检索通道 / CLI 命令 / PDF parser）的样板：
                 rag-channel-neo4j、rag-dots-parser
 config/         base.yaml 与 dev.yaml（值放 .env）
+config/agents/  每个专业子 Agent 一个 *.yaml
 deploy/         Milvus 与 OCR 产线的 compose
-eval/           黄金集（跑出来的报告落在 eval/reports/，不进库）
-tests/          pytest（977 个用例；需要真 Milvus / OCR 的集成用例默认跳过）
+src/rag/eval/   通用评测原语与可选结果报告（不维护固定黄金集）
+tests/          pytest（需要真 Milvus / OCR 的集成用例默认跳过）
 ```
 
 > `plugins/rag-dots-parser/` 是 **dots.ocr 官方仓库整包拿过来的第三方样例代码**（含它自己的
@@ -290,11 +295,12 @@ tests/          pytest（977 个用例；需要真 Milvus / OCR 的集成用例�
 
 * **图谱通道默认关**：860 行代码与两篇文档的图保留着，但 A/B 实测在这份语料上没有可测量的
   提升（见上表），所以先不全量灌图 —— 要让图通道有用，得先有真正需要跨文档多跳的问题。
-* **隔离的 `web` 检索通道没接**：agent 侧有 web 搜索工具（带闸门），检索层还没有 web 适配器。
+* **网络检索不是独立通道**：主 Agent 有网络搜索和网页抓取工具（共用闸门），检索层没有常驻 web 适配器。
 * **存储侧还差一块**：页图与表格片段未落地，资产也没有清理动作（文档改短后旧图会留在盘上）。
 * **历史会话里的 `[n]` 点不开**：只有当轮引用可点（`[n] → chunk_id` 的映射来自当轮事件，不入库）。
 * **模型选型的界面暂时下线**：视图、接口与用例都还在，只是导航里撤了入口；且选型**重启生效**。
-* **黄金集是 30 行的小集合**：够用来做 A/B 对照与回归，不够用来宣称绝对水平。
+* **没有固定黄金集**：历史合成问答集已移除；检索指标、引用判定和 ragas 适配器保留，
+  后续应基于真实检索结果或经过审核的数据集使用。
 
 ## 开发
 

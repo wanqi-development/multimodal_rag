@@ -280,9 +280,10 @@ def _llm_line(row: dict[str, Any]) -> str:
 
 def _tool_line(row: dict[str, Any]) -> str:
     preview = row.get("output") or "（空）"
+    scope = f" scope={row.get('scope')}" if row.get("scope") else ""
     return (
         f"工具#{row.get('index')} {row.get('tool')} "
-        f"入参={row.get('args') or '—'} 出参={preview} {_ms(row.get('duration_ms'))}"
+        f"入参={row.get('args') or '—'} 出参={preview} {_ms(row.get('duration_ms'))}{scope}"
     )
 
 
@@ -325,6 +326,7 @@ def record_agent_tool(
     run_id: str,
     index: int,
     tool: str,
+    scope: str = "",
     args: dict[str, Any] | None = None,
     output: Any = "",
     ok: bool = True,
@@ -345,6 +347,7 @@ def record_agent_tool(
             "run_id": run_id,
             "index": int(index),
             "tool": tool,
+            "scope": scope,
             "args": _args_brief(args),
             "output": preview,
             "output_chars": len(text),
@@ -507,7 +510,7 @@ def kind_of_line(source: str, fallback: str) -> str:
 
 
 def parse_line(line: str) -> tuple[str | None, str, str, str]:
-    """`10-06 18:02:33.123 INFO  interface  req=… POST /search 200`
+    """`10-06 18:02:33.123 INFO  interface  req=… POST /agent 200`
     → 时间 / 级别 / **来源**（logger 短名） / 其余。
 
     格式是我们自己定的（`obs/setup.py` 的 `FORMAT`），所以可以放心切；切不动就把整行

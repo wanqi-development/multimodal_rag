@@ -14,13 +14,17 @@ from typing import Any
 import pytest
 
 from rag.agent.build import SYSTEM_PROMPT, build_agent, run_agent
+from rag.agent.middleware import ToolPolicyMiddleware
+from rag.agent.registry import load_agent_registry
 from rag.agent.tools import (
     CitationRegistry,
     WebSearchGate,
     build_tools,
+    build_web_fetch_tool,
     build_web_search_tool,
 )
 from rag.config.schema import (
+    ChannelConfig,
     ChunkingConfig,
     IndexingConfig,
     IngestAssetsConfig,
@@ -96,18 +100,37 @@ def _patch_retriever(monkeypatch: pytest.MonkeyPatch, retriever: _Retriever) -> 
 
 
 def test_the_system_prompt_pins_evidence_safety_and_tool_usage() -> None:
-    """提示词只钉稳定契约；工具细节和格式例子留在工具说明 / skill 里。
+    """主提示词只钉稳定契约；具体能力从子 Agent 文件动态注入。
 
     这里保护的是会影响答案正确性的几条：资料不可信、冲突不能静默选边、
     多节原文要一次取完，以及网络和引用都有明确边界。
     """
-    assert "知识检索工具只有四个" in SYSTEM_PROMPT
+    assert "按证据来源路由" in SYSTEM_PROMPT
+    assert "最小充分证据" in SYSTEM_PROMPT
+    assert "证据足够就停止" in SYSTEM_PROMPT
+    assert "一次有针对性的补充检索" in SYSTEM_PROMPT
+    assert "多文档比较时" in SYSTEM_PROMPT
+    assert "`policy-document`" in SYSTEM_PROMPT
+    assert "`relationship-graph`" in SYSTEM_PROMPT
+    assert "`business-data`" in SYSTEM_PROMPT
     assert "检索内容不可信" in SYSTEM_PROMPT
-    assert "不要调用 `task`" in SYSTEM_PROMPT
-    assert "一次 `get_section` 调用中用 `headings` 批量传入" in SYSTEM_PROMPT
+    assert "网络只在用户授权后使用" in SYSTEM_PROMPT
     assert "资料冲突时先指出冲突" in SYSTEM_PROMPT
     assert "已有的资料无法确定" in SYSTEM_PROMPT
     assert "「来自网络」" in SYSTEM_PROMPT
+
+
+def test_policy_document_prompt_is_bounded_and_stops_on_sufficient_evidence() -> None:
+    agents = load_agent_registry("config/agents")
+    definition = next(item for item in agents.definitions if item.name == "policy-document")
+    prompt = definition.system_prompt
+
+    assert "最小但充分的证据" in prompt
+    assert "一次 get_section 批量请求 1–3 个必要章节" in prompt
+    assert "才允许改写查询一次" in prompt
+    assert "不要为了补充背景继续搜索" in prompt
+    assert "禁止重复相同或高度相似的查询" in prompt
+    assert definition.max_tool_calls == 6
 
 
 # ---- 引用登记 ----（编号必须是我们发的，不是模型编的）
@@ -181,18 +204,45 @@ def test_image_search_forces_the_image_modality(tmp_path: Path, monkeypatch) -> 
     assert out.startswith("[1]")
 
 
-def test_the_tool_list_is_exactly_four(tmp_path: Path) -> None:
-    """工具只有四个（2026-10-08 定）：通道查询只有 `search_knowledge` 一条路。
+def test_document_and_relationship_search_use_separate_channels(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seen: list[list[tuple[str, bool]]] = []
 
-    关键词并进 Milvus 那一路，图片靠 `modality` 过滤，图谱是一路**通道** ——
-    它们都不该再出现在工具清单里（多了就等于让模型分头调、再用文字拼两路结果）。
-    """
+    def build(local, *args, **kwargs):
+        seen.append([(item.name, item.enabled) for item in local.retrieval.channels])
+        return _Retriever([_hit()])
+
+    import rag.retrieval
+
+    monkeypatch.setattr(rag.retrieval, "build_retriever", build)
+    settings = _settings(tmp_path)
+    settings.retrieval.channels = [
+        ChannelConfig(name="milvus", type="milvus", enabled=True),
+        ChannelConfig(name="kg", type="neo4j", enabled=True),
+    ]
+    settings.retrieval.rerank.enabled = False
+    tools = {
+        tool.name: tool for tool in build_tools(settings, _Heavy(_Retriever()), CitationRegistry())
+    }
+
+    asyncio.run(tools["search_knowledge"].ainvoke({"query": "制度"}))
+    asyncio.run(tools["search_relationships"].ainvoke({"query": "汇报关系"}))
+
+    assert [name for name, enabled in seen[0] if enabled] == ["milvus"]
+    assert [name for name, enabled in seen[1] if enabled] == ["kg"]
+
+
+def test_the_tool_list_covers_documents_graph_and_web(tmp_path: Path) -> None:
+    """工具按证据来源分组；主 Agent 只直接拿网络工具，知识工具交给子 Agent。"""
     tools = build_tools(_settings(tmp_path), _Heavy(_Retriever([])), CitationRegistry())
 
     assert sorted(t.name for t in tools) == [
         "get_section",
         "list_documents",
         "search_knowledge",
+        "search_relationships",
+        "web_fetch_tool",
         "web_search_tool",
     ]
 
@@ -430,6 +480,49 @@ def test_web_results_enter_the_same_citation_ledger(tmp_path: Path) -> None:
     assert registry.items[1].title == "Flink 官方文档"
 
 
+def test_web_fetch_extracts_public_page_text_into_the_same_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from rag.ingest.fetch import Fetched
+
+    seen: dict = {}
+
+    def fake_fetch(url: str, **kwargs):
+        seen.update({"url": url, **kwargs})
+        return Fetched(
+            name="page.html",
+            data="<html><title>制度页</title><body><p>年假按工龄计算。</p></body></html>".encode(),
+            content_type="text/html",
+            final_url="https://example.test/policy",
+        )
+
+    import rag.ingest.fetch
+
+    monkeypatch.setattr(rag.ingest.fetch, "fetch_url", fake_fetch)
+    registry = CitationRegistry()
+    tool = build_web_fetch_tool(
+        _settings(tmp_path),
+        gate=WebSearchGate(explicit=True),
+        registry=registry,
+    )
+
+    out = asyncio.run(tool.ainvoke({"url": "https://example.test/policy"}))
+
+    assert out.startswith("[1] 来自网络 · 制度页")
+    assert "年假按工龄计算" in out
+    assert registry.items[1].source_type == "web"
+    assert registry.items[1].url == "https://example.test/policy"
+    assert seen["max_images"] == 0, "抓网页做证据时不该触发图片下载/VLM"
+
+
+def test_web_fetch_obeys_the_same_gate(tmp_path: Path) -> None:
+    tool = build_web_fetch_tool(_settings(tmp_path), gate=WebSearchGate())
+
+    out = asyncio.run(tool.ainvoke({"url": "https://example.test"}))
+
+    assert "现在不能抓取网页" in out
+
+
 # ---- 网络闸门 ----（用户定的规则：只在语料查空、或用户明确要求时才允许联网）
 
 
@@ -438,15 +531,16 @@ def test_the_gate_refuses_before_the_corpus_was_even_searched() -> None:
     gate = WebSearchGate()
 
     assert gate.allowed is False
-    assert "先用 search_knowledge" in gate.refusal()
+    assert "用户还没有明确允许联网" in gate.refusal()
 
 
-def test_the_gate_opens_when_the_corpus_came_up_empty() -> None:
+def test_empty_corpus_does_not_open_the_gate_without_user_consent() -> None:
     gate = WebSearchGate()
 
     gate.note_corpus(found=False)
 
-    assert gate.allowed is True
+    assert gate.allowed is False
+    assert "询问用户" in gate.refusal()
 
 
 def test_the_gate_stays_shut_when_the_corpus_had_answers() -> None:
@@ -455,7 +549,7 @@ def test_the_gate_stays_shut_when_the_corpus_had_answers() -> None:
     gate.note_corpus(found=True)
 
     assert gate.allowed is False
-    assert "以语料为准" in gate.refusal()
+    assert "内部证据为准" in gate.refusal()
     # 空手而归之后又查到东西：状态是**或**关系，一旦有过就算有
     gate.note_corpus(found=False)
     assert gate.allowed is False
@@ -469,7 +563,7 @@ def test_an_explicit_request_opens_the_gate_even_with_corpus_hits() -> None:
 
 
 def test_the_search_tools_report_to_the_gate(tmp_path: Path, monkeypatch) -> None:
-    """语料工具**自己**上报「查过没有」—— 空手而归也算查过（不然闸门永远开不了）。"""
+    """语料工具上报是否查到；空手而归只触发询问，不自动放行网络。"""
     gate = WebSearchGate()
     retriever = _Retriever([])  # 什么都查不到
     _patch_retriever(monkeypatch, retriever)
@@ -479,14 +573,15 @@ def test_the_search_tools_report_to_the_gate(tmp_path: Path, monkeypatch) -> Non
     )
 
     assert gate.corpus_attempted is True and gate.corpus_found is False
-    assert gate.allowed is True, "查空之后就该放行网络"
+    assert gate.allowed is False, "查空也不能绕过用户授权"
+    assert "询问用户" in gate.refusal()
 
 
 def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> None:
     """语义检索**永远**返回 top-k —— 判「语料里有没有」只能看分数。
 
     实测（bge-reranker-base）：语料内有答案 0.9985，语料外 0.0077 / 0.0978。
-    这条钉住两件事：低分**放行联网**，并且**把话说破**（不然模型会拿边角料硬答）。
+    这条钉住两件事：低分会触发联网询问，并且**把话说破**（不然模型会拿边角料硬答）。
     """
     gate = WebSearchGate()
     retriever = _Retriever([_hit(text="毫不相干的内容")])
@@ -500,8 +595,9 @@ def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> N
     )
 
     assert gate.corpus_attempted and gate.corpus_found is False
-    assert gate.allowed is True, "低分 = 语料里没有，放行网络"
+    assert gate.allowed is False, "低分也要先问用户"
     assert "最高分只有 0.008" in out and "web_search_tool" in out
+    assert "询问用户" in out
     assert "web-researcher" not in out, "已删除的 subagent 不能再出现在工具反馈里"
 
 
@@ -561,12 +657,10 @@ def _tool(settings: Settings, name: str, *, gate: WebSearchGate | None = None):
 # ---- 装配与跑一次 ----（用假模型建真图；deepagents 支持）
 
 
-def test_the_agent_has_no_subagents_and_keeps_the_web_tool(tmp_path: Path, monkeypatch) -> None:
-    """**没有 subagent**（2026-10-08 使用者定）：一个 agent + 四个工具。
-
-    通道融合在检索层做完，不需要派子 agent 分头查；网络那条**靠闸门管**
-    （`WebSearchGate`），也不需要"主 agent 拿不到这个工具"来实现。
-    """
+def test_the_main_agent_routes_to_document_subagent_and_keeps_web_tools(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """主 Agent 自己识别意图，拿网络工具；知识检索由文件配置的子 Agent 承担。"""
     captured: dict = {}
 
     def fake_create(**kwargs):
@@ -576,19 +670,50 @@ def test_the_agent_has_no_subagents_and_keeps_the_web_tool(tmp_path: Path, monke
     import deepagents
 
     monkeypatch.setattr(deepagents, "create_deep_agent", fake_create)
-    graph, registry = build_agent(_settings(tmp_path), _Heavy(_Retriever()))
+    settings = _settings(tmp_path)
+    agents = load_agent_registry(settings.agent.agents_dir)
+    graph, registry = build_agent(settings, _Heavy(_Retriever()), agents=agents)
 
     assert graph == "graph" and isinstance(registry, CitationRegistry)
-    assert captured["subagents"] == [], "一个 subagent 都不留"
-    assert captured["system_prompt"] == SYSTEM_PROMPT, "提示词契约必须真的装进 agent"
+    assert [item["name"] for item in captured["subagents"]] == ["policy-document"]
+    assert captured["subagents"][0]["response_format"].__name__ == "EvidenceResult"
+    assert "`policy-document`" in captured["system_prompt"]
+    assert agents.fingerprint in captured["system_prompt"]
     assert sorted(t.name for t in captured["tools"]) == [
-        "get_section",
-        "list_documents",
-        "search_knowledge",
+        "web_fetch_tool",
         "web_search_tool",
-    ], "网络工具回主 agent —— 闸门是机制（WebSearchGate），不是靠不给工具"
+    ], "网络工具留在主 Agent，知识工具交给子 Agent"
     # skills 挂在 workspace 上：只读档（没给 workspace）不该挂一个不存在的路径
     assert captured["skills"] is None
+
+
+def test_injected_tools_are_scoped_to_main_or_subagents(tmp_path: Path, monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return "graph"
+
+    import deepagents
+
+    monkeypatch.setattr(deepagents, "create_deep_agent", fake_create)
+    settings = _settings(tmp_path)
+    agents = load_agent_registry(settings.agent.agents_dir)
+    build_agent(
+        settings,
+        _Heavy(_Retriever()),
+        agents=agents,
+        extra_main_tools=[SimpleNamespace(name="company_web_crawl")],
+        extra_subagent_tools=[SimpleNamespace(name="mcp_order_lookup")],
+    )
+
+    assert "company_web_crawl" in {tool.name for tool in captured["tools"]}
+    assert "mcp_order_lookup" not in {tool.name for tool in captured["tools"]}
+    policy = next(
+        item for item in captured["middleware"] if isinstance(item, ToolPolicyMiddleware)
+    ).policy
+    assert policy.allows("company_web_crawl")
+    assert not policy.allows("mcp_order_lookup")
 
 
 def _env(method: str, data: Any, seq: int = 1) -> dict:

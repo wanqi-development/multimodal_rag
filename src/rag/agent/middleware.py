@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
 from langchain_core.messages import ToolMessage
 
 logger = logging.getLogger("rag.agent.tool")
@@ -28,11 +29,14 @@ ARGS_PREVIEW = 200
 KNOWLEDGE_TOOLS = frozenset(
     {
         "search_knowledge",
+        "search_relationships",
         "list_documents",
         "get_section",
         "web_search_tool",
+        "web_fetch_tool",
     }
 )
+STRUCTURED_OUTPUT_TOOLS = frozenset({"EvidenceResult"})
 READ_ONLY_FILE_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
 REPORT_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
 
@@ -47,23 +51,50 @@ class ToolPolicy:
 
     mode: str
     allowed: frozenset[str]
+    allowed_subagents: frozenset[str] = frozenset()
 
     @classmethod
-    def readonly(cls) -> ToolPolicy:
+    def readonly(
+        cls,
+        *,
+        allowed_subagents: frozenset[str] = frozenset(),
+        extra_tools: frozenset[str] = frozenset(),
+    ) -> ToolPolicy:
+        allowed = KNOWLEDGE_TOOLS | READ_ONLY_FILE_TOOLS | extra_tools
+        if allowed_subagents:
+            allowed = allowed | {"task"}
         return cls(
             mode="readonly",
-            allowed=KNOWLEDGE_TOOLS | READ_ONLY_FILE_TOOLS,
+            allowed=allowed,
+            allowed_subagents=allowed_subagents,
         )
 
     @classmethod
-    def report(cls) -> ToolPolicy:
+    def report(
+        cls,
+        *,
+        allowed_subagents: frozenset[str] = frozenset(),
+        extra_tools: frozenset[str] = frozenset(),
+    ) -> ToolPolicy:
+        allowed = KNOWLEDGE_TOOLS | READ_ONLY_FILE_TOOLS | REPORT_WRITE_TOOLS | extra_tools
+        if allowed_subagents:
+            allowed = allowed | {"task"}
         return cls(
             mode="report",
-            allowed=KNOWLEDGE_TOOLS | READ_ONLY_FILE_TOOLS | REPORT_WRITE_TOOLS,
+            allowed=allowed,
+            allowed_subagents=allowed_subagents,
         )
+
+    @classmethod
+    def exact(cls, allowed: frozenset[str]) -> ToolPolicy:
+        """子 Agent 精确白名单：没有列出的工具不可见、不可执行。"""
+        return cls(mode="subagent", allowed=allowed | STRUCTURED_OUTPUT_TOOLS)
 
     def allows(self, name: str) -> bool:
         return name in self.allowed
+
+    def allows_task(self, subagent: str) -> bool:
+        return bool(subagent) and subagent in self.allowed_subagents
 
 
 def _tool_name(tool: Any) -> str | None:
@@ -100,18 +131,41 @@ class ToolPolicyMiddleware(AgentMiddleware):
     def _rejection(self, request: Any) -> ToolMessage | None:
         call = getattr(request, "tool_call", None) or {}
         name = str(call.get("name") or "")
+        subagent = ""
         if self.policy.allows(name):
-            return None
-        logger.warning(
-            "工具策略拒绝：tool=%s mode=%s",
-            name or "?",
-            self.policy.mode,
-        )
+            if name != "task":
+                return None
+            args = call.get("args") if isinstance(call, dict) else None
+            subagent = str((args or {}).get("subagent_type") or "")
+            if self.policy.allows_task(subagent):
+                return None
+            reason = (
+                f"子 Agent {subagent or '?'} 不在本次允许清单中。"
+                f"可用：{', '.join(sorted(self.policy.allowed_subagents)) or '无'}。"
+            )
+        else:
+            reason = f"工具 {name or '?'} 在当前 {self.policy.mode} 策略下不可用。"
+        if name == "task":
+            logger.warning(
+                "子 Agent 策略拒绝：subagent=%s allowed=%s",
+                subagent,
+                ",".join(sorted(self.policy.allowed_subagents)),
+            )
+        else:
+            logger.warning(
+                "工具策略拒绝：tool=%s mode=%s",
+                name or "?",
+                self.policy.mode,
+            )
+        if name != "task":
+            return ToolMessage(
+                content=(reason + "请继续使用已开放的工具，不要重试这个调用。"),
+                tool_call_id=str(call.get("id") or ""),
+                name=name or None,
+                status="error",
+            )
         return ToolMessage(
-            content=(
-                f"工具 {name or '?'} 在当前 {self.policy.mode} 策略下不可用。"
-                "请继续使用已开放的工具，不要重试这个调用。"
-            ),
+            content=reason,
             tool_call_id=str(call.get("id") or ""),
             name=name or None,
             status="error",
@@ -183,3 +237,65 @@ class ToolErrorMiddleware(AgentMiddleware):
             tool_call_id=str(call.get("id") or ""),
             status="error",
         )
+
+
+class ToolCallBudgetMiddleware(ToolCallLimitMiddleware):
+    """限制一个 Agent 实例内实际执行的工具数量。
+
+    计数存放在 LangGraph 的 run state 中，因此每次子 Agent `task` 调用都会自动
+    从 0 开始；达到预算后继续保留结构化输出工具，使模型基于已有证据收尾。
+    """
+
+    def __init__(
+        self,
+        max_calls: int,
+        *,
+        protected: frozenset[str] = STRUCTURED_OUTPUT_TOOLS,
+        note: str = "",
+    ) -> None:
+        if max_calls < 1:
+            raise ValueError("max_calls 必须大于 0")
+        super().__init__(run_limit=max_calls, exit_behavior="continue")
+        self.protected = protected
+        self.max_calls = max_calls
+        self.note = note or (
+            "本次工具预算已用完。不要继续调用工具，基于已经取得的证据回答；资料不足的部分明确说明。"
+        )
+
+    def _matches_tool_filter(self, tool_call: Any) -> bool:
+        """结构化输出不算业务工具；其余工具都计入 run 预算。"""
+        return str(tool_call.get("name") or "") not in self.protected
+
+    def _localize(self, result: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not result or not result.get("messages"):
+            return result
+        return {
+            **result,
+            "messages": [
+                message.model_copy(update={"content": self.note})
+                if isinstance(message, ToolMessage) and message.status == "error"
+                else message
+                for message in result["messages"]
+            ],
+        }
+
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return self._localize(super().after_model(state, runtime))
+
+    async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return self._localize(await super().aafter_model(state, runtime))
+
+    def _visible(self, request: Any) -> Any:
+        state = getattr(request, "state", None) or {}
+        counts = state.get("run_tool_call_count") or {}
+        exhausted = int(counts.get("__all__", 0)) >= self.max_calls
+        if not exhausted:
+            return request
+        tools = [tool for tool in request.tools if _tool_name(tool) in self.protected]
+        return request.override(tools=tools)
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        return handler(self._visible(request))
+
+    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        return await handler(self._visible(request))

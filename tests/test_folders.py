@@ -7,6 +7,7 @@ HTTP 那几个端点走 `TestClient` —— 与 `test_api_documents.py` 同一�
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,39 @@ def test_assign_moves_documents_between_folders(store: FolderStore) -> None:
     assert store.assign(["doc1"], right.id) == 1
     assert store.assign(["doc1", "doc2"], None) == 2, "移回未分类"
     assert store.members() == {}
+
+
+def test_on_disk_members_are_grouped_by_folder_id(store: FolderStore) -> None:
+    folder = store.create("Flink")
+    empty = store.create("空目录")
+    store.assign(["doc1", "doc2"], folder.id)
+
+    payload = json.loads((store.root / "_folders.json").read_text("utf-8"))
+
+    assert payload["members"] == {folder.id: ["doc1", "doc2"]}
+    assert empty.id not in payload["members"], "空目录不写 members 键"
+    assert store.members() == {"doc1": folder.id, "doc2": folder.id}
+
+
+def test_legacy_document_to_folder_members_are_migrated_on_next_write(store: FolderStore) -> None:
+    folder = store.create("Flink")
+    path = store.root / "_folders.json"
+    path.write_text(
+        json.dumps(
+            {
+                "folders": [{"id": folder.id, "name": folder.name, "parent": None}],
+                "members": {"legacy-doc": folder.id},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = FolderStore(store.root)
+    assert loaded.members() == {"legacy-doc": folder.id}
+
+    loaded.assign(["new-doc"], folder.id)
+    payload = json.loads(path.read_text("utf-8"))
+    assert payload["members"] == {folder.id: ["legacy-doc", "new-doc"]}
 
 
 def test_assigning_to_an_unknown_folder_is_rejected(store: FolderStore) -> None:

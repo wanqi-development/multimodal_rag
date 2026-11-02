@@ -1,22 +1,15 @@
 // 后端接口的薄封装。**只做三件事**：带 X-API-Key、拼 URL、把 SSE 拆成事件。
 //
 // 一个关键选择：**流式用 fetch 读，不用 EventSource** —— EventSource 不能自定义请求头，
-// 而我们的 /chat 与 /agent 都要 X-API-Key。fetch + ReadableStream 还能顺手支持取消
+// 而 /agent 与日志流都要 X-API-Key。fetch + ReadableStream 还能顺手支持取消
 // （浏览器关页面/点停止时 abort，后端那套断线取消正好接上）。
 
 import type { S } from './generated/openapi'
 
 type RequiredSchema<K extends keyof S> = Required<S[K]>
 
-export type Hit = RequiredSchema<'HitView'>
-export type Stats = RequiredSchema<'StatsView'>
 export type Citation = RequiredSchema<'CitationView'>
 export type Chunk = RequiredSchema<'ChunkView'>
-export type SearchResponse = Omit<RequiredSchema<'SearchResponse'>, 'hits' | 'stats'> & {
-  hits: Hit[]
-  stats: Stats[]
-}
-export type ImageUpload = RequiredSchema<'ImageUploadView'>
 export type TranscribeResult = RequiredSchema<'TranscribeResponse'>
 
 // 图片 blob 缓存：同一个路径只拉一次。
@@ -172,34 +165,6 @@ export async function streamLogs(
   })
 }
 
-export function search(body: {
-  query: string
-  top_k?: number
-  rerank?: boolean
-  channels?: string[]
-  /** **以图搜图**：服务端路径，由 `uploadSearchImage` 给。给了它，`query` 可以留空。 */
-  image_path?: string
-}): Promise<SearchResponse> {
-  return json('/search', { method: 'POST', body: JSON.stringify(body) })
-}
-
-/**
- * 上传一张图给「以图搜图」。**只上传、不搜** —— 返回服务端路径，页面再拿它去调 `/search`。
- *
- * 分开的理由：`/search` 要过线上 embedding（按量计费），而「传了图还没点搜」是常态；
- * 分开之后重搜、换词、调 top_k 都不用重传图上。与文档上传同理：
- * **不要手写 `Content-Type`**，boundary 得由浏览器填。
- */
-export async function uploadSearchImage(
-  file: File,
-): Promise<ImageUpload> {
-  const form = new FormData()
-  form.append('file', file)
-  const res = await fetch('/search/image', { method: 'POST', body: form })
-  if (!res.ok) throw await failure(res)
-  return (await res.json()) as ImageUpload
-}
-
 // ---- 文档：上传 → 解析 → 人工核对标题 → 切分 → 入库（页面那五步）----
 
 /** 一份上传件走到哪一步（页面上那排步骤灯用它）。 */
@@ -315,13 +280,14 @@ export function sourceUrl(docId: string): string {
   return `/documents/${encodeURIComponent(docId)}/source`
 }
 
-export type SourceKind = 'html' | 'pdf' | 'image' | 'text' | 'other'
+export type SourceKind = 'html' | 'pdf' | 'docx' | 'image' | 'text' | 'other'
 
 /** 原文怎么展示：按后缀定（`content_type` 只有抓来的文件才有，上传件没有）。 */
 export function sourceKindOf(name: string): SourceKind {
   const suffix = (name.split('.').pop() ?? '').toLowerCase()
   if (suffix === 'html' || suffix === 'htm') return 'html'
   if (suffix === 'pdf') return 'pdf'
+  if (suffix === 'docx') return 'docx'
   if (['png', 'jpg', 'jpeg', 'bmp', 'tif', 'tiff'].includes(suffix)) return 'image'
   if (['md', 'markdown', 'txt', 'log', 'rst', 'csv'].includes(suffix)) return 'text'
   return 'other'
@@ -341,7 +307,7 @@ export async function uploadDocuments(files: File[]): Promise<UploadResult> {
 
 /**
  * 语音转文字（对话页那个麦克风）。**只转文字**：音频不落盘、不落库、不进会话 ——
- * 页面把它放进输入框让人改，改完再走 `/chat`。
+ * 页面把它放进输入框让人改，改完再走 `/agent`。
  *
  * 前端录的是 16kHz 单声道 wav（见 `ChatView.vue` 的录音那一段）：不用 `MediaRecorder`
  * 是因为它默认出 webm/opus，而 ASR 那一侧对 webm 没有保证。
@@ -434,20 +400,6 @@ export function assetBlob(path: string): Promise<string> {
   return task
 }
 
-export interface ChatEvent {
-  type: 'retrieval' | 'token' | 'done' | 'error'
-  text?: string
-  hits?: Hit[]
-  stats?: Stats[]
-  citations?: Citation[]
-  session_id?: string | null
-  usage?: Usage | null
-  rounds?: number
-  grade?: Record<string, unknown>
-  mode?: string
-  message?: string
-}
-
 /** 一条工具调用。`args` 是后端截过的预览（长正文会被截断），`ms` 是从「看到调用」到「看到结果」。 */
 export interface ToolStep {
   name: string
@@ -469,8 +421,11 @@ export interface Interrupt {
 }
 
 export interface AgentEvent {
-  type: 'token' | 'tool' | 'interrupt' | 'done' | 'error'
+  type: 'status' | 'token' | 'tool' | 'interrupt' | 'done' | 'error'
   text?: string
+  phase?: string
+  message?: string
+  tool?: string
   name?: string
   status?: string
   args?: Record<string, unknown>
@@ -483,7 +438,6 @@ export interface AgentEvent {
   thread_id?: string | null
   session_id?: string | null
   usage?: Usage | null
-  message?: string
 }
 
 /** 一段会话或一轮问答的 token 用量。 */
@@ -532,7 +486,7 @@ export async function deleteSession(sessionId: string): Promise<void> {
 }
 
 /**
- * 把 SSE 响应拆成一个个事件。`/chat`、`/agent`、`/agent/resume` **共用这一段**。
+ * 把 SSE 响应拆成一个个事件。`/agent`、`/agent/resume`、日志流**共用这一段**。
  *
  * 用 `fetch` + `ReadableStream` 而不是 `EventSource`：后者不能自定义请求头，而这几个端点
  * 都要 `X-API-Key`；`fetch` 还能 abort（页面上的「停止」直接触发后端那套断线取消）。
@@ -566,27 +520,6 @@ async function readSse(
       index = buffer.indexOf('\n\n')
     }
   }
-}
-
-/** 流式问答（`/chat`）：定制链路，单轮、无历史。 */
-export async function streamChat(
-  body: {
-    question: string
-    top_k?: number
-    graph?: boolean
-    rerank?: boolean
-    session_id?: string | null
-  },
-  onEvent: (event: ChatEvent) => void,
-  signal?: AbortSignal,
-): Promise<void> {
-  const res = await fetch('/chat', {
-    method: 'POST',
-    headers: headers(),
-    body: JSON.stringify({ ...body, stream: true }),
-    signal,
-  })
-  await readSse(res, (name, data) => onEvent({ type: name as ChatEvent['type'], ...data }))
 }
 
 /** 流式 agent（`/agent`）：让模型自己决定查什么，多轮靠 `thread_id`。 */
