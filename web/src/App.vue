@@ -5,7 +5,6 @@ import { onMounted, onUnmounted } from 'vue'
 import ChatView from './views/ChatView.vue'
 import DocumentsView from './views/DocumentsView.vue'
 import LogsView from './views/LogsView.vue'
-import SearchView from './views/SearchView.vue'
 import NavRail from './components/NavRail.vue'
 import DetailPane from './components/DetailPane.vue'
 import { closeDetail, detail, page, ping, setTheme, theme } from './state'
@@ -35,8 +34,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
   <div class="app">
     <NavRail />
     <main class="main">
-      <SearchView v-if="page === 'search'" />
-      <ChatView v-else-if="page === 'chat'" />
+      <ChatView v-if="page === 'chat'" />
       <DocumentsView v-else-if="page === 'documents'" />
       <LogsView v-else-if="page === 'logs'" />
     </main>

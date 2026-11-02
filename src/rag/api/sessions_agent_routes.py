@@ -30,7 +30,7 @@ def _session_view(row: dict) -> SessionView:
     return SessionView(
         session_id=row["session_id"],
         title=row.get("title") or "",
-        mode=row.get("mode") or "chat",
+        mode=row.get("mode") or "agent",
         thread_id=row.get("thread_id"),
         turns=int(row.get("turns") or 0),
         created_at=row.get("created_at"),
@@ -59,7 +59,7 @@ async def list_sessions(limit: int = 20, components=Depends(get_components)) -> 
     """UI 会话列表。
 
     **和 `rag sessions` 不是一回事**：那个管的是 LangGraph checkpointer 的残留 thread，
-    这里是我们自己的对话记录（快问答也有）。表结构见 `persistence/chat.py`。
+    这里是我们自己的对话记录。表结构见 `persistence/chat.py`。
     token 合计一起给 —— 列表上就要显示「这段花了多少」，别让界面再来一次。
     """
     rows = await _chats(components).list(limit=max(1, min(limit, 100)))
@@ -84,7 +84,7 @@ async def get_session(session_id: str, components=Depends(get_components)) -> Se
     return SessionDetailResponse(
         session_id=found["session_id"],
         title=found.get("title") or "",
-        mode=found.get("mode") or "chat",
+        mode=found.get("mode") or "agent",
         thread_id=found.get("thread_id"),
         created_at=found.get("created_at"),
         updated_at=found.get("updated_at"),
@@ -105,15 +105,15 @@ async def delete_session(session_id: str, components=Depends(get_components)) ->
 async def agent(body: AgentRequest, components=Depends(get_components)) -> AgentResponse:
     """对话式 agent（M5，deepagents）。
 
-    与 `/chat` 的区别：`/chat` 走我们定好的直线或 QueryGraph；这里**让模型自己决定**
-    要不要查、查几轮、派给哪个子 agent。代价是 LLM 调用次数多得多。
+    `/agent` 是唯一问答入口。主 Agent 自己判断意图、调用哪个专业子 Agent；
+    网络搜索和网页抓取仍由主 Agent 直接调用。
 
     批次 B：agent 落在 `data/workspace` 上（`agent.workspace_writes` 可关回只读），
     但**写类工具一律等人批准** —— 撞上闸门时返回 `status="interrupted"` 与
     `interrupt.action_requests`，客户端看完调 `/agent/resume` 放行或拒绝。
     多轮靠 `thread_id`（历史与中断状态都在 PG 的 checkpointer 里，重启还在）。
 
-    `stream=true` 走 SSE，四种事件：`token` / `tool` / `interrupt` / `done`。
+    `stream=true` 走 SSE，五类事件：`status` / `token` / `tool` / `interrupt` / `done`。
     """
     if body.stream:
         return StreamingResponse(
@@ -181,9 +181,10 @@ async def agent_resume(
 
 
 async def _sse_events(source):
-    """把 agent 事件源翻成 SSE。心跳与断线取消与 `/chat` 同一套（自己写，不引 sse_starlette）。
+    """把 agent 事件源翻成 SSE。心跳与断线取消自己写，不引 sse_starlette。
 
-    事件类型：`token`（主 agent 的正文增量）、`tool`（某次工具调用结束）、
+    事件类型：`status`（当前正在理解/检索/整理/生成）、`token`（主 agent 的正文增量）、
+    `tool`（某次工具调用结束）、
     `interrupt`（等人批准，流到此为止）、`done`（跑完，带引用）。
 
     **收的是一个异步迭代器，不是一个请求体**：`/agent` 与 `/agent/resume` 的起点不同
@@ -198,6 +199,8 @@ async def _sse_events(source):
                 kind = event["type"]
                 if kind == "token":
                     await queue.put(("token", event["text"]))
+                elif kind == "status":
+                    await queue.put(("status", event))
                 elif kind == "tool":
                     await queue.put(("tool", event))
                 elif kind == "interrupt":
@@ -222,6 +225,15 @@ async def _sse_events(source):
                 continue
             if kind == "token":
                 yield _event("token", {"text": payload})
+            elif kind == "status":
+                yield _event(
+                    "status",
+                    {
+                        "phase": payload.get("phase"),
+                        "message": payload.get("message"),
+                        "tool": payload.get("tool"),
+                    },
+                )
             elif kind == "tool":
                 yield _event("tool", payload)
             elif kind == "interrupt":

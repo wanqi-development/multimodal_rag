@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage
 from rag.config.schema import Settings
 from rag.contracts import AssembledContext, Chunk, ScoredChunk
 from rag.graphs.answer import AnswerEngine
+from rag.graphs.verification import AnswerVerifier
 
 
 def _hit(chunk_id: str = "d1:0001") -> ScoredChunk:
@@ -171,3 +172,40 @@ def test_stream_gets_graph_preflight_before_its_first_token(
         "output_tokens": 5,
         "total_tokens": 15,
     }
+
+
+def test_answer_and_stream_emit_low_faithfulness_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retriever = _Retriever()
+    _patch_retriever(monkeypatch, retriever)
+
+    async def faithfulness(question: str, answer: str, contexts: list[str]) -> float:
+        assert question == "Savepoint 是什么"
+        assert answer == "答案 [1]"
+        assert contexts == ["Savepoint 是作业状态的一致快照。"]
+        return 0.2
+
+    verifier = AnswerVerifier(threshold=0.5, timeout_s=1, faithfulness=faithfulness)
+    engine = AnswerEngine(
+        _settings(graph=False),
+        object(),
+        _Heavy(_Chat()),
+        verifier=verifier,
+    )
+
+    answer = asyncio.run(engine.answer("Savepoint 是什么", 5))
+
+    async def collect() -> list[dict[str, Any]]:
+        return [event async for event in engine.stream("Savepoint 是什么", 5)]
+
+    events = asyncio.run(collect())
+    verification = [event for event in events if event["type"] == "verification"]
+
+    assert answer.verification is not None
+    assert answer.verification["status"] == "low"
+    assert answer.verification["can_search_web"] is True
+    assert len(verification) == 1
+    assert verification[0]["verification"]["score"] == 0.2
+    assert events[-1]["type"] == "done"
+    assert events[-1]["verification"]["status"] == "low"

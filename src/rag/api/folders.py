@@ -75,8 +75,9 @@ class FolderStore:
         ]
 
     def members(self) -> dict[str, str]:
-        """`doc_id → 目录 id`。没归属的文档不在里面（等价于「未分类」）。"""
-        return dict(self._load()["members"])
+        """对外仍返回 `doc_id → 目录 id`，页面无需理解磁盘上的反向数组。"""
+        grouped = self._load()["members"]
+        return {doc_id: folder_id for folder_id, doc_ids in grouped.items() for doc_id in doc_ids}
 
     # ---- 写 ----
 
@@ -133,9 +134,7 @@ class FolderStore:
         if any(item["parent"] == folder_id for item in payload["folders"]):
             raise FolderError("这个目录里还有子目录，先把它们删掉或搬走")
         payload["folders"] = [item for item in payload["folders"] if item["id"] != folder_id]
-        moved = [key for key, value in payload["members"].items() if value == folder_id]
-        for key in moved:
-            payload["members"].pop(key, None)
+        moved = payload["members"].pop(folder_id, [])
         self._save(payload)
         return len(moved)
 
@@ -147,9 +146,10 @@ class FolderStore:
         changed = 0
         for doc_id in doc_ids:
             if folder_id is None:
-                changed += 1 if payload["members"].pop(doc_id, None) is not None else 0
-            elif payload["members"].get(doc_id) != folder_id:
-                payload["members"][doc_id] = folder_id
+                changed += 1 if _remove_doc(payload, doc_id) else 0
+            elif doc_id not in payload["members"].get(folder_id, []):
+                _remove_doc(payload, doc_id)
+                payload["members"].setdefault(folder_id, []).append(doc_id)
                 changed += 1
         self._save(payload)
         return changed
@@ -157,10 +157,10 @@ class FolderStore:
     def forget(self, doc_ids: Sequence[str]) -> None:
         """文档被删掉时跟着清归属（否则 `_folders.json` 里会堆死记录）。"""
         payload = self._load()
-        if not any(doc_id in payload["members"] for doc_id in doc_ids):
+        if not any(doc_id in _all_member_ids(payload) for doc_id in doc_ids):
             return
         for doc_id in doc_ids:
-            payload["members"].pop(doc_id, None)
+            _remove_doc(payload, doc_id)
         self._save(payload)
 
     # ---- 内部 ----
@@ -186,14 +186,42 @@ class FolderStore:
             for item in payload.get("folders") or []
             if isinstance(item, dict) and item.get("id") and item.get("name")
         ]
-        members = {
-            str(key): str(value)
-            for key, value in (payload.get("members") or {}).items()
-            if isinstance(value, str)
-        }
+        folder_ids = {item["id"] for item in folders}
+        raw_members = payload.get("members") or {}
+        grouped: dict[str, list[str]] = {}
+        if isinstance(raw_members, dict):
+            legacy = all(isinstance(value, str) for value in raw_members.values())
+            if legacy:
+                for doc_id, folder_id in raw_members.items():
+                    if str(folder_id) in folder_ids:
+                        grouped.setdefault(str(folder_id), []).append(str(doc_id))
+            else:
+                for folder_id, doc_ids in raw_members.items():
+                    if str(folder_id) not in folder_ids or not isinstance(doc_ids, list):
+                        continue
+                    grouped[str(folder_id)] = [str(doc_id) for doc_id in doc_ids]
+        # 一份文档只保留第一次出现的归属；空数组不写回文件。
+        seen: set[str] = set()
+        members: dict[str, list[str]] = {}
+        for folder_id, doc_ids in grouped.items():
+            kept: list[str] = []
+            for doc_id in doc_ids:
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                kept.append(doc_id)
+            if kept:
+                members[folder_id] = kept
         return {"folders": folders, "members": members}
 
     def _save(self, payload: dict[str, Any]) -> None:
+        folder_ids = {str(item["id"]) for item in payload["folders"]}
+        members = {
+            str(folder_id): list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+            for folder_id, doc_ids in payload["members"].items()
+            if str(folder_id) in folder_ids and doc_ids
+        }
+        payload = {"folders": payload["folders"], "members": members}
         path = self.root / FOLDERS_NAME
         tmp = path.with_suffix(path.suffix + ".part")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -288,6 +316,23 @@ def _new_id(payload: dict[str, Any]) -> str:
         if candidate not in taken:
             return candidate
     raise FolderError("目录 id 抽不出来（树太大了？）")
+
+
+def _all_member_ids(payload: dict[str, Any]) -> set[str]:
+    return {str(doc_id) for doc_ids in payload["members"].values() for doc_id in doc_ids}
+
+
+def _remove_doc(payload: dict[str, Any], doc_id: str) -> bool:
+    removed = False
+    for folder_id, doc_ids in list(payload["members"].items()):
+        kept = [item for item in doc_ids if item != doc_id]
+        if len(kept) != len(doc_ids):
+            removed = True
+        if kept:
+            payload["members"][folder_id] = kept
+        else:
+            payload["members"].pop(folder_id, None)
+    return removed
 
 
 def build_folder_store(settings: Any) -> FolderStore:

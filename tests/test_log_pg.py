@@ -60,7 +60,7 @@ def test_a_business_row_carries_category_status_and_duration() -> None:
         _record(
             row={
                 "category": "interface",
-                "text": "POST /chat 200 12ms",
+                "text": "POST /agent 200 12ms",
                 "status": 200,
                 "duration_ms": 12.4,
             }
@@ -73,7 +73,7 @@ def test_a_business_row_carries_category_status_and_duration() -> None:
     assert row["source"] == "http", "入口是 HTTP，不从 id 前缀反推"
     assert row["logger"] == "rag.interface"
     assert row["status"] == 200 and row["duration_ms"] == 12, "耗时列是 int 毫秒"
-    assert row["text"] == "POST /chat 200 12ms"
+    assert row["text"] == "POST /agent 200 12ms"
     assert row["ts"].tzinfo is not None, "时间要带时区（列是 timestamptz）"
 
 

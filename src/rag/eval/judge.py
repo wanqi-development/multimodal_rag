@@ -18,8 +18,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from rag.eval.dataset import GoldenCase
-
 AskFn = Callable[[str], Awaitable[str]]
 
 SYSTEM = "你是严格的检索评测员。只输出要求的 JSON，不要解释、不要复述规则。"
@@ -92,6 +90,12 @@ def _render_points(points: tuple[str, ...]) -> str:
     return "\n".join(f"- {point}" for point in points)
 
 
+def used_citations(answer: str, citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """只保留答案正文里真的出现过的引用编号。"""
+    used = {int(match) for match in re.findall(r"\[(\d+)\]", answer)}
+    return [item for item in citations if item.get("index") in used]
+
+
 def parse_verdict(text: str) -> JudgeVerdict:
     """从模型输出里抠出那个 JSON。
 
@@ -135,14 +139,19 @@ def _as_bool(value: Any) -> bool:
 
 
 async def judge_case(
-    ask: AskFn, case: GoldenCase, *, answer: str, citations: list[dict[str, Any]]
+    ask: AskFn,
+    *,
+    question: str,
+    answer: str,
+    citations: list[dict[str, Any]],
+    answer_points: tuple[str, ...] = (),
 ) -> JudgeVerdict:
     """判一条问题。`ask` 是「prompt → 模型原文」，这样这一层能注入假模型单测。"""
     prompt = PROMPT.format(
-        question=case.question,
+        question=question,
         answer=answer or "（空答案）",
         citations=_render_citations(citations),
-        points=_render_points(case.answer_points),
+        points=_render_points(answer_points),
     )
     reply = await ask(prompt)
     verdict = parse_verdict(reply)

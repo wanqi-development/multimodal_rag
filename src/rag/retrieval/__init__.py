@@ -13,9 +13,9 @@
 （`name` / `type` / …）。只有一路时**原样返回它**（不包一层），保持单路行为与性能不变。
 `type` 怎么找到适配器见 ``retrieval/plugins.py``（内置注册表 → entry points → 点路径）。
 
-**谁在调这一段**：检索页、快问答（StateGraph 的 retrieve 节点）、agent 的
-``search_knowledge`` 工具 —— 三处共用 ``build_retriever``，所以"一次工具调用 = 一次
-融合检索"。关键词不再有独立通道（2026-10-08）：它就是 Milvus 那一路的 sparse 腿。
+**谁在调这一段**：CLI、AnswerEngine（StateGraph 的 retrieve 节点）以及
+`policy-document` / `relationship-graph` 子 Agent 的检索工具，都共用
+``build_retriever``。关键词不再有独立通道：它就是 Milvus 那一路的 sparse 腿。
 """
 
 from __future__ import annotations
@@ -26,14 +26,19 @@ from rag.indexing.milvus import MilvusIndex
 from rag.retrieval.assembler import assemble, estimate_tokens
 from rag.retrieval.channels import MilvusHybridRetriever
 from rag.retrieval.fusion import rrf_fuse
+from rag.retrieval.hyde import HydeFn, HyDERetriever, build_hyde, configured_hyde
 from rag.retrieval.multichannel import MultiChannelRetriever, RetrievalError
 from rag.retrieval.plugins import resolve_channel_type
 
 __all__ = [
     "MilvusHybridRetriever",
     "MultiChannelRetriever",
+    "HyDERetriever",
+    "HydeFn",
     "RetrievalError",
     "assemble",
+    "build_hyde",
+    "configured_hyde",
     "build_channel",
     "build_retriever",
     "estimate_tokens",
@@ -47,6 +52,8 @@ def build_retriever(
     index: MilvusIndex,
     embedder: Embedder,
     reranker: Reranker | None = None,
+    *,
+    hyde: HydeFn | None = None,
 ) -> Retriever:
     """**按配置里那张表装配**：每一路 = 一个数据源，多路就 L2 融合成一路。
 
@@ -70,6 +77,19 @@ def build_retriever(
         raise ValueError("retrieval.channels 里一路都没启用：检索没有数据源可用")
     channels = [build_channel(item, settings, index, embedder) for item in enabled]
     limits = {item.name: item.top_k for item in enabled if item.top_k}
+    if cfg.transform.hyde:
+        if hyde is None:
+            raise ValueError(
+                "retrieval.transform.hyde 开着，但没有传 HyDE 生成函数；"
+                "调用方要用当前 chat 模型构造 build_hyde(chat)。"
+            )
+        return HyDERetriever(
+            MultiChannelRetriever(channels, cfg.fusion, limits=limits),
+            MultiChannelRetriever(channels, cfg.fusion, limits=limits),
+            reranker,
+            cfg.fusion,
+            generate=hyde,
+        )
     if len(channels) == 1 and reranker is None:
         # 单路（也是默认档）：原样返回，不包一层 —— 保持单路的行为与性能不变
         return channels[0]

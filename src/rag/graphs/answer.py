@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from rag.config.schema import Settings
 from rag.contracts import AssembledContext, ChannelStats, Citation, ScoredChunk
 from rag.graphs.query import build_query_preflight, run_query_preflight
+from rag.graphs.verification import AnswerVerifier
 from rag.graphs.wiring import build_json_caller
 
 
@@ -35,6 +36,7 @@ class AnswerRun(BaseModel):
     grade: dict[str, Any] = Field(default_factory=dict)
     mode: str
     usage: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
 
 
 class AnswerEngine:
@@ -44,10 +46,18 @@ class AnswerEngine:
     都从同一个 `PreparedAnswer` 出发，避免 `stream=true` 绕过检索纠错。
     """
 
-    def __init__(self, settings: Settings, index: Any, heavy: Any) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        index: Any,
+        heavy: Any,
+        *,
+        verifier: AnswerVerifier | None = None,
+    ) -> None:
         self.settings = settings
         self.index = index
         self.heavy = heavy
+        self.verifier = verifier
 
     async def prepare(
         self,
@@ -100,6 +110,7 @@ class AnswerEngine:
             prepared.context,
             usage=usage,
         )
+        verification = await self._verify(question, answer, prepared)
         return AnswerRun(
             answer=answer,
             hits=prepared.hits,
@@ -109,6 +120,7 @@ class AnswerEngine:
             grade=prepared.grade,
             mode=prepared.mode,
             usage=usage or None,
+            verification=verification,
         )
 
     async def stream(
@@ -137,15 +149,33 @@ class AnswerEngine:
         ):
             pieces.append(piece)
             yield {"type": "token", "text": piece}
+        answer = "".join(pieces)
+        verification = await self._verify(question, answer, prepared)
+        if verification is not None:
+            yield {"type": "verification", "verification": verification}
         yield {
             "type": "done",
-            "answer": "".join(pieces),
+            "answer": answer,
             "citations": prepared.context.citations,
             "rounds": prepared.rounds,
             "grade": prepared.grade,
             "mode": prepared.mode,
             "usage": usage or None,
+            "verification": verification,
         }
+
+    async def _verify(
+        self, question: str, answer: str, prepared: PreparedAnswer
+    ) -> dict[str, Any] | None:
+        if self.verifier is None:
+            return None
+        by_id = {hit.chunk.chunk_id: hit.chunk.text for hit in prepared.hits}
+        contexts = [
+            by_id[item.chunk_id]
+            for item in prepared.context.citations
+            if item.source_type == "corpus" and item.chunk_id in by_id
+        ]
+        return await self.verifier.verify(question, answer, contexts)
 
     async def _retrieve(
         self,
@@ -155,7 +185,7 @@ class AnswerEngine:
         filters: dict[str, Any] | None = None,
         channels: list[str] | None = None,
     ) -> tuple[list[ScoredChunk], list[ChannelStats]]:
-        from rag.retrieval import build_retriever
+        from rag.retrieval import build_retriever, configured_hyde
 
         local = self.settings.model_copy(deep=True)
         if channels:
@@ -167,6 +197,7 @@ class AnswerEngine:
             self.index,
             self.heavy.embedder,
             self.heavy.reranker,
+            hyde=configured_hyde(local, self.heavy.chat),
         )
         hits = await retriever.retrieve(query, top_k, filters=filters)
         return hits, getattr(retriever, "last_stats", [])
@@ -177,5 +208,11 @@ class AnswerEngine:
         return assemble(hits, self.settings.retrieval.assemble.max_tokens)
 
 
-def build_answer_engine(settings: Settings, index: Any, heavy: Any) -> AnswerEngine:
-    return AnswerEngine(settings, index, heavy)
+def build_answer_engine(
+    settings: Settings,
+    index: Any,
+    heavy: Any,
+    *,
+    verifier: AnswerVerifier | None = None,
+) -> AnswerEngine:
+    return AnswerEngine(settings, index, heavy, verifier=verifier)

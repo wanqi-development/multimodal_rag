@@ -9,6 +9,7 @@
 import { computed, ref } from 'vue'
 import { AlertTriangle, Check, ChevronDown, ChevronRight } from 'lucide-vue-next'
 import type { ChunkSummary, IndexSummary } from '../api'
+import { fillParentNumbers } from '../outline-number'
 
 const props = defineProps<{
   chunks: ChunkSummary
@@ -127,6 +128,7 @@ const tree = computed<OutlineNode[]>(() => {
     node.subChars = chars
   }
   for (const node of roots) rollup(node)
+  fillParentNumbers(roots)
   return roots
 })
 

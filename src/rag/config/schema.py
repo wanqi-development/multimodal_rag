@@ -557,10 +557,11 @@ class HybridChannelConfig(BaseModel):
 
 
 class TransformConfig(BaseModel):
-    """查询变换。multi_query=0 表示关闭。"""
+    """查询变换。HyDE 已接；multi_query=0 表示关闭。"""
 
     multi_query: int = 0
     hyde: bool = False
+    hyde_max_chars: int = Field(600, ge=100, le=2000)
 
 
 class RetrievalRerankConfig(BaseModel):
@@ -590,7 +591,7 @@ class GraphChannelConfig(BaseModel):
     uri: str = "bolt://127.0.0.1:7687"
     user: str = "neo4j"
     # 最多走几跳：1 跳 = 邻居关系，2 跳 = 「邻居的邻居」。跳数一涨，召回面与噪声一起涨，
-    # 所以默认 2 而不是 3 —— 多跳的真实收益要用 rag eval 量，别凭感觉加。
+    # 所以默认 2 而不是 3 —— 多跳收益要用真实检索快照评测，别凭感觉加。
     hops: int = 2
     # 问题里最多认几个实体、每个实体最多取几条边：都是给「问句很长 + 热门实体」兜底的，
     # 不设上限的话「Flink」一个词就能拉回几百条边，融合层直接被它淹掉
@@ -809,6 +810,15 @@ class GraphConfig(BaseModel):
     index_concurrency: int = 1
 
 
+class AnswerVerificationConfig(BaseModel):
+    """可选的答案忠实度核验；ragas 懒加载。Web 快问答入口已移除，
+    当前保留给离线评测或后续 Agent 后置核验。"""
+
+    enabled: bool = False
+    threshold: float = Field(0.5, ge=0.0, le=1.0)
+    timeout_s: float = Field(15.0, gt=0.0)
+
+
 class AgentConfig(BaseModel):
     """deepagents 主 agent 的选型。
 
@@ -821,16 +831,17 @@ class AgentConfig(BaseModel):
 
     # deepagents 0.5.3 起 model=None 已弃用，必须显式给一个能构建出来的 model
     chat: str = "default"
-    subagents: list[str] = Field(default_factory=list)
+    # 每个专业子 Agent 一个 ``*.yaml``；启动时严格解析，运行中不热加载。
+    agents_dir: str = "./config/agents"
     workspace_dir: str = "./data/workspace"
     # 给不给 agent 一个**真能落盘**的 workspace（批次 B 的功能）。
     # true => backend 的 /workspace/ 指向 workspace_dir，写类工具全部挂 HITL 闸门；
     # false => 回到批次 A 的只读 StateBackend，磁盘一个字都不动。
     workspace_writes: bool = True
-    # 网络搜索闸门：语料检索的**最高分**低于这个值就算「语料里没有相关内容」，放行联网。
+    # 内部证据阈值：最高分低于它时提示主 Agent 询问用户是否允许联网，不自动放行。
     # 实测（2026-10-05，bge-reranker-base）：语料内有答案 **0.9985**，语料外 **0.0077 / 0.0978**。
     # 注意：这个判据只在**开了重排**时成立（关掉重排时分数是 RRF 的名次分，量纲不同、不可比）——
-    # 关着重排时闸门退化成「只有用户明确要求才放行」。
+    # 关着重排时分数不可比，只记录语料是否查过。
     web_min_corpus_score: float = 0.2
 
 
@@ -1023,6 +1034,7 @@ class Settings(BaseModel):
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     graph: GraphConfig = Field(default_factory=GraphConfig)
+    answer_verification: AnswerVerificationConfig = Field(default_factory=AnswerVerificationConfig)
     deployment: DeploymentConfig = Field(default_factory=DeploymentConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)

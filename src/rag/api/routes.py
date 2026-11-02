@@ -6,14 +6,14 @@
 
 from fastapi import APIRouter, Depends
 
+from rag.api.chat_routes import chat_router
 from rag.api.deps import enforce_rate_limit
 from rag.api.documents_routes import documents_router
-from rag.api.search_chat_routes import search_chat_router
 from rag.api.sessions_agent_routes import sessions_agent_router
 from rag.api.system_routes import system_router
 
 router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
 router.include_router(system_router)
-router.include_router(search_chat_router)
+router.include_router(chat_router)
 router.include_router(documents_router)
 router.include_router(sessions_agent_router)

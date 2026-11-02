@@ -1,4 +1,4 @@
-"""服务层：鉴权、限流、五个端点、SSE 事件顺序。
+"""服务层：鉴权、限流、Agent 会话、文档端点与 SSE 契约。
 
 用 `TestClient` + **替身 Components**：不起 Milvus、不加载模型、不调线上 —— HTTP 这一层
 要能单独验，否则每次改服务都要等模型加载十几秒。
@@ -18,24 +18,8 @@ from rag.api.ratelimit import RateLimiter, identity_of
 from rag.api.redis_backend import RedisBackend
 from rag.config.schema import ApiConfig, RedisConfig, Settings
 from rag.config.settings import Secrets
-from rag.contracts import ChannelStats, Chunk, Citation, ScoredChunk
+from rag.contracts import Citation
 from rag.deployment import apply_deployment_profile
-
-
-def _hit(chunk_id: str = "d1:0001") -> ScoredChunk:
-    return ScoredChunk(
-        chunk=Chunk(
-            chunk_id=chunk_id,
-            doc_id="d1",
-            text="正文内容",
-            modality="image",
-            metadata={"source_uri": "a.pdf"},
-        ),
-        score=0.9,
-        channel="rrf",
-        rank=0,
-        sources=["hybrid:milvus:c"],
-    )
 
 
 class _Redis(RedisBackend):
@@ -115,38 +99,10 @@ class _Components:
         self.heavy = _Heavy()
         self.ingest_gate = None
         self.background: set = set()
-        self.searches: list[dict] = []
         self.ingested: list[Any] = []
         self.agent_calls: list[dict] = []
         self.resumes: list[dict] = []
         self.chats = _Chats()
-
-    async def search(self, **kwargs):
-        self.searches.append(kwargs)
-        return [_hit()], [ChannelStats(channel="hybrid:milvus:c", candidates=10, kept=1)]
-
-    async def answer(self, body):
-        return {
-            "answer": "答案 [1]",
-            "hits": [_hit()],
-            "stats": [],
-            "citations": [
-                Citation(index=1, chunk_id="d1:0001", source_uri="a.pdf", snippet="正文")
-            ],
-            "rounds": 1,
-            "grade": {"score": 0.9},
-        }
-
-    async def stream_answer(self, body):
-        yield {"type": "retrieval", "hits": [_hit()], "stats": []}
-        for piece in ("你", "好"):
-            yield {"type": "token", "text": piece}
-        yield {
-            "type": "done",
-            "citations": [
-                Citation(index=1, chunk_id="d1:0001", source_uri="a.pdf", snippet="正文")
-            ],
-        }
 
     async def run_ingest(self, body):
         self.ingested.append(body)
@@ -209,6 +165,7 @@ class _Components:
         web_explicit: bool = False,
         session_id: str | None = None,
     ):
+        yield {"type": "status", "phase": "thinking", "message": "正在思考如何规划查询…"}
         yield {"type": "token", "text": "正在"}
         yield {"type": "tool", "name": "search_knowledge", "status": "success"}
         yield {
@@ -226,6 +183,7 @@ class _Components:
     ):
         """与 `stream_agent` 同一组事件 —— 这是契约，不是巧合。"""
         self.resumes.append({"thread_id": thread_id, "decisions": decisions})
+        yield {"type": "status", "phase": "thinking", "message": "正在继续处理…"}
         yield {"type": "token", "text": "写"}
         yield {
             "type": "tool",
@@ -252,7 +210,9 @@ class _Components:
         session_id: str | None = None,
     ):
         """走到闸门前停下 —— 用来看中断事件里到底带了什么（签名与 stream_agent 一致）。"""
+        yield {"type": "status", "phase": "tool", "message": "正在准备写入文件…"}
         yield {"type": "token", "text": "我先写个文件"}
+        yield {"type": "status", "phase": "interrupt", "message": "等待你确认操作…"}
         yield {
             "type": "interrupt",
             "interrupt": {
@@ -540,82 +500,14 @@ def test_health_never_triggers_model_loading() -> None:
     assert client.get("/health").status_code == 200
 
 
-# ---- /search ----
-
-
-def test_search_returns_hits_and_passes_the_options_through() -> None:
-    components = _Components(_settings())
-    client = _client(components)
-
-    body = client.post(
-        "/search",
-        json={
-            "query": "怎么配",
-            "top_k": 3,
-            "filters": {"modality": "image"},
-            "channels": ["hybrid"],
-        },
-    ).json()
-
-    assert body["hits"][0]["chunk_id"] == "d1:0001"
-    assert body["hits"][0]["modality"] == "image"
-    assert body["stats"][0]["channel"] == "hybrid:milvus:c"
-    call = components.searches[0]
-    assert (call["query"], call["top_k"]) == ("怎么配", 3)
-    assert call["filters"] == {"modality": "image"} and call["channels"] == ["hybrid"]
-
-
-def test_search_needs_a_query_or_an_image() -> None:
+def test_retrieval_page_and_fast_chat_routes_are_removed() -> None:
     client = _client(_Components(_settings()))
 
-    empty = client.post("/search", json={"query": "  "})
-
-    assert empty.status_code == 422
-    assert "至少给一个" in empty.json()["error"]["message"]
-
-
-def test_search_rejects_a_missing_image_path() -> None:
-    client = _client(_Components(_settings()))
-
-    resp = client.post("/search", json={"query": "", "image_path": "no/such.png"})
-
-    assert resp.status_code == 422 and "不存在" in resp.json()["error"]["message"]
-
-
-def test_search_rejects_an_oversized_top_k() -> None:
-    client = _client(_Components(_settings()))
-
-    assert client.post("/search", json={"query": "x", "top_k": 999}).status_code == 422
-
-
-# ---- /chat ----
-
-
-def test_chat_returns_the_answer_with_citations() -> None:
-    client = _client(_Components(_settings()))
-
-    body = client.post("/chat", json={"question": "怎么配"}).json()
-
-    assert body["answer"] == "答案 [1]"
-    assert body["citations"][0]["chunk_id"] == "d1:0001"
-    assert body["grade"] == {"score": 0.9}
-
-
-def test_chat_stream_emits_retrieval_then_tokens_then_done() -> None:
-    """SSE 的事件顺序是契约：客户端靠它决定什么时候能渲染来源、什么时候结束。"""
-    client = _client(_Components(_settings()))
-
-    with client.stream("POST", "/chat", json={"question": "怎么配", "stream": True}) as resp:
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/event-stream")
-        text = "".join(resp.iter_text())
-
-    events = [
-        line.removeprefix("event: ") for line in text.splitlines() if line.startswith("event: ")
-    ]
-    assert events == ["retrieval", "token", "token", "done"]
-    assert '"text": "你"' in text and '"text": "好"' in text
-    assert '"chunk_id": "d1:0001"' in text, "done 事件里要带引用"
+    paths = client.app.openapi()["paths"]
+    assert "/search" not in paths
+    assert "/search/image" not in paths
+    assert "/chat" not in paths
+    assert "/chat/transcribe" in paths
 
 
 # ---- /ingest + /jobs ----
@@ -806,8 +698,8 @@ def test_agent_resume_needs_a_thread_and_a_decision() -> None:
     )
 
 
-def test_agent_stream_emits_tokens_tools_and_done() -> None:
-    """SSE 版：token（正文增量）、tool（某次工具调用结束）、done（收尾 + 引用）。"""
+def test_agent_stream_emits_status_tokens_tools_and_done() -> None:
+    """SSE 版：status（正在做什么）、token、tool、done 都按发生顺序透传。"""
     client = _client(_Components(_settings()))
 
     with client.stream("POST", "/agent", json={"message": "随便问问", "stream": True}) as resp:
@@ -818,7 +710,8 @@ def test_agent_stream_emits_tokens_tools_and_done() -> None:
     events = [
         line.removeprefix("event: ") for line in text.splitlines() if line.startswith("event: ")
     ]
-    assert events == ["token", "tool", "done"]
+    assert events == ["status", "token", "tool", "done"]
+    assert '"message": "正在思考如何规划查询…"' in text
     assert '"text": "正在"' in text
     assert '"name": "search_knowledge"' in text
     assert '"chunk_id": "d1:0001"' in text, "done 事件里要带引用"
@@ -842,7 +735,7 @@ def test_agent_resume_stream_emits_the_same_events_as_agent() -> None:
     events = [
         line.removeprefix("event: ") for line in text.splitlines() if line.startswith("event: ")
     ]
-    assert events == ["token", "tool", "done"]
+    assert events == ["status", "token", "tool", "done"]
     assert '"file_path": "/workspace/r.md"' in text, "工具事件要带参数"
     assert '"ms": 12' in text, "工具事件要带耗时"
     assert components.resumes == [{"thread_id": "t1", "decisions": [{"type": "approve"}]}]
@@ -861,7 +754,8 @@ def test_the_interrupt_event_carries_the_thread_id() -> None:
     events = [
         line.removeprefix("event: ") for line in text.splitlines() if line.startswith("event: ")
     ]
-    assert events == ["token", "interrupt"]
+    assert events == ["status", "token", "status", "interrupt"]
+    assert '"message": "等待你确认操作…"' in text
     assert '"thread_id": "t1"' in text
     assert '"name": "write_file"' in text, "「它想干什么」也要给出来"
 
@@ -1049,7 +943,7 @@ def test_logs_tail_merges_the_four_files_in_time_order(tmp_path) -> None:
     settings = _log_settings(tmp_path)
     _write(
         settings.observability.logging.files["interface"].path,
-        "10-06 18:00:01 INFO  interface        req=r1 run=x POST /search 200 12ms",
+        "10-06 18:00:01 INFO  interface        req=r1 run=x POST /agent 200 12ms",
     )
     _write(
         settings.observability.logging.files["channel"].path,
@@ -1068,7 +962,7 @@ def test_logs_tail_merges_the_four_files_in_time_order(tmp_path) -> None:
     line = body["items"][1]
     assert line["ts"] == "10-06 18:00:01" and line["level"] == "INFO"
     assert line["source"] == "interface", "来源单独一列，正文里不再重复短名"
-    assert "POST /search 200" in line["text"]
+    assert "POST /agent 200" in line["text"]
     assert body["files"]["channel"].endswith("channel.log")
 
 

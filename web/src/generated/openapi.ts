@@ -30,19 +30,6 @@ export type S = {
   Body_upload_documents_documents_upload_post: {
     files: Array<string>;
   };
-  Body_upload_search_image_search_image_post: {
-    file: string;
-  };
-  ChatRequest: {
-    question: string;
-    top_k?: number;
-    stream?: boolean;
-    filters?: Record<string, unknown> | null;
-    channels?: Array<string> | null;
-    rerank?: boolean | null;
-    graph?: boolean | null;
-    session_id?: string | null;
-  };
   ChunkSummaryView: {
     at?: number;
     blocks?: number;
@@ -165,26 +152,6 @@ export type S = {
     postgres: S["DependencyView"];
     models?: Record<string, S["DependencyView"]>;
     config?: Record<string, unknown>;
-  };
-  HitView: {
-    chunk_id: string;
-    score: number;
-    sources?: Array<string>;
-    doc_id?: string;
-    modality?: string;
-    doc_type?: string;
-    source_uri?: string;
-    heading_path?: string;
-    heading_numbers?: string;
-    page?: number;
-    line?: number;
-    assets?: Array<string>;
-    text?: string;
-  };
-  ImageUploadView: {
-    path: string;
-    name?: string;
-    bytes?: number;
   };
   IndexSummaryView: {
     indexed?: boolean;
@@ -312,19 +279,6 @@ export type S = {
     models?: Array<Record<string, unknown>> | null;
     actor?: string;
   };
-  SearchRequest: {
-    query?: string;
-    image_path?: string | null;
-    top_k?: number;
-    filters?: Record<string, unknown> | null;
-    channels?: Array<string> | null;
-    rerank?: boolean | null;
-  };
-  SearchResponse: {
-    query: string;
-    hits: Array<S["HitView"]>;
-    stats?: Array<S["StatsView"]>;
-  };
   SectionSummaryView: {
     heading_path?: string;
     heading_numbers?: string;
@@ -369,13 +323,6 @@ export type S = {
     created_at?: string | null;
     updated_at?: string | null;
     usage?: S["SessionUsageView"];
-  };
-  StatsView: {
-    channel: string;
-    candidates?: number;
-    kept?: number;
-    latency_ms?: number | null;
-    error?: string | null;
   };
   TranscribeResponse: {
     text: string;

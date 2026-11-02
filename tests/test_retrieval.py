@@ -294,7 +294,7 @@ def test_keyword_is_not_a_channel_any_more() -> None:
     （dense + 内建 BM25 在服务端融合）。
 
     判据是注册表：`bm25` 必须不在里面 —— 留着它，配置里就能再写出一路"同一个库的
-    另一种搜法"，那正是这条要禁掉的形状（实测关掉它 recall@8 一样、MRR 反而略好）。
+    另一种搜法"，那正是这条要禁掉的形状。
     """
     import rag.retrieval  # noqa: F401  触发通道注册
     from rag.contracts import CHANNEL_TYPES

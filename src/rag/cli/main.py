@@ -634,14 +634,20 @@ def search(
     async def _run() -> tuple[list[ScoredChunk], list]:
         from rag.graphs.wiring import build_heavy
         from rag.indexing import build_index
-        from rag.retrieval import build_retriever
+        from rag.retrieval import build_retriever, configured_hyde
 
         index = build_index(settings)
         await _probe_milvus(index, settings)
         await index.ensure_ready()
         heavy = build_heavy(settings, index)
         _require(heavy, "embedding")
-        retriever = build_retriever(settings, index, heavy.embedder, heavy.reranker)
+        retriever = build_retriever(
+            settings,
+            index,
+            heavy.embedder,
+            heavy.reranker,
+            hyde=configured_hyde(settings, heavy.chat),
+        )
         hits = await retriever.retrieve(query, top_k, filters=filters or None, image=image)
         # 账本挂在多通道检索器上；单路没有这一项，取不到就是空
         return hits, getattr(retriever, "last_stats", [])
@@ -1362,139 +1368,6 @@ def logs_search(
     typer.echo(f"\n共 {len(rows)} 行（req={request_id}）")
 
 
-@app.command("eval")
-def eval_cmd(
-    dataset: Path = typer.Option(
-        Path("eval/golden.jsonl"), "--dataset", help="黄金集（JSONL，一条一个问题 + 判据）"
-    ),
-    top_k: int = typer.Option(8, "--top-k", "-k", help="检索几条"),
-    judge: bool = typer.Option(
-        False,
-        "--judge",
-        help="跑生成侧判定（引用准确率 / 要点覆盖 / 拒答）：**每次问题一次模型调用，按量计费**",
-    ),
-    ragas: bool = typer.Option(
-        False,
-        "--ragas",
-        help="额外算 ragas 的 faithfulness（要 --judge 才有生成结果；每个问题再加一次调用）",
-    ),
-    label: str = typer.Option("baseline", "--label", help="报告文件名前缀，做 A/B 时改它"),
-    channels: str | None = typer.Option(
-        None, "--channel", help="覆盖可选通道（同 search：逗号分隔，如 hybrid,bm25）"
-    ),
-    rerank: bool | None = typer.Option(None, "--rerank/--no-rerank", help="覆盖重排开关"),
-    graph: bool | None = typer.Option(
-        None, "--graph/--no-graph", help="覆盖 graph.enabled（评测默认走直线，与线上 ask 一致）"
-    ),
-    out_dir: Path = typer.Option(Path("eval/reports"), "--out-dir", help="报告目录"),
-) -> None:
-    """跑评测：检索指标（免费）+ 可选的生成侧判定（`--judge`，花钱）。
-
-    默认**只跑检索那层**：本地 embedding，不调模型、不花钱，随时能跑。指标是
-    `recall@k` / `MRR` / `nDCG@k` / 命中率 —— 它回答的是「材料找不找得到」。
-
-    `--judge` 再加生成侧：**引用准确率**（答案里的引用编号是否真支持那句话）、
-    **要点覆盖率**、以及语料外问题**该不该拒答**。这部分每个问题一次模型调用。
-
-    报告两份落 `eval/reports/`（JSON 给下次 diff、Markdown 给人看）。做 A/B 就改 `--label`
-    再跑一次，比如 `--label no-rerank --no-rerank`，然后对比两份 JSON 的 summary。
-    """
-    from rag.eval import build_report, load_golden, run_eval, write_report
-    from rag.eval.wiring import build_ask, build_generate, build_retrieve
-
-    settings = load_settings()
-    _tracing(settings)
-    _begin_run()
-    if channels:
-        _apply_channels(settings, channels)
-    if rerank is not None:
-        settings.retrieval.rerank.enabled = rerank
-    if graph is not None:
-        settings.graph.enabled = graph
-
-    cases = load_golden(dataset)
-
-    async def _run():
-        from rag.graphs.wiring import build_heavy
-        from rag.indexing import build_index
-
-        index = build_index(settings)
-        await _probe_milvus(index, settings)
-        await index.ensure_ready()
-        heavy = build_heavy(settings, index)
-        _require(heavy, "embedding")
-        retrieve = build_retrieve(settings, heavy)
-        generate = ask = None
-        faithfulness = None
-        if judge:
-            _require(heavy, "chat", "generator")
-            generate, ask = build_generate(settings, heavy), build_ask(heavy)
-            if ragas:
-                from rag.eval.ragas_backend import build_faithfulness
-
-                faithfulness = build_faithfulness(settings, get_secrets())
-        return await run_eval(
-            cases,
-            retrieve=retrieve,
-            generate=generate,
-            ask=ask,
-            faithfulness=faithfulness,
-            top_k=top_k,
-        )
-
-    rows = _run_async(_run(), settings)
-    report = build_report(
-        rows,
-        top_k=top_k,
-        meta={
-            "label": label,
-            "dataset": str(dataset),
-            "config": {
-                "collection": settings.indexing.vector.collection,
-                "embedding": settings.providers.embedding.backend,
-                "channels": [item.name for item in settings.retrieval.channels if item.enabled],
-                "rerank": settings.retrieval.rerank.enabled,
-                "graph": settings.graph.enabled,
-                "top_k": top_k,
-                "judge": judge,
-                "ragas": ragas,
-            },
-        },
-    )
-    json_path, md_path = write_report(report, out_dir=out_dir, label=label)
-
-    summary = report["summary"]
-    typer.echo("")
-    typer.secho(
-        f"检索 {summary['retrieval_cases']} 条："
-        + "  ".join(
-            f"{name}={value * 100:.1f}%" for name, value in (summary["retrieval"] or {}).items()
-        ),
-        fg=typer.colors.CYAN,
-    )
-    if judge:
-        typer.secho(
-            f"生成 {summary['judged_cases']} 条：引用准确率"
-            f"={_pct(summary['citation_accuracy'])}  要点覆盖={_pct(summary['point_coverage'])}  "
-            f"拒答={summary['refused']}  判不了={summary['errors']}"
-            + (f"  ragas 忠实度={_pct(summary['ragas_faithfulness'])}" if ragas else ""),
-            fg=typer.colors.CYAN,
-        )
-    missed = [row for row in rows if row.retrieval_case and row.rank == 0]
-    if missed:
-        typer.secho(
-            f"\n{len(missed)} 条没命中（报告里列了它们召回了什么）：", fg=typer.colors.YELLOW
-        )
-        for row in missed[:5]:
-            top = row.top[0]
-            typer.echo(f"  · {row.question[:40]}  → 召回 #{1} {top['heading_path'][:50]}")
-    typer.secho(f"\n报告：{md_path}（机器读的在同一目录的 .json）", fg=typer.colors.GREEN)
-
-
-def _pct(value: float | None) -> str:
-    return "—" if value is None else f"{value * 100:.1f}%"
-
-
 @app.command()
 def serve(
     host: str | None = typer.Option(None, help="监听地址；默认用 api.host"),
@@ -1506,7 +1379,7 @@ def serve(
 ) -> None:
     """启动 FastAPI 服务（M4）。
 
-    端点：`/health`、`/search`、`/chat`（`stream=true` 走 SSE）、`/ingest`（202 + job_id）、
+    端点：`/health`、`/agent`（`stream=true` 走 SSE）、`/ingest`（202 + job_id）、
     `/jobs/{id}`。鉴权走 `X-API-Key`（`.env` 的 `RAG_API_KEY`；没配就只允许本机）。
 
     `local-lite` / `docker-single` 严格单 worker；`multiworker` 要求 Docker Milvus +

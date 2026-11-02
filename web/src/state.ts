@@ -8,20 +8,18 @@ import {
   sessions as fetchSessions,
   type Chunk,
   type Citation,
-  type Hit,
   type Interrupt,
   type SessionDetail,
   type SessionSummary,
-  type Stats,
   type Usage,
 } from './api'
 
 // 设置页（原 'models'）2026-10-10 暂时下线：页面与接口都留着，只是不挂导航
 // （见 docs/backlog.md 第 2 条）。要放回来就在这个联合类型里加回 'models'，
 // 再把 NavRail 的条目与 App.vue 那条分支接上。
-export type PageId = 'search' | 'chat' | 'documents' | 'logs'
+export type PageId = 'chat' | 'documents' | 'logs'
 
-export const page = ref<PageId>('search')
+export const page = ref<PageId>('chat')
 export const detail = ref<Chunk | null>(null)
 export const detailError = ref('')
 export const status = ref<{ ok: boolean; text: string; milvus?: boolean; postgres?: boolean; redis?: boolean }>({
@@ -60,42 +58,27 @@ export function closeDetail(): void {
 
 // ---- 对话（P2）----
 //
-// **放在这里而不是 ChatView 里**：外壳用的是 `<ChatView v-if>`，一切到「检索」再切回来
+// **放在这里而不是 ChatView 里**：外壳用的是 `<ChatView v-if>`，一切到别的页面再切回来
 // 组件就卸载重建了 —— 状态留在组件里等于「点一下别的页，聊过的东西全没了」。
-
-/** 走哪条路：`chat` = 定制链路（单轮、无历史）；`agent` = 让模型自己决定查什么。 */
-export type Mode = 'chat' | 'agent'
 
 export interface Turn {
   question: string
   answer: string
-  hits: Hit[]
-  stats: Stats[]
   citations: Citation[]
   error: string
   running: boolean
-  /** 这一轮实际走的哪条路 —— 事后要说得清「刚才那次是 agent 查的」 */
-  mode: Mode
-  /** agent 给的会话 id，追问必须带回去；`/chat` 恒为 null */
+  /** 当前 Agent 正在做什么；为空 = 没有可展示的活动。 */
+  activity: string
+  /** 当前活动开始的时间戳，用来显示本阶段耗时。 */
+  activitySince: number
+  /** Agent 给的会话 id，追问必须带回去。 */
   thread: string | null
   /** 撞上 HITL 闸门时它想干什么，等人在卡片上按批准/拒绝 */
   interrupt: Interrupt | null
-  /** 证据不足 → 提示可以转 agent 再查一遍 */
-  weak: boolean
   /** 这一轮的 token 用量（服务端在 `done` 事件里给的；历史轮次没有） */
   usage?: Usage | null
 }
 
-/**
- * 「证据不足」的判据：最高分低于这个数。
- *
- * **这是抄后端那个数**（`agent.web_min_corpus_score: 0.2`，实测「语料内有答案 0.9985 /
- * 语料外 0.0077~0.0978」），不另发明一个 —— 两处判据不一致时最难查。
- * 注意只在**开着重排**时这个分才可比（关掉时是 RRF 名次分）；默认是开着的。
- */
-export const WEAK_SCORE = 0.2
-
-export const mode = ref<Mode>((localStorage.getItem('rag_mode') as Mode) ?? 'chat')
 export const turns = ref<Turn[]>([])
 /** 本会话的 agent thread：非空 = 已经聊出历史了 */
 export const thread = ref<string | null>(null)
@@ -149,15 +132,13 @@ function turnsOf(detail: SessionDetail): Turn[] {
       out.push({
         question: message.content,
         answer: '',
-        hits: [],
-        stats: [],
         citations: [],
         error: '',
         running: false,
-        mode: (detail.mode as Mode) ?? 'chat',
+        activity: '',
+        activitySince: 0,
         thread: detail.thread_id,
         interrupt: null,
-        weak: false,
       })
       continue
     }
@@ -176,7 +157,6 @@ export async function openSession(id: string): Promise<void> {
   const detail = await fetchSession(id)
   sessionId.value = detail.session_id
   thread.value = detail.thread_id
-  mode.value = (detail.mode as Mode) ?? 'chat'
   turns.value = turnsOf(detail)
 }
 
@@ -192,14 +172,8 @@ export async function dropSession(id: string): Promise<void> {
     turns.value = []
     thread.value = null
     sessionId.value = null
-    mode.value = 'chat'
   }
   await refreshSessions()
-}
-
-export function setMode(next: Mode): void {
-  mode.value = next
-  localStorage.setItem('rag_mode', next)
 }
 
 /**
@@ -212,7 +186,6 @@ export function newConversation(): void {
   turns.value = []
   thread.value = null
   sessionId.value = null
-  setMode('chat')
 }
 
 // 主题：自动（跟随系统）/ 浅 / 深 —— 写 <html data-theme>，token 里的 light-dark() 自动切

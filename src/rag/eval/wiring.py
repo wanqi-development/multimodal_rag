@@ -12,19 +12,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from rag.contracts import ScoredChunk
 from rag.eval.judge import AskFn
-from rag.eval.runner import GenerateFn, RetrieveFn
+
+RetrieveFn = Callable[[str, int], Awaitable[list[ScoredChunk]]]
+GenerateFn = Callable[[str, list[ScoredChunk]], Awaitable[tuple[str, list[dict[str, Any]]]]]
 
 
 def build_retrieve(settings: Any, heavy: Any) -> RetrieveFn:
     """检索闭包。**重对象来自 heavy**（embedder / reranker 只建一次，见 graphs/wiring 的教训）。"""
-    from rag.retrieval import build_retriever
+    from rag.retrieval import build_retriever, configured_hyde
 
     async def retrieve(question: str, top_k: int) -> list[ScoredChunk]:
-        retriever = build_retriever(settings, heavy.index, heavy.embedder, heavy.reranker)
+        retriever = build_retriever(
+            settings,
+            heavy.index,
+            heavy.embedder,
+            heavy.reranker,
+            hyde=configured_hyde(settings, heavy.chat),
+        )
         return await retriever.retrieve(question, top_k)
 
     return retrieve

@@ -1,0 +1,25 @@
+schema_version: 1
+name: business-data
+description: 通过公司业务 MCP 工具查询员工、订单、库存等精确业务数据。
+
+enabled: false
+
+system_prompt: |
+  你负责通过只读业务 MCP 工具查询精确数据。
+
+  只能调用当前开放的 MCP 工具，不生成 SQL，不猜测表结构，不编造业务字段。
+  参数不足时明确写出需要用户补充的标识或时间范围；工具没有结果时写入 limitations。
+  返回事实必须带工具名称、查询条件和数据时间，并保留工具返回的引用编号。
+
+  本文件默认关闭。接入公司业务 MCP 后，把适配后的工具注册到代码工具表，
+  再把 enabled 改为 true 并填写允许的工具名。
+
+tools: []
+
+middleware:
+  - tool-error
+
+model: inherit
+max_tool_calls: 4
+response_schema: EvidenceResult
+requires_channels: []

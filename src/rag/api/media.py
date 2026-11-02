@@ -1,4 +1,4 @@
-"""对话 / 检索用的媒体（图片）落点。**与文档语料分开**。
+"""对话媒体（图片）落点。**与文档语料分开**。
 
 **为什么不能落在 `data/uploads/`**：那是文档语料的根，`LocalUploadStore.list()` 按 loader
 后缀扫顶层文件，而 `.png/.jpg` 本来就在 loader 注册表里 —— 丢进去就会被当成一份「文档」
@@ -16,8 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-# 认得的图片后缀。**不做格式转换**：以图搜图那条 embedding 自己会解码，
-# 转一道只会引入「转完跟原图不一样」的可能。
+# 认得的图片后缀。**不做格式转换**：下游多模态模型自己会解码。
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff")
 
 # Content-Type → 后缀（浏览器给 File 的时候两边都可能有）
@@ -52,15 +51,14 @@ def suffix_for(name: str, content_type: str = "") -> str:
 
 
 def save_image(settings: Any, data: bytes, *, name: str = "", content_type: str = "") -> Path:
-    """把一张图落盘，返回它的路径（`/search` 的 `image_path` 要的就是这个）。
+    """把一张图落盘，返回本地路径。
 
-    上限 `api.media_max_image_mb`（默认 5MB）。**当场拒**，别等发到下游才报错 ——
-    以图搜图那条要过一次线上 embedding，按量计费。
+    上限 `api.media_max_image_mb`（默认 5MB）。**当场拒**，别等发到下游才报错。
 
     落点按 `api.media_backend`：`auto`（默认，听统一开关 `storage.backend`）→ 落
     `api.media_dir`（本地盘）或进桶（键 = `media/<落盘名>`，2026-10-09）。
     **返回的一律是一个本地路径** —— 下游
-    （看图的 VLM、以图搜图那条多模态 embedding）要的就是路径；minio 下那是读穿透缓存里的
+    （看图的 VLM、多模态 embedding）要的就是路径；minio 下那是读穿透缓存里的
     副本，桶才是真相。
     """
     if not data:

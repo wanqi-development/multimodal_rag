@@ -413,7 +413,10 @@ retrieval:
     candidates_per_channel: 10
   transform:
     multi_query: 0 # 0 表示关闭
-    hyde: false
+    # HyDE：先让 chat 模型生成“可能出现在技术资料中的假设段落”，
+    # 原问题与假设段落各走一次检索，再 RRF 融合并用原问题重排。
+    hyde: ${RAG_HYDE:-false}
+    hyde_max_chars: ${RAG_HYDE_MAX_CHARS:-600}
   rerank:
     # 精排：把融合后的 20 条候选按「查询 ↔ 正文」重排，再按调用方要的条数交货
     # （交几条由 -k 决定，这里**没有 top_n**）。开关走插值，临时跑一次可以设环境变量：
@@ -434,6 +437,13 @@ graph:
   # 默认 1（= 以前串行的行为）。想快就往上加，但要跟上游承载能力匹配。
   index_concurrency: 1
 
+answer_verification:
+  # 生成完成后用 ragas Faithfulness 检查答案是否被检索上下文支持。
+  # 低分不会自动联网，只在页面询问用户是否允许联网；默认关闭避免每轮额外计费。
+  enabled: ${RAG_ANSWER_VERIFY:-false}
+  threshold: ${RAG_ANSWER_VERIFY_THRESHOLD:-0.5}
+  timeout_s: ${RAG_ANSWER_VERIFY_TIMEOUT_S:-15}
+
 api:
   # FastAPI 服务（`rag serve`）。默认只听本机，要对外就改 RAG_API_HOST。
   host: ${RAG_API_HOST:-127.0.0.1}
@@ -449,7 +459,7 @@ api:
   # 超了当场 413，不往上打 —— 打上去就是一次按量的调用费。
   media_max_audio_mb: 10
   media_max_image_mb: 5
-  # 对话 / 检索用的图片落点。**不能指到 ingest.uploads.dir**：那是文档语料根，
+  # 对话图片落点。**不能指到 ingest.uploads.dir**：那是文档语料根，
   # 而 .png/.jpg 就在 loader 注册表里 —— 丢进去会被当成一份文档列出来、走完五步流程。
   media_dir: ./data/chat/media
   # 会话图片（语音不落盘：ASR 在内存里转完就丢）。
@@ -505,14 +515,15 @@ agent:
   # 写字符串会绕开三件套：deepseek / zhipuai 这类没有独立 LangChain 集成包，
   # "deepseek:deepseek-chat" 会要求额外装 langchain-deepseek。
   chat: ${AGENT_CHAT:-default}
-  subagents: []
+  # 每个子 Agent 一个 *.yaml（固定字段，system_prompt 直接写在 YAML 里）。
+  agents_dir: ${RAG_AGENT_CONFIG_DIR:-./config/agents}
   workspace_dir: ./data/workspace
   # agent 能不能把文件写到 workspace_dir（写类工具一律先过 HITL，人批准才落盘）。
   # false 就退回只读：写只落在内存 state 里，磁盘一个字不动。
   workspace_writes: ${RAG_AGENT_WRITES:-true}
-  # 网络搜索闸门：语料检索的**最高分**低于它就认为「语料里没有相关内容」，放行联网。
+  # 内部证据阈值：最高分低于它时提示主 Agent 询问用户是否允许联网，不自动放行。
   # 实测（2026-10-05，bge-reranker-base）：语料内有答案 0.9985，语料外 0.0077 / 0.0978。
-  # 只在开了重排时成立；关掉重排时分数是 RRF 名次分、不可比，闸门退化成「只有用户明确要求才放行」。
+  # 只在开了重排时成立；关掉重排时分数是 RRF 名次分、不可比，只记录“查过”状态。
   web_min_corpus_score: 0.2
 
 observability:

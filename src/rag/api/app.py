@@ -62,6 +62,10 @@ class Components:
         self.index: Any = None
         self.heavy: Any = None
         self.persistence: Any = None
+        self.agents: Any = None
+        # 由业务集成层注入：网络工具只在主 Agent；MCP 等业务工具只给子 Agent。
+        self.agent_main_tools: list[Any] = []
+        self.agent_subagent_tools: list[Any] = []
         # UI 会话的存储（chat_session / chat_message / token_usage）。
         # local 档用 SQLite，multiworker 用 PostgreSQL。
         self.chats: Any = None
@@ -88,6 +92,20 @@ class Components:
         await self.persistence.connect()
         if profile == "multiworker" and not self.persistence.available:
             raise RuntimeError(f"multiworker 要求 PostgreSQL 可用：{self.persistence.reason}")
+        from rag.agent import load_agent_registry
+
+        try:
+            self.agents = load_agent_registry(self.settings.agent.agents_dir)
+        except Exception as exc:  # noqa: BLE001 —— 路由配置错必须在启动时暴露
+            raise RuntimeError(f"子 Agent 配置加载失败：{exc}") from exc
+        import logging
+
+        logging.getLogger("rag.agent").info(
+            "子 Agent 配置已加载：fingerprint=%s definitions=%d enabled=%d",
+            self.agents.fingerprint,
+            len(self.agents.definitions),
+            len(self.agents.enabled()),
+        )
         if profile in {"docker-single", "multiworker"}:
             from rag.storage import build_blob_store
 
@@ -156,7 +174,7 @@ class Components:
         self.background.add(task)
         task.add_done_callback(self.background.discard)
 
-    # ---- 参数整理 ----
+    # ---- 参数整理（历史方法保留到本轮清理） ----
 
     def _local(self, channels: list[str] | None, rerank: bool | None) -> Settings:
         """把这次请求的覆盖项落到一份**拷贝**上 —— 请求之间不能互相污染。"""
@@ -199,10 +217,16 @@ class Components:
         image: Any = None,
     ) -> tuple[list[ScoredChunk], list[ChannelStats]]:
         self._require("embedding")
-        from rag.retrieval import build_retriever
+        from rag.retrieval import build_retriever, configured_hyde
 
         local = self._local(channels, rerank)
-        retriever = build_retriever(local, self.index, self.heavy.embedder, self.heavy.reranker)
+        retriever = build_retriever(
+            local,
+            self.index,
+            self.heavy.embedder,
+            self.heavy.reranker,
+            hyde=configured_hyde(local, self.heavy.chat),
+        )
         hits = await retriever.retrieve(query, top_k, filters=filters or None, image=image)
         return hits, getattr(retriever, "last_stats", [])
 
@@ -216,7 +240,14 @@ class Components:
 
         # token 用量靠调用方传容器收集（`heavy.generator` 是跨请求单例，不能挂实例属性）
         usage: dict[str, Any] = {}
-        engine = build_answer_engine(local, self.index, self.heavy)
+        from rag.graphs.verification import build_answer_verifier
+
+        engine = build_answer_engine(
+            local,
+            self.index,
+            self.heavy,
+            verifier=build_answer_verifier(local, self.secrets),
+        )
         result = await engine.answer(
             body.question,
             body.top_k,
@@ -232,6 +263,7 @@ class Components:
             "grade": result.grade,
             "mode": result.mode,
             "usage": result.usage,
+            "verification": result.verification,
         }
         sid = await self._open_session(body.session_id, title=body.question[:30], mode="chat")
         await self._save_turn(
@@ -251,8 +283,14 @@ class Components:
             local.graph.enabled = body.graph
         self._require("embedding", "generator")
         from rag.graphs import build_answer_engine
+        from rag.graphs.verification import build_answer_verifier
 
-        engine = build_answer_engine(local, self.index, self.heavy)
+        engine = build_answer_engine(
+            local,
+            self.index,
+            self.heavy,
+            verifier=build_answer_verifier(local, self.secrets),
+        )
         sid = await self._open_session(body.session_id, title=body.question[:30], mode="chat")
         async for event in engine.stream(
             body.question,
@@ -336,10 +374,13 @@ class Components:
         return build_agent(
             self.settings,
             self.heavy,
+            agents=self.agents,
             checkpointer=(self.persistence.checkpointer if self.persistence else None),
             store=(self.persistence.store if self.persistence else None),
             workspace=default_workspace(self.settings),
             web_explicit=web_explicit,
+            extra_main_tools=self.agent_main_tools,
+            extra_subagent_tools=self.agent_subagent_tools,
         )
 
     def _agent_persistence_check(self, thread_id: str | None) -> None:
@@ -425,9 +466,8 @@ class Components:
     async def _history_for(self, session_id: str | None) -> list[dict[str, Any]] | None:
         """给新 thread 的铺垫：这个会话已有的问答。
 
-        **只在 thread 还是空的时候用**：一段会话可能先用快问答聊了几轮（那条路没有
-        checkpointer），切到 agent 时 thread 是新的 —— 不把历史灌进去，agent 就只看得到
-        当前这一句（使用者提的第一个问题就是它）。
+        **只在 thread 还是空的时候用**：历史会话可能来自旧版本，或当前 thread 尚未建立；
+        不把已有问答灌进去，agent 就只看得到当前这一句。
 
         只取最近 `HISTORY_MESSAGES` 条、且跳过正文为空的（中断那轮的回答是空的，
         塞进 prompt 只会添乱）。

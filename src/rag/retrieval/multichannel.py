@@ -157,48 +157,7 @@ class MultiChannelRetriever:
     async def _rerank(
         self, query: str, fused: list[ScoredChunk], top_n: int
     ) -> tuple[list[ScoredChunk], ChannelStats | None]:
-        """重排；**失败就退回融合顺序**，并把这笔账记下来。
-
-        为什么不让它抛：重排只是精排，融合结果本身是可用的。模型下不下来、ONNX 加载失败
-        这类问题不该让整个查询失败 —— 但也不能装作没事，所以记进 stats（``--stats`` 会打出来）。
-        """
-        if self._reranker is None or not fused:
-            return fused, None
-        if not query.strip():
-            # **纯图查询**：交叉编码器靠「查询词 ↔ 正文」算相关性，没有词它只是在白花
-            # 几秒（还可能把融合顺序打乱）。这时候 dense 的名次就是最好的答案，跳过。
-            return fused, ChannelStats(
-                channel=self._reranker.name,
-                candidates=len(fused),
-                kept=len(fused),
-                latency_ms=0.0,
-                error="纯图查询：重排需要查询词，已跳过",
-            )
-        started = time.perf_counter()
-        try:
-            reranked = await self._reranker.rerank(query, fused, top_n)
-        except Exception as exc:  # noqa: BLE001  —— 见上面的理由
-            return fused, ChannelStats(
-                channel=self._reranker.name,
-                candidates=len(fused),
-                kept=0,
-                latency_ms=_ms(started),
-                error=f"{type(exc).__name__}: {exc}（已退回融合顺序）",
-            )
-        if not reranked:  # 空结果也算失败：别把好好的融合结果换成一片空白
-            return fused, ChannelStats(
-                channel=self._reranker.name,
-                candidates=len(fused),
-                kept=0,
-                latency_ms=_ms(started),
-                error="重排返回空结果（已退回融合顺序）",
-            )
-        return reranked, ChannelStats(
-            channel=self._reranker.name,
-            candidates=len(fused),
-            kept=len(reranked),
-            latency_ms=_ms(started),
-        )
+        return await rerank_hits(query, fused, self._reranker, top_n)
 
     async def _one(
         self,
@@ -249,3 +208,47 @@ class MultiChannelRetriever:
 
 def _ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 1)
+
+
+async def rerank_hits(
+    query: str,
+    fused: list[ScoredChunk],
+    reranker: Reranker | None,
+    top_n: int,
+) -> tuple[list[ScoredChunk], ChannelStats | None]:
+    """重排一次；失败时退回融合顺序并记录账本。"""
+    if reranker is None or not fused:
+        return fused, None
+    if not query.strip():
+        return fused, ChannelStats(
+            channel=reranker.name,
+            candidates=len(fused),
+            kept=len(fused),
+            latency_ms=0.0,
+            error="纯图查询：重排需要查询词，已跳过",
+        )
+    started = time.perf_counter()
+    try:
+        reranked = await reranker.rerank(query, fused, top_n)
+    except Exception as exc:  # noqa: BLE001
+        return fused, ChannelStats(
+            channel=reranker.name,
+            candidates=len(fused),
+            kept=0,
+            latency_ms=_ms(started),
+            error=f"{type(exc).__name__}: {exc}（已退回融合顺序）",
+        )
+    if not reranked:
+        return fused, ChannelStats(
+            channel=reranker.name,
+            candidates=len(fused),
+            kept=0,
+            latency_ms=_ms(started),
+            error="重排返回空结果（已退回融合顺序）",
+        )
+    return reranked, ChannelStats(
+        channel=reranker.name,
+        candidates=len(fused),
+        kept=len(reranked),
+        latency_ms=_ms(started),
+    )

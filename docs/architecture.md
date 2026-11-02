@@ -28,7 +28,36 @@
 
 1. **FastAPI 服务** — 对外 HTTP 接口
 2. **Typer CLI** — 灌库、检索、评测的调试入口
-3. **deepagents 对话式 Agent** — 规划 + 多路子 agent 并行检索
+3. **deepagents 对话式 Agent** — 主 Agent 识别意图，按需调用专业子 Agent
+
+### 当前问答架构（2026-10-30）
+
+页面问答只有 `/agent` 一条入口。主 Agent 本身承担意图识别和任务编排，不再额外放一层
+独立的 LLM 路由器，也不保留检索页、`/search`、`/search/image` 或快问答 `/chat`。
+
+```text
+用户问题
+  → 主 Agent 判断证据来源
+      ├─ policy-document      → 制度/规则/SOP/普通文档
+      ├─ relationship-graph   → 组织架构/人员关系/审批链/多跳路径
+      └─ business-data        → 公司业务 MCP 只读工具（未接入时禁用）
+  → 子 Agent 返回 EvidenceResult
+  → 主 Agent 融合证据、处理冲突、生成带引用答案
+  → 内部证据不足时，询问用户是否允许联网
+```
+
+每个子 Agent 一个固定格式的 `config/agents/<name>.yaml`。`system_prompt`、工具列表、
+中间件和其他能力字段都在同一个 YAML 文件里，启动时由 `rag.agent.registry` 严格解析并
+编译成 deepagents 原生 `SubAgent`。配置里只能
+引用代码注册表中的工具名，不能写任意 Python import；缺少所需通道或工具的文件不会静默装作可用。
+`mode` 不暴露给配置，Registry 统一固定为 `isolated`。
+
+网络搜索和网页抓取保留在主 Agent。`WebSearchGate` 只有两种状态：用户明确授权时允许；
+其他情况下即使内部证据为空也只提示模型先询问用户，不自动联网。
+
+业务集成通过两个作用域注入工具：`agent_main_tools` 只给主 Agent（例如公司自研搜索/抓取），
+`agent_subagent_tools` 只进入子 Agent 工具表（例如业务 MCP 查询）。两类工具都先在代码侧
+注册名称，再由 YAML 按名称引用，避免把 MCP 写能力暴露给主 Agent。
 
 **核心设计原则：`contracts/` 是纯协议层，零第三方依赖。** 上层组件只依赖协议不依赖实现。换向量库、换 embedding 模型、加一路检索通道，都只动一个文件。
 
@@ -121,10 +150,11 @@ M0 装完依赖后先用实际 import 验证一遍再往下写。
 
 ```
 ┌───────────────────── 入口层 ─────────────────────┐
-│  FastAPI(/ingest /search /chat)  │  Typer CLI     │
+│  FastAPI(/agent /chat/transcribe /ingest /documents) │ Typer CLI │
 │  deepagents 对话式助手                            │
 └───────────────────────┬──────────────────────────┘
 ┌───────────────────────▼──────────────────────────┐
+│  deepagents 主 Agent → 专业子 Agent              │
 │  LangGraph 编排层   IndexGraph │ QueryGraph       │
 └───────────────────────┬──────────────────────────┘
 ┌───────────────────────▼──────────────────────────┐
@@ -161,6 +191,7 @@ multi-modal-rag/
 ├── docs/architecture.md            # 本文档
 ├── config/
 │   ├── base.yaml
+│   ├── agents/                     # 每个子 Agent 一个 *.yaml
 │   └── dev.yaml / prod.yaml.example
 ├── deploy/
 │   └── docker-compose.yml          # etcd + MinIO + milvus standalone
@@ -194,7 +225,7 @@ multi-modal-rag/
 │   │   ├── index_graph.py
 │   │   ├── query_graph.py
 │   │   └── state.py
-│   ├── agent/                      # deepagents: main / subagents / tools / backend
+│   ├── agent/                      # main / registry / subagent contracts / tools / backend
 │   ├── api/
 │   ├── cli/
 │   ├── eval/
@@ -320,7 +351,7 @@ retrieval:
     sparse: { field: sparse, limit: 20, weight: 1.0 }
     fusion: { strategy: rrf, k: 60 }   # rrf | weighted（rrf 下权重必须都是 1.0，见 ADR 16）
   optional_channels: []        # 按 query 类型和语料启用，M2 起
-  transform: { multi_query: 0, hyde: false }
+  transform: { multi_query: 0, hyde: false, hyde_max_chars: 600 }
   rerank:    { enabled: true, top_n: 8 }
   assemble:  { max_tokens: 6000 }
 
@@ -1161,7 +1192,7 @@ retrieval:
     - {name: kg, type: neo4j, enabled: false, complement_only: true, top_k: 10}
 ```
 
-* **`name`** 是这一路的身份：日志、通道账本、RRF 的 `sources`、`--channel` 与 `/search` 的
+* **`name`** 是这一路的身份：日志、通道账本、RRF 的 `sources` 与 CLI `--channel` 的
   `channels` 参数全都用它（重名会被配置校验拦下 —— 两套身份是最容易出错的地方）；
 * **`enabled`** 是参不参与检索的**唯一**开关；
 * **`complement_only`** 覆盖适配器默认值（只补位：与别路重复的候选丢掉，只贡献新块）；
@@ -1239,24 +1270,10 @@ pip install -e plugins/rag-dots-parser   # 默认 PDF 链路需要
 
 **learned sparse ≠ BM25，不能互相替代。** 稀疏向量权重是模型学的、能做 term expansion，对「语义相近但用词不同」召回更好；BM25 是纯统计，对精确串匹配反而更稳。
 
-**bm25 通道为什么默认关（2026-10-07 实测）**：它和 hybrid 的稀疏腿是**同一份**
-Milvus 内建 BM25（同索引、同 `chinese` analyzer、同一次打分），所以不可能召回 hybrid
-看不到的文档；它实际做的只是把同一份证据在 L2 的 RRF 里**投两票**，外加把服务端 RRF
-截断掉的稀疏命中捞回来一点。27 题检索层对照（`rag eval --channel hybrid,bm25` vs
-`--channel hybrid`，同一索引、同一配置）：
-
-| 指标 | 开 bm25 | 关 bm25 |
-|---|---|---|
-| recall@8 | 87.5% | 87.5% |
-| top1 | 62.5% | 62.5% |
-| MRR | 71.70% | **71.43%** |
-| nDCG@8 | 75.58% | **75.36%** |
-| 名次有变化的题 | 2 / 27（一升一降） | |
-
-单条查询的账本更直观（Kafka 日志保留时间那题）：`hybrid 10→入选 7`、`bm25 10→入选 5`，
-两路重叠 4 条 —— **bm25 真正独有的只有 1 条，而那条是个跑题的 Flink 块**；
-正确答案 `log.retentionminutes` 反倒被挤到第 8（关掉 bm25 回到第 7）。
-代价那边也没占到便宜：多一次 Milvus 往返（实测 142ms）。
+**bm25 通道为什么默认关**：它和 hybrid 的稀疏腿是同一份 Milvus 内建 BM25
+（同索引、同 analyzer、同一次打分），不会提供新的数据源；独立成一路只会在 L2 RRF
+里给同一份证据重复投票，并额外增加一次 Milvus 往返。因此关键词能力留在 hybrid 内部，
+不再暴露为第二个通道。
 
 **但 M1 的结论是：本项目暂时只有 BM25 可用。** fastembed 拿不到任何 learned sparse 模型
 （也没有 bge-m3），所以「hybrid 主通道」的 sparse 腿由 Milvus 内建 BM25 承担（ADR 13）。
@@ -1266,7 +1283,7 @@ Milvus 内建 BM25（同索引、同 `chinese` analyzer、同一次打分），�
 
 ### 9.2 增强环节
 
-- **transform**：HyDE / multi-query 展开 / 问题分解
+- **transform**：HyDE **已实现**；multi-query 展开 / 问题分解仍未实现
 - **fusion**：跨通道 RRF（L2 层，客户端）—— **已实现**（2026-10-03，`retrieval/fusion.py`）
 - **rerank**：本地 cross-encoder（flashrank / sentence-transformers 两个 backend），
   把融合后的 20 条候选重排 —— **已实现**（2026-10-03，`providers/rerank.py`，见 §9.4）
@@ -1275,7 +1292,9 @@ Milvus 内建 BM25（同索引、同 `chinese` analyzer、同一次打分），�
 
 **M1 已实现 assemble**（`retrieval/assembler.py`），**L2 融合已在 2026-10-03 落地**
 （`retrieval/fusion.py` + `retrieval/multichannel.py`），**重排也在同一天落地**
-（`providers/rerank.py`）；`transform` 还是配置里的空位。
+（`providers/rerank.py`）。HyDE 于 2026-10-29 落地：`RAG_HYDE=true` 时用当前
+chat 模型生成假设资料，与原问题双路召回，RRF 融合后用原问题重排一次；纯图查询
+跳过 HyDE，生成或假设腿失败时回退原问题检索。multi-query 与问题分解仍是空位。
 装配阶段有三条不显眼但会直接决定答案质量的规则：
 
 1. **同一块被多路召回时只保留排名最靠前的那次** —— hybrid 下这是常态，不去重会让同一条资料
@@ -1413,12 +1432,12 @@ Milvus 3.0.2 确实自带重排能力（schema 上的 `FunctionType.RERANK`）�
 
 **这一批的边界**：只做 1~2 跳召回，**不做社区摘要/全局问答**，也**不做实体消歧**
 （同名不同义靠 `docs` 属性区分；后续要更细的消歧，得在 `names` 上再加一层来源约束）。
-当前只灌了 Flink 两章（354 实体 / 426 关系）。**A/B 结果：在现有黄金集上没有可测量的提升
-（27 条里名次变化 0 条），所以全量灌图暂缓** —— 原因与下一步见 §13.3。
+当前只灌了 Flink 两章（354 实体 / 426 关系）。由于当前没有固定评测集，图通道不宣称
+检索收益；全量灌图暂缓，先等真实跨文档多跳问题作为评估输入。
 
-**它声明了 `complement_only = True`**（2026-10-05 加的）：融合层会把它与 hybrid/bm25
-重复的候选丢掉，只让它贡献新块。理由与实测见 §13.3 —— 同一批块再投一票改不了名次，
-而这条通道每次查询要花 ~350ms。**默认不启用**（`dev.yaml` 的 `optional_channels` 是空的）。
+**它声明了 `complement_only = True`**：融合层会把它与主通道重复的候选丢掉，只让它
+贡献新块；这一路每次查询约 350ms，目前**默认不启用**（`dev.yaml` 的
+`optional_channels` 是空的）。
 
 **真机三方对比（2026-10-03，`rag_dev_qwen3vl_v1`，26 条候选池）**：
 
@@ -1509,7 +1528,7 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 ### 10.3 还没做
 
 * ~~**流式输出**：`generate` 目前一次性返回~~ —— **已落地**：`generator.astream` +
-  `/chat`、`/agent` 的 SSE（见 §11.5 与 §12.3）。这条 2026-10-12 从内部待办清单里清掉。
+  `/agent` 与日志流的 SSE（见 §11.5 与 §12.3）。这条 2026-10-12 从内部待办清单里清掉。
 * **web 检索通道**：agent 侧已可用（`web_search_tool` + `WebSearchGate`，§11.6），
   检索层还没有适配器 —— 要加就得走 §9.2 的插件。
 * **把图谱 / web 写进 LangGraph 的节点**：现在两者都不在图里 —— 图谱是检索层的一路通道
@@ -1535,33 +1554,43 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 
 ### 11.1 现状
 
+> **2026-10-30 已取代下面这批 10-08 的“无 subagent”决定。** 当前结构是主 Agent
+> Supervisor + 三个文件配置的专业子 Agent；检索页、`/search`、`/search/image`、
+> 快问答 `/chat` 均已删除。10-08 关于“不要按 dense/BM25/HyDE 拆 Agent”的结论仍成立，
+> 现在的拆分边界是证据来源，不是检索引擎内部通道。
+
 | 组件 | 是什么 |
 |---|---|
-| 知识工具（`agent/tools.py`）**四个** | `search_knowledge`（**一次调用 = 一次融合检索**：所有启用的通道并发 + 融合 + 重排，`modality` 用来只看某类块）/ `list_documents`（有哪些文档）/ `get_section`（取某几节原文）/ `web_search_tool`（网络，带闸门） |
-| 项目自定义 subagent | **没有**（2026-10-08 撤）。即使 deepagents 自动注入 general-purpose / `task`，ToolPolicy 也会把它从模型可见面和执行面同时裁掉 |
-| 工具策略 | `ToolPolicyMiddleware`：`readonly` 只允许知识工具 + 只读文件工具；`report` 另允许 `write_file` / `edit_file`；`task` / `delete` / `execute` 默认拒绝 |
-| 主 agent | `create_deep_agent(model=build_chat(agent.chat), tools, subagents=[], backend=StateBackend(), checkpointer=PG, store=PG)` |
+| 主 Agent | 负责意图识别、子 Agent 选择、证据融合和最终答案。直接工具只有网络搜索和网页抓取（外加 workspace 文件工具）；知识检索交给子 Agent |
+| `policy-document` | 制度、规则、SOP、手册和普通文档；工具为 `search_knowledge` / `list_documents` / `get_section` |
+| `relationship-graph` | 组织架构、人员关系、审批链与多跳路径；工具为 `search_relationships` / `get_section`，只有 `kg` 通道启用时才加载 |
+| `business-data` | 员工、订单、库存等精确业务数据；通过公司业务 MCP 工具查询，不允许模型生成 SQL。MCP 未接入时文件保持禁用 |
+| 配置加载 | 每个子 Agent 一个 `config/agents/*.yaml`；启动时 Pydantic 严格校验并编译成 deepagents `SubAgent`，运行中不热加载。`mode` 固定为 `isolated`；`max_tool_calls` 配置独立预算 |
+| 工具策略 | 主 Agent 可见 `task`，但只接受 Registry 里的子 Agent；子 Agent 使用精确白名单，默认文件工具不可见。主/子工具按 namespace 分域计数，`EvidenceResult` 不占业务额；到预算后禁止继续调用但仍允许最终作答 |
 | CLI / API | `rag agent "问题" [--thread-id] [--no-writes]` / `rag agent --resume --thread-id <会话> --approve` / `POST /agent {message, thread_id, stream}` / `POST /agent/resume {thread_id, decisions}` |
 
 ### 11.2 三个关键决定
 
-1. **通道查询只有一条路：`search_knowledge`**（2026-10-08 定）。关键词、图片、图谱都不再
-   单独开工具：关键词是主通道里的 sparse 腿、图片靠 `modality` 过滤、图谱是一路**通道**
-   由检索层融合。判据很实在 —— 工具一多，模型就会分头调、再用文字合并结果，
-   而"哪条支撑哪句话"是靠 RRF 的分数与引用编号钉住的，不能交给模型的印象。
-   （代价要说清：撤掉 `mode="isolated"` 的 subagent 之后，中间结果会累积在主上下文里；
-   换来的是"一次工具调用 = 一次融合检索"这个形状。）
+1. **按证据来源拆 Agent，不按 dense / BM25 / HyDE 拆。** 同一份制度文档内部的混合检索、
+   融合与重排仍由 `search_knowledge` 一次完成。拆出来的是文档、图关系、业务 MCP 三类
+   不同数据面和访问方式，避免让模型用文字拼多路检索结果。
 2. **引用编号由我们发**（`EvidenceLedger`）：工具返回的每条命中拿一个**全局递增的 `[n]`**，
    同时登记 `n → Citation`；网页结果也登记到同一张表。答案里的 `[n]` 直接查表，同一个来源
    复用同一个号；返回给调用方时**只列答案里真的引用到的那些**（召回了 20 条只用 3 条时，
    全塞回去会让「哪条支撑哪句话」看不出来）。
 3. **每请求建图、但不重建模型**：工具要闭包住这次的引用表，所以图不能全局共享；
    而 embedder / reranker / chat 都在 `graphs/wiring.py::build_heavy` 里只建一次（M3 的教训）。
-4. **提示词只钉稳定契约**（2026-10-23）：主提示词负责证据优先、检索内容不可信、工具边界、
-   引用、冲突 / 部分回答和输出顺序；工具参数细节留在工具 docstring，格式例子留在 skill。
-   尤其明确 `task` 不用于委派检索，多节原文必须一次 `get_section` + `headings` 批量取，
-   低分检索反馈只指向 `web_search_tool`，不再提已删除的 `web-researcher`。
-   `tests/test_agent_tools.py` 钉住这几条，防止提示词以后在重构中被悄悄改薄。
+4. **主 Agent 就是意图路由器。** 不再额外增加一次 LLM 分类调用；deepagents 的 `task`
+   根据文件里的 name / description 选择子 Agent。工具可见面从 Registry 动态生成，
+   不可用的数据面根本不会出现在候选清单中。
+   主提示词要求先识别问题信息点，并以**最小充分证据**为目标；证据足够后不得用同义词
+   重复检索或继续检查无关文档。`policy-document` 同样采用有界流程：一次搜索、
+   一次批量读取必要章节，最多一次 query rewrite，然后返回证据或 limitations。
+5. **预算按执行域隔离。** v3 工具事件的 `params.namespace` 为空才是主 Agent 调用；
+   子 Agent 的内部工具不再消耗主 Agent 的 12 次预算。主、子各自通过
+   `ToolCallBudgetMiddleware` 拒绝超额调用；计数存放在 LangGraph run state，每次
+   子 Agent `task` 自动从 0 开始。模型仍可基于现有证据输出最终答案或 `EvidenceResult`，
+   不再由事件流直接 `break`。多文档比较由主 Agent 按文档拆成独立任务。
 5. **工具权限用中间件，不靠提示词自觉**（2026-10-23）：`ToolPolicyMiddleware` 集成
    `AgentMiddleware`，模型请求阶段按允许列表裁掉工具，执行阶段再拒绝越权调用。后者防的是
    历史消息、缓存或模型幻觉绕过“它看不见”；两处共用同一个 `ToolPolicy`，测试覆盖编译后
@@ -1577,9 +1606,9 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 ```python
 agent = create_deep_agent(
     model=build_chat(settings, secrets, settings.agent.chat),   # 用哪家见 agent.chat（.env 的 AGENT_CHAT）
-    tools=build_tools(settings, heavy, registry, gate=gate),
-    subagents=[],                           # 不再声明项目自己的检索 subagent
-    system_prompt=SYSTEM_PROMPT,            # 证据、安全、冲突与输出契约
+    tools=[web_search_tool, web_fetch_tool], # 网络工具留在主 Agent
+    subagents=agent_registry.build_subagents(...),
+    system_prompt=system_prompt,             # 基础契约 + 当前可用子 Agent 清单
     backend=CompositeBackend(default=StateBackend(), routes={
         "/workspace/": FilesystemBackend(root_dir="./data/workspace"),  # 报告落盘
     }),
@@ -1601,8 +1630,8 @@ interrupt profile）确实对 Anthropic 支持最好，但价格也是最贵的 
 决定（默认 `default`，即 deepseek）。
 
 **框架注入的兜底**：deepagents 自动注入的 general-purpose / 文件工具先经过 ToolPolicy
-白名单。`task` 始终不可见、也不可执行；文件工具按 `readonly` / `report` 档位裁剪。
-引用格式已经按 skill 加载；图谱只作为检索通道，不再做 subagent。
+白名单。`task` 只有 Registry 至少生成一个子 Agent 时才可见；即使模型尝试调用
+`general-purpose` 或配置外名称，执行面也会拒绝。文件工具按 `readonly` / `report` 档位裁剪。
 
 ### 11.5 批次 B：可写 workspace + HITL + 流式（2026-10-04）
 
@@ -1639,8 +1668,9 @@ interrupt profile）确实对 Anthropic 支持最好，但价格也是最贵的 
   用的是中断前发的号；不存，恢复后的答案会显示成「一条引用都没有」。取不到就给空表 ——
   引用丢了不该让恢复直接失败。
 
-**流式**（`stream_agent`，`stream_mode=["messages", "updates"]`）四种事件：
-`token` / `tool` / `interrupt` / `done`。两个实测细节：中断在 updates 里是
+**流式**（`stream_agent`，`stream_mode=["messages", "updates"]`）五类事件：
+`status` / `token` / `tool` / `interrupt` / `done`。`status` 由 v3 的模型开始、工具开始/结束、
+首个正文 token 和中断状态生成，只说明当前高层动作，不暴露内部推理。两个实测细节：中断在 updates 里是
 `__interrupt__` 这个键（值是个 tuple）；**子 agent 的 token 会混在同一个 `messages` 流里**，
 不过滤就会把子 agent 的中间话术当成答案吐给用户 —— 判据是路径 `checkpoint_ns` 有没有多段
 （主图一段、子图用 `|` 拼多段）。
@@ -1667,17 +1697,16 @@ interrupt profile）确实对 Anthropic 支持最好，但价格也是最贵的 
 **`web_search_tool`**：使用者自研的智谱 web 搜索接进来了 —— key 从 `Secrets.zhipuai_api_key`、
 base_url 从 `providers.chat.zhipuai.base_url`（**机密不进 yaml / Settings**：
 `rag config` 会把整棵配置树打出来）。真机调过一次，返回带链接的真实结果。
-**2026-10-08 起它直接挂主 agent**，不再藏在一个 `web-researcher` subagent 后面：
-「网络只当兜底」这条现在是 `WebSearchGate` 这个**机制**在管（语料没查过、或语料已有结果
-→ 工具直接拒绝并回理由），不靠"主 agent 手上没有这个工具"。
+**网络搜索与网页抓取都直接挂主 Agent**，不单独创建 `external-realtime` Agent。
+「网络只当兜底」仍是 `WebSearchGate` 这个**机制**在管：只有用户明确允许时才放行；
+内部证据为空或不足时，只提示模型先询问用户，不自动调用。
 **Web 结果也进入 `EvidenceLedger`**（2026-10-23）：每条结果拿到与语料块同一编号空间的
 `[n]`，`source_type=web`、`title` 和 `url` 一起返回；前端点击时打开原链接，CLI 的来源清单
 明确写「来自网络」。不再出现“正文有编号、调用方却只有一段纯文本”的第二套来源格式。
 
-**图谱（`search_graph` 工具已删）**：§9.6 的知识图谱现在只以**一路通道**的身份出现
-（`type: neo4j`，`complement_only`：只补别人没找到的块），由检索层融合。
-原来那个 `graph-explorer` subagent 与 `search_graph` 工具在 2026-10-08 一并撤掉，
-理由与「知识工具只有四个」是同一条。它历史上的实测结论保留在这儿：**真机那轮模型没选它**
+**图谱（2026-10-30 重新有专用子 Agent）**：`relationship-graph` 只在 `kg` 图通道启用时加载，
+通过 `search_relationships` 查组织架构、人员关系和多跳路径；关系附带的原文仍用
+`get_section` 取回。它不再负责普通文档检索或业务数值。这段历史实测保留在这儿：
 （问「Flink 和 Spark 在定位上有什么不同」，它走了 `list_documents → search_keywords →
 search_knowledge → get_section`，11 步、引用 12 条，一次图谱都没查，答案是对的），
 与 §13.3 的 A/B 一致 —— 这份语料上关系信息本来就在正文里，所以图谱通道默认不开。
@@ -1710,8 +1739,7 @@ skills 是从 **backend** 读的（中间件只认 backend 路径），所以要
 | 端点 | 说明 | 状态 |
 |---|---|---|
 | `GET /health` | Milvus / Redis / 模型**分开报**，哪个挂了单独看得见 | ✅ |
-| `POST /search` | 纯检索：M2 那一整套（多通道 + 融合 + 重排 + 过滤 + 以图搜图） | ✅ |
-| `POST /chat` | 问答；`stream=true` 走 **SSE**（`retrieval` → `token`* → `done`） | ✅ |
+| `POST /chat/transcribe` | 对话页语音转文字；只回文字，不落盘、不落库 | ✅ |
 | `POST /ingest` | 提交文档 → **202 + job_id**（后台跑 IndexGraph） | ✅ |
 | `GET /jobs/{id}` | 任务状态 / 结果 / 失败原因 | ✅ |
 | `GET /jobs` | 最近的任务（新的在前），页面靠它轮询进度 | ✅ |
@@ -1728,7 +1756,7 @@ skills 是从 **backend** 读的（中间件只认 backend 路径），所以要
 | `PATCH /documents/folders/{id}` | 目录改名 / 搬家（没传 `parent` 就是只改名） | ✅ |
 | `DELETE /documents/folders/{id}` | 删目录：里面的文档回「未分类」；有子目录 409 | ✅ |
 | `PUT /documents/folders/members` | 把几份文档放进一个目录 / 移回未分类（`{doc_ids, folder_id}`） | ✅ |
-| `POST /agent` | deepagents 对话式入口；`stream=true` 走 SSE（`token`/`tool`/`interrupt`/`done`） | ✅ |
+| `POST /agent` | deepagents 对话式入口；`stream=true` 走 SSE（`status`/`token`/`tool`/`interrupt`/`done`） | ✅ |
 | `POST /agent/resume` | 批准 / 拒绝被中断的写操作，接着跑（`{thread_id, decisions}`） | ✅ |
 | `GET /chunks/{id}` | 按 id 取一个块的原文（前端「点开引用看原文」） | ✅ |
 | `GET /assets/{path}` | 取原始资产（图片）；**只认 assets 根目录底下、解析之后仍在根内**的路径 | ✅ |
@@ -1769,8 +1797,8 @@ skills 是从 **backend** 读的（中间件只认 backend 路径），所以要
 `generator.astream`。检索纠错发生在第一个 token 之前，不需要把已发出的 token 回滚；
 `stream=true` 与 `stream=false` 只差最后一步的生成方式。
 
-`/agent` 的流式（批次 B）复用同一套心跳与断线取消，事件换成
-`token` / `tool` / `interrupt` / `done` —— agent 不是一条直线，中间会调工具、也可能停在
+`/agent` 的流式（批次 B）复用同一套心跳与断线取消，事件为
+`status` / `token` / `tool` / `interrupt` / `done` —— agent 不是一条直线，中间会调工具、也可能停在
 等人批准那一步，所以「工具结果」与「中断」都要能推给客户端。
 
 ### 12.4 已知取舍
@@ -1827,7 +1855,6 @@ skills 是从 **backend** 读的（中间件只认 backend 路径），所以要
 rag ingest ./data/docs --collection rag_v1
 rag ask "问题" --show-sources
 rag search "关键词" --channel hybrid --top-k 10
-rag eval --dataset eval/golden.jsonl
 rag serve
 rag sessions list                     # 看有哪些会话（含「⏸ 等人批准」）
 rag sessions prune --keep 5           # 只保留最新 5 个；--dry-run 先看要删什么
@@ -1896,7 +1923,7 @@ web/                 Vue 3 + TypeScript + Vite（pnpm 管理；**不引 UI 组�
   src/api.ts             接口薄封装：带 X-API-Key、拼 URL、把 SSE 拆成事件、取图转 blob
   src/generated/openapi.ts  后端 OpenAPI schema 生成的 TS 类型（不手改）
   src/components/        NavRail / HitCard / LedgerTable / DetailPane / AssetImage
-  src/views/             SearchView / ChatView / DocumentsView / LogsView（四个页面，**没有占位页**）
+  src/views/             ChatView / DocumentsView / LogsView（三个页面，**没有占位页**）
   src/App.vue            外壳装配：左导航 + 主区 + 右抽屉，主区按 page 切
   vite.config.ts     开发期把后端那几条路径代理到 127.0.0.1:8000（**不加 CORS**）
 ```
@@ -1967,11 +1994,11 @@ Linux 版把日志落当前 profile 的 `<state_dir>/logs/`、PID 记 `<state_di
 三个刻意的决定：
 
 1. **流式用 `fetch` + `ReadableStream` 读 SSE，不用 `EventSource`** —— 后者不能自定义请求头，
-   而 `/chat`、`/agent` 都要 `X-API-Key`；用 `fetch` 还能 abort（页面上的「停止」直接触发
+   而 `/agent`、日志流都要 `X-API-Key`；用 `fetch` 还能 abort（页面上的「停止」直接触发
    后端那套断线取消）。
 2. **静态页不鉴权，数据端点全鉴权**：浏览器加载 `<script>`/`<img>` 时带不了 header，
-   所以页面与构建产物是公开的（本地工具，无敏感内容），而 `/search`、`/chat`、
-   `/chunks`、`/assets` 都走 router 上那道 `X-API-Key`（没配 key 时只允许本机）。
+   所以页面与构建产物是公开的（本地工具，无敏感内容），而 `/agent`、`/chunks`、
+   `/assets` 都走 router 上那道 `X-API-Key`（没配 key 时只允许本机）。
    **这条的代价是图片得自己取**：`<img src="/assets/…">` 一律 401，所以有 `AssetImage` ——
    带 key `fetch` 回来转 `blob:`，按路径缓存、key 一换整批作废（`interface.log` 里能同时看到
    同一张图的 401 `ip:…` 与 200 `key:…` 两条）。
@@ -2000,13 +2027,15 @@ Linux 版把日志落当前 profile 的 `<state_dir>/logs/`、PID 记 `<state_di
 第二批（会话留在本地 + 流式 agent 落运行日志）见 §12.9；
 下一步 **P3** 管理台（日志页、文档页、任务页都做完了，**会话页 2026-10-08 决定不做** ——
 会话的列表/回放/继续/删除/每轮 token 对话页的下拉本来就有，见 `web/README.md`；
-**评测页也 2026-10-08 决定不做** —— 它是一次性批处理、要过按量计费的线上模型，留在
-`rag eval` CLI 里，见 §13）；**P4** any-to-any 的检索侧图片输入已经落地：
-`POST /search/image` 负责 multipart 上传，检索框统一承载文字和图片附件；仍未做的是
-把图片直接送进对话或 agent。检索框内的 Top-k 是唯一的数量选择入口，内部通道组合与
-重排状态不暴露给用户；重排固定开启。
+**评测页不做**；固定黄金集和批量评测 CLI 已于 2026-10-29 移除，底层指标、judge 与
+ragas 适配器保留，见 §13）；**P4** 图片检索入口已于 2026-10-30 随检索页一起移除：
+`SearchView`、`/search`、`/search/image` 和前端相关 API 均已删除。当前 Web 入口只有
+对话页、文档页和日志页。
 
 ### 12.8 对话页：两条路、以及 HITL 批准（2026-10-05，P2 第一批）
+
+> **2026-10-30 已取代“两条路”。** `/chat` 与快问答从前后端移除，`/agent` 是唯一问答入口；
+> 下面的双路比较只保留为历史设计记录。
 
 **`/chat` 与 `/agent` 差在哪**（这决定了 UI 该给几个按钮）：
 
@@ -2433,7 +2462,10 @@ chrome 不进正文（实测同一页：本机 HTML 抽出来 `Copy page` 出现
 
 **「点左边 → 右边定位」试过、当天又整个删掉了**（2026-10-08，使用者两次改主意后的定论）：
 **不做映射** —— 右栏就是**原文**：PDF 交给浏览器内置查看器（**上下连续滚动、不分页**），
-其余格式整份看。做过的那些（下面 1–3 条）连同接口、模块、配置、测试一起删了 ——
+DOCX 由前端 `docx-preview` 渲染标题、正文、表格和基础样式；复杂分页、页眉页脚、批注与
+修订痕迹不承诺和桌面 Word 完全一致。核对页采用阅读视图，正文按右栏宽度连续重排，
+不把整张 A4 页面缩小后塞进窄栏；后续 PPTX 使用独立的幻灯片适配视图。其余格式整份看。做过的那些（下面 1–3 条）连同接口、
+模块、配置、测试一起删了 ——
 `/documents/{id}/page/{n}`、`/documents/{id}/locate`、`ingest/pdf_pages.py`、
 `ingest.page_view` 配置、大纲行上的页码字段，全部不再存在。
 
@@ -2519,6 +2551,8 @@ bbox 存进产物** —— `Position` 加坐标字段，`dots` 的响应里本�
 显示）。HTML 走 **`<iframe sandbox="">`**（不带 `allow-scripts`，脚本与表单全关掉）+ 响应
 头的 `CSP: sandbox` 与 `nosniff` —— 抓回来的是第三方页面，这是唯一有安全面的地方。
 PDF 交给浏览器内置查看器，图片给 `<img>`，纯文本前端取回来放 `<pre>`（截断到 20000 字）。
+DOCX 保持原始字节返回，由前端 `docx-preview` 渲染成只读 HTML；库按需动态加载，
+失败时保留下载原文件入口。
 
 **各阶段的数字是现算的**（`ingest/summary.py` 的纯函数：`parse_stats` / `chunk_stats` /
 `section_rollup` / `vector_bytes`），读两份产物 json，**不写进产物格式** —— 报表不是数据，
@@ -2531,6 +2565,8 @@ PDF 交给浏览器内置查看器，图片给 `<img>`，纯文本前端取回�
 章节树的做法：`heading_path` 本来就是**从根到该节的完整路径**（`章 -> 节 -> 小节`，
 由人工核对过的清单拼出来），按 ` -> ` 拆开、同一串前缀归到同一个父节点，渲染时按深度
 缩进 —— 前端摊平成「带层级的行」再渲染（按文档顺序，不用递归组件）。
+由更深路径带出来的容器父节点没有自己的汇总行和编号；前端按“自身编号 → 标题作者编号 →
+首个可推断子节点的前缀”补全，避免有子节点时父节点编号显示成 `—`。
 **默认全折叠**（2026-10-07 使用者定的），点行首箭头展开：668 节那种树默认铺满一屏没法看。
 注意实测多数文档只有一个根节点，所以默认那屏只露 **1 行**（那一行还可能是个"自己没有
 正文"的容器，块/字显示 `—`）。所以**带子节点的行另外写一行「含子项 N 块 / M 字」**
@@ -2582,9 +2618,12 @@ Kafka 2.5 PDF 的 668 节里有不少），那种行显示 `—` 而不是 0；�
 
 ```json
 { "folders": [{"id": "f0a1", "name": "Flink", "parent": null}],
-  "members": {"<doc_id>": "f0a1"} }
+  "members": {"f0a1": ["<doc_id>"]} }
 ```
 
+`members` 的 key 是文件夹 id、value 是文档 id 数组；空文件夹不写 key。
+一份文档仍只能有一个归属。读到旧版 `doc_id → folder_id` 时会自动分组迁移，
+下一次写入按新格式落盘。
 与 `_index.json` **分开**：那份是「一个 doc_id 一条」，塞进去要么破坏形状，要么挪一次
 目录就重写整份索引。丢了当没有（目录全没、文档全回未分类），与 `_index.json` 同一个立场。
 以后换文件服务器（MinIO / 共享盘）时，这份元数据跟着文件走，不用另建库。
@@ -2609,6 +2648,10 @@ Kafka 2.5 PDF 的 668 节里有不少），那种行显示 `—` 而不是 0；�
 时那一格也留着**，刚把最后一份拖走、想拖回来的时候才用得上）。**拖拽目录本身去改父子关系
 没做**：后端支持，但使用者要的是「拖文件进目录」，先把这条路走通。
 顶部那条上传/导入的旁边有个「放进哪个目录」，落盘之后顺手归类（没选就不调那个接口）。
+
+页面补充（2026-11-02）：即使没有文档也可渲染目录树并新建空目录；支持按当前阶段筛选
+（已上传 / 已解析 / 已核对 / 已切分入库），筛选后点击整行多选，并提供“全选当前结果 /
+取消全选”。文档阶段徽标改为四个累计阶段，不再把“已切分”和“已入库”拆成两项。
 
 **没做的**：拖目录改父子关系；跨目录的多归属；「只在某个目录里检索」（那是检索侧加过滤，与组织方式
 无关）；**并发写保护** —— 现在读-改-写没有锁，与 `_index.json` 一样只有一个进程在写，
@@ -2712,162 +2755,53 @@ ASR 的 `max_retries` 默认 **0**，失败多半是格式或时长的问题，�
 「剩下的没取」。**5 这个上限是「敢让它一次多要」的前提**：不限的话它会把整章一次拖进来，
 那比多跑两轮更贵。工具说明里也写清了「确知缺哪几段就一次要全」—— 得给它一个这么用的理由。
 
-**没收手的那半边**：快问答与 agent 的分工没动 —— 单跳问题本该走 `/chat`，只有多跳推理
-或要写文件才值得上 agent。页面现在是「有历史就锁死 agent」，所以续着聊就一直在 agent 那条。
+**2026-10-30 起**：快问答 `/chat` 与检索页均已移除，所有 Web 问答统一走主 Agent。
+QueryGraph 与普通 AnswerEngine 仍作为 CLI/评测和 `policy-document` 的底层能力保留。
 
 ---
 
-## 13. 评测与观测（2026-10-05 落地）
+## 13. 评测与观测
 
-### 13.1 三层结构
+### 13.1 当前边界（2026-10-29）
 
-```
-eval/golden.jsonl        一行一个问题 + 判据（人维护，进 git）
-src/rag/eval/            dataset（校验）→ runner（跑）→ judge（花钱的判定）→ report（两份报告）
-eval/reports/*.json|md   每次跑的报告（.gitignore 已忽略）
-```
+仓库不再维护固定黄金集，也不再提供批量 `rag eval` 命令。此前
+`eval/golden.jsonl` 的问题、证据和答案要点均由 LLM 自动生成，没有人工标注；
+它不能代表真实用户问题分布，因此相关绝对指标已经从 README 和结果文档撤回。
 
-```bash
-rag eval                                # 只跑检索：本地 embedding，不花钱
-rag eval --judge                        # 加生成侧判定：每个问题一次模型调用（花钱）
-rag eval --label no-rerank --no-rerank  # A/B：改前缀，对比两份 JSON
-```
+### 13.2 保留的评测原语
 
-**评测跑的是生产链路本身**（`build_retriever` + `assemble` + `heavy.generator` +
-`heavy.chat`，见 `eval/wiring.py`）—— 另写一条「简化版检索」等于给自己发一张假成绩单。
+`src/rag/eval/` 保留与数据来源无关的底层能力：
 
-### 13.2 指标
-
-| 层 | 指标 | 回答的问题 | 花钱 |
-|---|---|---|---|
-| 检索 | `recall@k` / `mrr` / `nDCG@k` / `top1` | 材料找得到吗、好找吗、排序好不好 | 否 |
-| 生成 | **引用准确率** | 答案里的 `[n]` 指的那段原文，是否真支持该编号所在的那句话 | 是 |
-| 生成 | 要点覆盖率 | `answer_points` 里被讲到几条 | 是 |
-| 生成 | 漏拒 / 误拒 | 语料外问题该拒没拒 / 不该拒却拒了（分开数，修法相反） | 是 |
-| — | 判不了 | 模型输出解析不出来。**不算通过**，单列 | — |
-
-**引用准确率必须自己写**：ragas 的 faithfulness 看的是「答案是否忠于上下文」，而我们要的
-是更窄的一件事 —— 那个编号指的片段能不能支撑它所在的那句话。两者对「引用了无关片段」的
-容忍度不一样，而后者才是引用能不能点开的依据。**两者互补，不是替代**：自研的看「引用站不站得住」，
-ragas 的看「答案有没有超出上下文」。
-
-**ragas 已经装并接上（2026-10-05，`--ragas` 开关）**，但有一个必须先垫的坑：ragas 0.4.3
-（当前最新）在 `ragas/llms/base.py` 里 `from langchain_community.chat_models.vertexai import
-ChatVertexAI`（还有 `llms.vertexai.VertieAI`），而我们这套 `langchain-community` 0.4.2
-**已经把那两个模块移走了** —— 直接 `import ragas` 就是 `ModuleNotFoundError`。
-它只是把这两个名字再导出、做类型判断，我们不用 Vertex，所以在 `eval/ragas_backend.py` 里
-塞两个占位类进 `sys.modules` 即可（上游补上就能删）。另外**必须给异步 client**：
-ragas 内部走 `agenerate`，传同步 `OpenAI` 会报「Cannot use agenerate() with a synchronous client.」
-
-真机实测（deepseek-chat 当裁判，同一段上下文）：
-
-| 答案 | faithfulness |
+| 能力 | 用途 |
 |---|---|
-| 「Save Points 把任务快照存在存储介质上…」（有依据） | **1.0** |
-| 「Save Points 会把数据写到 HDFS，每小时自动执行一次」（编的） | **0.0** |
+| `metrics.py` | recall@k / MRR / nDCG@k / top1 纯函数 |
+| `judge.py` | 引用准确率、要点覆盖、拒答与输出解析 |
+| `ragas_backend.py` | 可选 ragas faithfulness 适配器 |
+| `report.py` | 把 `EvaluationRow` 汇总成 JSON / Markdown |
 
-评测里它是**可选后端**：`rag eval --judge --ragas` 才多算这一项（每个问题再加一次调用），
-拒答/没有上下文那类不适用，报告里单独标「N 条适用」。
+以后可以从真实用户问题、线上检索快照或经过审核的数据集构造 `EvaluationRow`，
+再复用这些能力；不再要求为了新增文档维护一份 JSONL。
 
-### 13.3 基线（2026-10-05，`rag_dev_qwen3vl_v1`，1691 块）
+### 13.3 ragas 可选后端
 
-`rag eval --label baseline --top-k 8`，22 条检索条目：
+`pyproject.toml` 的 `eval` extra 仍保留 ragas。它是懒加载能力，不影响正常运行。
 
-| recall@8 | MRR | nDCG@8 | top1 |
-|---|---|---|---|
-| **86.4%** | 75.6% | 78.2% | 68.2% |
+> **2026-10-30 注**：下面的 `ChatResponse` / `/chat` 核验接线已随快问答入口移除。
+> ragas 适配器与 judge 原语保留，供离线评测或后续 Agent 后置核验复用。
 
-同一批问题、关掉重排（`--label no-rerank --no-rerank`）：
+快问答还可选用它做**生成后答案核验**：
 
-| 配置 | recall@8 | MRR | nDCG@8 | top1 |
-|---|---|---|---|---|
-| 有重排（默认） | **86.4%** | **75.6%** | **78.2%** | **68.2%** |
-| 无重排 | 81.8% | 54.7% | 61.1% | 45.5% |
+- `answer_verification.enabled=true` 时才启用；
+- 只检查 `/chat`，agent 已有一套工具闸门；
+- 用实际装配进上下文的片段调用 `Faithfulness`；
+- 分数达到阈值 → `supported`；低于阈值 → `low`；
+- 缺少上下文 → 直接 `low`，提示用户是否允许联网；
+- ragas 缺失、超时或 judge 报错 → `unavailable`，不把“没核验”伪装成通过；
+- 低分不会自动联网。用户在页面上明确点击后，复用 agent 的 `web=true` 与
+  `web_search_tool`，网络来源继续使用统一引用表。
 
-**重排在这套语料上是 +20.9pp MRR、+22.7pp top1**（召回只差 4.6pp）—— 也就是说它主要不是
-「多找到几条」，而是**把对的那条提到第一**。这是评测骨架交出的第一份有用结论：M2 那批
-把 `retrieval.rerank.enabled` 默认打开的取舍，现在有数了。
-
-生成侧（`rag eval --label judge-final --judge`，12 条带判据的条目）：
-
-| 指标 | 值 |
-|---|---|
-| 引用准确率（按问题平均，macro） | **90.0%** |
-| 引用准确率（按引用条数汇总，micro） | **69.2%**（共判 26 条引用） |
-| 要点覆盖率 | 94.4% |
-| 漏拒 / 误拒 | **0 / 0**（3 条语料外全部正确拒答） |
-| 判不了 | 0 |
-
-**两种引用口径要一起看。** macro 与 micro 差 21pp，原因很具体：一条语料外的问题正确拒答了，
-但它顺手把查过的 8 条无关材料列成了引用 —— 那 8 条不支持任何论断，把 micro 拖下来。
-于是有两件事可做（都还没做）：① 生成提示词里写明**拒答时不要列无关引用**；
-② 报告里对拒答条目单独看（现在漏拒/误拒本来就是单列的）。
-
-**这里还修了一次指标的错**：第一版把 `assemble` 发出去的**所有**编号都算进引用准确率的分母，
-而答案常常只用了其中几条 —— 那等于在问「你有没有把材料引用完」，跑出来 76.0%。改成只看
-**答案里真的引用到的**之后是 90.0%。判据写歪比指标难看危险得多，这一条同样适用。
-
-**图谱通道的 A/B：跑了，没有可测量的提升**（2026-10-05）。同口径对照（黄金集 24 条检索项，
-含为它加的两条关系类问题 `flink-vs-spark` / `flink-dependencies`）：
-
-| 配置 | recall@8 | MRR | nDCG@8 | top1 |
-|---|---|---|---|---|
-| `hybrid + bm25`（基线） | 87.5% | 71.7% | 75.6% | 62.5% |
-| **`hybrid + bm25 + graph`** | 87.5% | 71.7% | 75.6% | 62.5% |
-
-**逐题 diff：27 条里名次变化 0 条**（含 11 条 Flink 题 —— 图里正好只有这两篇文档）。
-`--stats` 显示这一路**确实在工作**：每次召回 10 条候选、各有 1 条进了最终 5 条，
-耗时约 400ms（对比 rerank 的 16s 可忽略）。
-
-三条原因，按重要性排：
-
-1. **带回来的块和 hybrid 命中的是同一批** —— 图只是给它们再投一票，而 RRF 的票数变化
-   不足以改变名次（rerank 之后更是如此）；
-2. **覆盖面**：图里只有 Flink 两章（354 实体 / 426 关系），另外 3 篇（Kafka 1208 块等）
-   一条边都没有 —— 14 条 Kafka/Docker 问题这一路直接空转；
-3. **问题类型**：这份黄金集大多是「找一段文本」，而图通道的长处是**跨文档的多跳关系**，
-   现有语料里这种问题很少（两条关系类题也只在单篇内部）。
-
-**决定：不全量灌图**（按事先说好的口径）。这 860 行代码与 Flink 两章的图保留 ——
-`rag graph query` 已经是排查实体/关系的现成工具，将来 M6 的 `graph-explorer` subagent
-也要用它；但要让它影响检索结果，得先解决上面第 1 条（见下）。
-
-**下一步的两个候选**（都还没做）：
-
-* **只补位**：图通道只返回 hybrid/bm25 没命中的块（过滤掉重复候选）—— 假设是「同一批块
-  再投票没有信息量，只有新块才有」，改动小、一次免费 A/B 就能验；
-* **灌全量 + 跨文档问题**：Kafka 那 1208 块灌图约几块钱，然后在黄金集里加真正需要多跳的
-  问题（「A 文档说的 X 和 B 文档说的 Y 是什么关系」）—— 验的是图通道的本命场景。
-
-**候选 1（只补位）已经做了，也没用**（用户定「先做 A」，同日）：通道可以声明
-`complement_only = True`，融合层会把它与别路重复的候选丢掉，只让它贡献新块
-（`ChannelStats.complement_dropped` 记着丢了几条）。
-
-```text
---stats 实测：graph 召回 10 → 丢重复 5 → 补进 5 条新块 → 入选 0
-评测（同一批 24 条）：87.5% / 71.7% / 75.6% / 62.5%  —— 与基线逐字节相同
-逐题 diff：名次变化 0 条；**没有任何图通道来源的块进过 top-5**
-```
-
-**这说明原假设不成立**：问题不在「重复投票稀释了名次」，而在**图补进来的新块本身不够竞争** ——
-rerank 拿同一批 hybrid 候选就把它们比下去了。根因还是那两条：图只覆盖 2/5 篇文档，
-而这些问题大多是单跳查找（图的「新块」恰好是 hybrid 有意没排高的邻居）。
-
-于是判断收敛到一件事：**要么按候选 2 去验图通道的本命场景（跨文档多跳），要么就承认
-这份语料上它没用**。当前 `graph` **不在任何默认配置里**（`dev.yaml` 的
-`optional_channels` 是空的），要跑得显式 `--channel hybrid,graph`；每次查询它多花
-~300-400ms，所以默认关着是对的。
-
-三条真 miss（报告里带「它召回了什么」，便于分辨是检索问题还是期望写歪）：
-
-- 「Kafka 快速开始里的 Step 7 是做什么的」→ 召回 `Step 8: Use Kafka Streams`（步骤号差一位）；
-- 「Kafka 2.5 的安全章节包含哪些小节」→ 召回文档总目录（目录页列了所有章名，语义上更"像"）；
-- 「listener.name 这种前缀是干什么用的」→ 召回 `8. KAFKA CONNECT -> REST API` 等。
-
-**第一次跑还暴露了两条我自己写歪的期望**（已改，并记在 golden.jsonl 的 `notes` 里）：
-`listener.name` 我指到了 `control.plane.listener.name`（那是控制器专用监听器，不是通用前缀）；
-日志保留时间我按 heading 找 `log.retention`，而 OCR 把配置名拼成了 `log.retentionminutes`。
-**这两条是事实错误，不是拿指标迁就系统** —— 判据写歪比指标难看危险得多。
+流的协议在 token 之后增加 `verification` 事件，再发 `done`；非流式
+`ChatResponse` 增加同名字段。当前核验状态不写入会话表，重新打开历史会话时不会恢复。
 
 ### 13.4 日志：三类各落一个文件；再顺手进一张 PG 索引表（2026-10-08）
 
@@ -3136,7 +3070,7 @@ Milvus 内部 bucket `milvus-bucket` 与两个应用 bucket 完全分离。
 UI 对话记录也跟随状态域：本地两档用各自目录下的 `chats.sqlite3`
 （启动自动建表、WAL），multiworker 继续用 PG
 `chat_session / chat_message / token_usage`。这样本地对话页不再返回“没配 PG”的 503，
-普通快问答与会话列表重启后都还在；LangGraph Agent 的 checkpointer 仍是另一层。
+Agent 会话列表重启后都还在；LangGraph Agent 的 checkpointer 仍是另一层。
 
 每个 profile 还会写状态 marker：
 
@@ -3337,7 +3271,7 @@ services:
 | 7 | `rag search` 三路召回正确排序 | ✅ | 两轮查询均把对应文档排到 #1（含 metadata 过滤） |
 | 8 | `rag ask` 生成段 | ⏳ | **未实测**：`.env` 里还没有任何 chat provider 的 API key。检索→装配→引用→构造 model 这一段已走通（缺 key 时报的是我们自己的中文提示，不是 LangChain 的晦涩异常） |
 | 9 | 单测 + lint | ✅ | 82 项用例（64 单测 + 18 集成）、`ruff check` / `ruff format --check` 干净 |
-| 10 | `rag eval` / `rag serve` | — | 仍是空壳，分别属 M6 / M4 |
+| 10 | `rag eval` / `rag serve` | — | 历史 `rag eval` 已移除；`rag serve` 属 M4 |
 
 **两件待办（需要用户决定或提供）：**
 

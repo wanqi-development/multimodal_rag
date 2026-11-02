@@ -55,6 +55,7 @@ def test_the_model_slots_exist_and_default_to_follow_the_existing_config() -> No
     settings = load_settings(profile="dev", directory=CONFIG_DIR)
 
     assert settings.models.backend == "sqlite", "默认 docker-single 是零中间件的单机档"
+    assert settings.agent.agents_dir.endswith("config/agents")
     assert list(settings.models.slots) == [
         "chat.fast",
         "chat.agent",
@@ -151,6 +152,16 @@ def test_env_interpolation_overrides_default(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("MILVUS_URI", "http://milvus.test:19530")
     settings = load_settings(profile="dev", directory=CONFIG_DIR)
     assert settings.indexing.vector.uri == "http://milvus.test:19530"
+
+
+def test_hyde_switch_and_limit_come_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RAG_HYDE", "true")
+    monkeypatch.setenv("RAG_HYDE_MAX_CHARS", "700")
+
+    settings = load_settings(profile="dev", directory=CONFIG_DIR)
+
+    assert settings.retrieval.transform.hyde is True
+    assert settings.retrieval.transform.hyde_max_chars == 700
 
 
 def test_env_interpolation_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
