@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from rag.config.schema import FusionConfig
-from rag.contracts import ChannelStats, Retriever, ScoredChunk
+from rag.contracts import (
+    ChannelStats,
+    RerankStatus,
+    RetrievalDegradation,
+    RetrievalResult,
+    Retriever,
+    ScoredChunk,
+)
 from rag.contracts.protocols import Reranker
 from rag.obs import record_channels
 from rag.retrieval.fusion import rrf_fuse
@@ -78,6 +85,15 @@ class MultiChannelRetriever:
         filters: dict[str, Any] | None = None,
         image: Path | None = None,
     ) -> list[ScoredChunk]:
+        return (await self.retrieve_result(query, top_k, filters=filters, image=image)).chunks
+
+    async def retrieve_result(
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+        image: Path | None = None,
+    ) -> RetrievalResult:
         # **每路要一样多**：候选数不对等时，给得多那一侧在融合里票更多（实测：hybrid 5 条
         # vs bm25 20 条）。池子同时留给下一层的 rerank —— 精排得有得挑才有意义。
         pool = max(top_k, self._fusion.candidates_per_channel)
@@ -98,20 +114,36 @@ class MultiChannelRetriever:
             k=self._fusion.k,
             sources=[channel.name for channel in self._channels],
         )
-        reranked, rerank_stat = await self._rerank(query, fused, top_k)
-        self.last_stats = self._stats(outcomes, reranked[:top_k], rerank_stat)
+        reranked = await self._rerank(query, fused, top_k)
+        hits = reranked.hits[:top_k]
+        stats = self._stats(outcomes, hits, reranked.stat)
+        self.last_stats = stats
         # **通道日志**（三类日志里的第三类）在这里落：这是唯一同时握着「每一路账本」
         # 和「最终结果」的地方，放到调用点去记一定会漏（调用点有五个）。
         # 落到 channel.log（挂在自己的 logger 上，见 obs/setup.py）。
         record_channels(
             query=query,
             channels=[channel.name for channel in self._channels],
-            stats=self.last_stats,
+            stats=stats,
             rerank=self._reranker is not None,
-            hits=reranked[:top_k],
+            hits=hits,
             filters=filters,
         )
-        return reranked[:top_k]
+        return result_from_rerank(
+            query,
+            reranked,
+            top_k,
+            stats,
+            [
+                RetrievalDegradation(
+                    stage=item.channel.name,
+                    code="channel_failed",
+                    message=f"{type(item.error).__name__}: {item.error}",
+                )
+                for item in outcomes
+                if item.error is not None
+            ],
+        )
 
     def _pool_for(self, channel: Retriever, default: int) -> int:
         """这一路要多少候选。配置里给了 `channels[].top_k` 就用它，否则用统一值。
@@ -154,9 +186,7 @@ class MultiChannelRetriever:
             )
         return result
 
-    async def _rerank(
-        self, query: str, fused: list[ScoredChunk], top_n: int
-    ) -> tuple[list[ScoredChunk], ChannelStats | None]:
+    async def _rerank(self, query: str, fused: list[ScoredChunk], top_n: int) -> RerankOutcome:
         return await rerank_hits(query, fused, self._reranker, top_n)
 
     async def _one(
@@ -210,45 +240,111 @@ def _ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 1)
 
 
+async def retrieve_channel_result(
+    retriever: Retriever,
+    query: str,
+    top_k: int,
+    filters: dict[str, Any] | None = None,
+    image: Path | None = None,
+) -> RetrievalResult:
+    """优先原子结果；旧插件只需 retrieve，不读共享 last_stats。"""
+    method = getattr(retriever, "retrieve_result", None)
+    if callable(method):
+        return await method(query, top_k, filters=filters, image=image)
+    hits = await retriever.retrieve(query, top_k, filters=filters, image=image)
+    kinds = {hit.score_kind for hit in hits}
+    return RetrievalResult(
+        query=query, chunks=hits, score_kind=next(iter(kinds)) if len(kinds) == 1 else "unknown"
+    )
+
+
+@dataclass
+class RerankOutcome:
+    """同一次重排的命中、账本与实际状态，不依赖共享的上次执行状态。"""
+
+    hits: list[ScoredChunk]
+    status: RerankStatus
+    reranker: str | None = None
+    stat: ChannelStats | None = None
+    degradation: RetrievalDegradation | None = None
+
+
+def result_from_rerank(
+    query: str,
+    outcome: RerankOutcome,
+    top_k: int,
+    stats: list[ChannelStats],
+    degradations: list[RetrievalDegradation],
+) -> RetrievalResult:
+    hits = outcome.hits[:top_k]
+    kinds = {hit.score_kind for hit in hits}
+    return RetrievalResult(
+        query=query,
+        chunks=hits,
+        stats=stats,
+        score_kind=next(iter(kinds)) if len(kinds) == 1 else "unknown",
+        rerank_status=outcome.status,
+        reranker=outcome.reranker,
+        degradations=[*degradations, *([outcome.degradation] if outcome.degradation else [])],
+    )
+
+
 async def rerank_hits(
     query: str,
     fused: list[ScoredChunk],
     reranker: Reranker | None,
     top_n: int,
-) -> tuple[list[ScoredChunk], ChannelStats | None]:
-    """重排一次；失败时退回融合顺序并记录账本。"""
-    if reranker is None or not fused:
-        return fused, None
+) -> RerankOutcome:
+    """重排一次；异常或空返回保留输入分数语义。"""
+    if reranker is None:
+        return RerankOutcome(fused, "disabled")
+    if not fused:
+        return RerankOutcome(fused, "skipped", reranker.name)
     if not query.strip():
-        return fused, ChannelStats(
-            channel=reranker.name,
-            candidates=len(fused),
-            kept=len(fused),
-            latency_ms=0.0,
-            error="纯图查询：重排需要查询词，已跳过",
+        return RerankOutcome(
+            fused,
+            "skipped",
+            reranker.name,
+            ChannelStats(
+                channel=reranker.name,
+                candidates=len(fused),
+                kept=len(fused),
+                latency_ms=0.0,
+                error="纯图查询：重排需要查询词，已跳过",
+            ),
         )
     started = time.perf_counter()
     try:
         reranked = await reranker.rerank(query, fused, top_n)
     except Exception as exc:  # noqa: BLE001
-        return fused, ChannelStats(
+        message = f"{type(exc).__name__}: {exc}（已退回融合顺序）"
+        code = "rerank_failed"
+    else:
+        if reranked:
+            hits = [hit.model_copy(update={"score_kind": "rerank"}) for hit in reranked]
+            return RerankOutcome(
+                hits,
+                "succeeded",
+                reranker.name,
+                ChannelStats(
+                    channel=reranker.name,
+                    candidates=len(fused),
+                    kept=len(hits),
+                    latency_ms=_ms(started),
+                ),
+            )
+        message = "重排返回空结果（已退回融合顺序）"
+        code = "rerank_empty"
+    return RerankOutcome(
+        fused,
+        "failed",
+        reranker.name,
+        ChannelStats(
             channel=reranker.name,
             candidates=len(fused),
             kept=0,
             latency_ms=_ms(started),
-            error=f"{type(exc).__name__}: {exc}（已退回融合顺序）",
-        )
-    if not reranked:
-        return fused, ChannelStats(
-            channel=reranker.name,
-            candidates=len(fused),
-            kept=0,
-            latency_ms=_ms(started),
-            error="重排返回空结果（已退回融合顺序）",
-        )
-    return reranked, ChannelStats(
-        channel=reranker.name,
-        candidates=len(fused),
-        kept=len(reranked),
-        latency_ms=_ms(started),
+            error=message,
+        ),
+        RetrievalDegradation(stage="rerank", code=code, message=message),
     )

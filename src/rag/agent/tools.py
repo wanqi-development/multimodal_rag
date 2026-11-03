@@ -62,6 +62,12 @@ class WebSearchGate:
     explicit: bool = False
     corpus_attempted: bool = False
     corpus_found: bool = False
+    corpus_unknown: bool = False
+
+    def note_corpus_unknown(self) -> None:
+        """有候选但相关性未确认，不等同于无资料，也不授予联网权限。"""
+        self.corpus_attempted = True
+        self.corpus_unknown = True
 
     def note_corpus(self, *, found: bool) -> None:
         """语料检索工具上报一次结果（`found=False` 也是有用信息）。"""
@@ -81,9 +87,11 @@ class WebSearchGate:
             )
         if self.corpus_found:
             return (
-                "内部证据已经足够，本次回答请以内部证据为准。"
-                "如果用户仍明确要求核对网络，再让用户打开联网授权。"
+                "内部已找到相关资料或读到原文，但不代表事实已核验。"
+                "如果用户要求核对网络，仍须先取得明确联网授权。"
             )
+        if self.corpus_unknown:
+            return "内部返回候选，相关性未确认。可继续取证；联网仍须先询问用户并取得明确授权。"
         return "内部证据不足。先询问用户是否允许联网，用户确认后才能调用网络工具。"
 
 
@@ -95,7 +103,15 @@ def build_tools(
     gate: WebSearchGate | None = None,
 ) -> list[Any]:
     """建这一批工具。``heavy`` 里带着 embedder / reranker（**不在这里重建模型**）。"""
-    from rag.retrieval import build_retriever, configured_hyde
+    from rag.service.retrieval import RetrievalService, assess_relevance
+
+    service = RetrievalService(
+        settings,
+        heavy.index,
+        heavy.embedder,
+        heavy.reranker,
+        heavy.chat,
+    )
 
     async def _search(
         query: str,
@@ -104,33 +120,26 @@ def build_tools(
         modality: str | None = None,
         channels: list[str] | None = None,
     ) -> str:
-        local = settings.model_copy(deep=True)
-        if channels:
-            wanted = set(channels)
-            for item in local.retrieval.channels:
-                item.enabled = item.name in wanted
-            if not any(item.enabled for item in local.retrieval.channels):
-                return f"没有可用的检索通道：{', '.join(sorted(wanted))}。"
-        retriever = build_retriever(
-            local,
-            heavy.index,
-            heavy.embedder,
-            heavy.reranker,
-            hyde=configured_hyde(local, heavy.chat),
-        )
+        if channels and not any(item.name in channels for item in settings.retrieval.channels):
+            return f"没有可用的检索通道：{', '.join(sorted(channels))}。"
         filters = {"modality": modality} if modality else None
-        hits = await retriever.retrieve(query, top_k, filters=filters)
-        # 「语料里有没有相关内容」：**不能只看结果空不空** —— 语义检索永远返回 top-k，
-        # 只是分数可能低到 0.008（实测：语料内有答案 0.9985，语料外 0.0077 / 0.0978）。
-        # 重排开着时分数可比，用阈值判；关着重排时分数是 RRF 名次分，不可比 → 退回「有结果就算有」。
-        rerank_on = local.retrieval.rerank.enabled
-        best = float(hits[0].score) if hits else 0.0
-        relevant = bool(hits) and (not rerank_on or best >= settings.agent.web_min_corpus_score)
+        result = await service.retrieve(query, top_k, filters=filters, channels=channels)
+        hits = result.chunks
+        relevance = assess_relevance(result, settings.agent.web_min_corpus_score)
+        best = max((float(hit.score) for hit in hits), default=0.0)
         if gate is not None:
-            gate.note_corpus(found=relevant)
+            if relevance == "unknown":
+                gate.note_corpus_unknown()
+            else:
+                gate.note_corpus(found=relevance == "relevant")
+        degradation = (
+            "\n\n（检索降级：" + "、".join(item.code for item in result.degradations) + "。）"
+            if result.degradations
+            else ""
+        )
         if not hits:
-            # 空结果要明说「没查到」，别让模型把空字符串当成「查到了但没内容」
-            return f"没有检索到与「{query}」相关的内容。"
+            # 空结果与有候选但相关性未知分开描述。
+            return f"没有检索到与「{query}」相关的内容。" + degradation
         lines: list[str] = []
         for hit in hits:
             chunk = hit.chunk
@@ -152,15 +161,20 @@ def build_tools(
             )
             lines.append(f"[{number}] {where}\n{chunk.text[:SNIPPET_CHARS]}")
         text = "\n\n".join(lines)
-        if not relevant:
-            # 低分命中要**说破**：否则模型会拿这堆边角料硬答，而不是去查网络（或说不知道）
+        if relevance == "unknown":
+            text += (
+                "\n\n（返回候选，相关性未确认；可换关键词或读取原文继续取证，"
+                "联网仍需用户明确授权。）"
+            )
+        elif relevance == "irrelevant":
+            # 只有本次成功重排后的分数才与阈值比较。
             text += (
                 f"\n\n（提示：以上结果的最高分只有 {best:.3f}，"
                 f"低于「算作相关」的阈值 {settings.agent.web_min_corpus_score} —— "
                 "内部证据很可能不足：可以换关键词再试；仍不足时请询问用户是否允许联网，"
                 "不要自行调用 web_search_tool。）"
             )
-        return text
+        return text + degradation
 
     @tool
     async def search_knowledge(query: str, top_k: int = 8, modality: str | None = None) -> str:

@@ -7,7 +7,7 @@ langgraph / milvus 等任何框架——这是「换实现不动上层」的前�
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -166,6 +166,18 @@ class Embeddings(BaseModel):
     sparse: list[dict[int, float]] | None = None
 
 
+ScoreKind = Literal["unknown", "rrf", "weighted", "dense", "rerank"]
+RerankStatus = Literal["unknown", "disabled", "skipped", "succeeded", "failed"]
+
+
+class RetrievalDegradation(BaseModel):
+    """执行位置报告的降级原因；code 是稳定标识，不从 message 推断状态。"""
+
+    stage: str
+    code: str
+    message: str
+
+
 class ScoredChunk(BaseModel):
     """带分数的检索结果。
 
@@ -182,6 +194,7 @@ class ScoredChunk(BaseModel):
     channel: str
     rank: int
     sources: list[str] = Field(default_factory=list)
+    score_kind: ScoreKind = "unknown"
 
 
 class ChannelStats(BaseModel):
@@ -204,6 +217,10 @@ class RetrievalResult(BaseModel):
     query: str
     chunks: list[ScoredChunk] = Field(default_factory=list)
     stats: list[ChannelStats] = Field(default_factory=list)
+    score_kind: ScoreKind = "unknown"
+    rerank_status: RerankStatus = "unknown"
+    reranker: str | None = None
+    degradations: list[RetrievalDegradation] = Field(default_factory=list)
 
 
 class Citation(BaseModel):

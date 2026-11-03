@@ -242,6 +242,7 @@ def test_multiple_sub_queries_are_fused_into_one_board() -> None:
 
     assert [call["query"] for call in retriever.calls] == ["甲", "乙"]
     assert {hit.chunk.chunk_id for hit in result["hits"]} == {"a", "b", "c"}
+    assert all(hit.score_kind == "rrf" for hit in result["hits"])
 
 
 def test_the_plan_filters_and_channels_reach_the_retriever() -> None:

@@ -26,6 +26,44 @@ def test_retrieval_result_defaults_to_empty() -> None:
     assert result.stats == []
 
 
+def test_result_metadata_defaults_and_roundtrip() -> None:
+    from rag.contracts import RetrievalDegradation
+
+    hit = ScoredChunk(
+        chunk=Chunk(chunk_id="c", doc_id="d", text="t"), score=0.5, channel="legacy", rank=0
+    )
+    old = RetrievalResult(query="q", chunks=[hit])
+    assert hit.score_kind == old.score_kind == "unknown"
+    assert old.rerank_status == "unknown"
+    assert old.reranker is None
+    assert old.degradations == []
+    result = old.model_copy(
+        update={
+            "score_kind": "rrf",
+            "rerank_status": "failed",
+            "reranker": "test",
+            "degradations": [
+                RetrievalDegradation(stage="rerank", code="rerank_failed", message="不可用")
+            ],
+        }
+    )
+    assert RetrievalResult.model_validate_json(result.model_dump_json()) == result
+    result.degradations.append(RetrievalDegradation(stage="hyde", code="hyde_empty", message="空"))
+    assert old.degradations == []
+
+
+@pytest.mark.parametrize("kind", ["unknown", "rrf", "weighted", "dense", "rerank"])
+def test_score_kinds(kind: str) -> None:
+    hit = ScoredChunk(
+        chunk=Chunk(chunk_id="c", doc_id="d", text="t"),
+        score=0.5,
+        channel="c",
+        rank=0,
+        score_kind=kind,
+    )
+    assert hit.score_kind == kind
+
+
 def test_registry_rejects_duplicate_name() -> None:
     reg = Registry("demo")
 

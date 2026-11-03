@@ -110,9 +110,9 @@ def _settings(*, graph: bool) -> Settings:
 
 
 def _patch_retriever(monkeypatch: pytest.MonkeyPatch, retriever: _Retriever) -> None:
-    import rag.retrieval
+    import rag.service.retrieval
 
-    monkeypatch.setattr(rag.retrieval, "build_retriever", lambda *a, **k: retriever)
+    monkeypatch.setattr(rag.service.retrieval, "build_retriever", lambda *a, **k: retriever)
 
 
 def test_plain_answer_and_stream_use_the_same_preparation(

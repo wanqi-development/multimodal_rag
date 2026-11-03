@@ -21,6 +21,13 @@ def _ids(hits: list[ScoredChunk]) -> list[str]:
     return [hit.chunk.chunk_id for hit in hits]
 
 
+def test_refusion_resets_rerank_semantics() -> None:
+    hit = _hit("a").model_copy(update={"score_kind": "rerank"})
+    fused = rrf_fuse([[hit]])
+    assert fused[0].score_kind == "rrf"
+    assert hit.score_kind == "rerank", "融合不修改输入"
+
+
 def test_a_hit_found_by_both_channels_beats_one_found_by_a_single_channel() -> None:
     """RRF 的本意：两路都认可的东西排前面。"""
     fused = rrf_fuse(

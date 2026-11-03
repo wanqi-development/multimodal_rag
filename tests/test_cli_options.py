@@ -295,6 +295,53 @@ def test_heavy_components_are_built_once(monkeypatch) -> None:
 # ---- 启动失败必须留下栈（2026-10-10）----
 
 
+def test_cli_search_adapts_shared_service_and_keeps_output(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    import rag.cli.main as cli
+    import rag.graphs.wiring as wiring
+    import rag.indexing as indexing
+    from rag.contracts import RetrievalResult
+    from rag.service.retrieval import RetrievalService
+
+    settings = Settings()
+    seen = []
+
+    class Index:
+        async def ensure_ready(self):
+            pass
+
+    async def probe(*args):
+        pass
+
+    async def retrieve(self, query, top_k, **kwargs):
+        seen.append((self._settings.retrieval.rerank.enabled, query, top_k, kwargs))
+        return RetrievalResult(query=query, rerank_status="disabled")
+
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_tracing", lambda s: None)
+    monkeypatch.setattr(cli, "_begin_run", lambda: None)
+    monkeypatch.setattr(cli, "_probe_milvus", probe)
+    monkeypatch.setattr(indexing, "build_index", lambda s: Index())
+    monkeypatch.setattr(
+        wiring,
+        "build_heavy",
+        lambda *a: SimpleNamespace(
+            embedder=object(),
+            reranker=None,
+            chat=None,
+            errors={},
+        ),
+    )
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    result = CliRunner().invoke(cli.app, ["search", "q", "--top-k", "3", "--no-rerank"])
+    assert result.exit_code == 0, result.output
+    assert "命中 0 个 chunk" in result.output
+    assert seen == [(False, "q", 3, {"filters": None, "image": None})]
+
+
 def test_a_broken_config_leaves_the_stack_behind(tmp_path, monkeypatch) -> None:
     """配置坏掉时进程死在**装日志之前**：四个 .log 一个字没有，窗一关栈也没了。
 

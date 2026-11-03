@@ -152,6 +152,7 @@ def test_rerank_scores_and_channel_replace_the_retrieval_ones(
     result = asyncio.run(reranker.rerank("q", [_hit("a"), _hit("b")], 2))
 
     assert result[0].channel == "rerank"
+    assert all(hit.score_kind == "rerank" for hit in result)
     assert [hit.rank for hit in result] == [0, 1]
     assert result[0].sources == ["hybrid:milvus:c"], "来源要留着，重排不改召回信息"
     assert result[0].score != 0.03

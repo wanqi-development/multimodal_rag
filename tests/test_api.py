@@ -22,6 +22,33 @@ from rag.contracts import Citation
 from rag.deployment import apply_deployment_profile
 
 
+def test_components_search_adapts_service_without_exposing_internal_fields(monkeypatch):
+    from types import SimpleNamespace
+
+    from rag.contracts import ChannelStats, RetrievalResult
+    from rag.service.retrieval import RetrievalService
+
+    settings = Settings()
+    components = Components(settings, Secrets(_env_file=None))
+    components.index = object()
+    components.heavy = SimpleNamespace(
+        embedder=object(), reranker=object(), chat=object(), errors={}
+    )
+    stats = [ChannelStats(channel="test", candidates=0, kept=0)]
+    seen = []
+
+    async def retrieve(self, query, top_k, **kwargs):
+        seen.append((self._settings, query, top_k, kwargs))
+        return RetrievalResult(query=query, stats=stats, rerank_status="disabled")
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    result = asyncio.run(components.search(query="q", top_k=3, rerank=False))
+    assert result == ([], stats)
+    local, query, top_k, kwargs = seen[0]
+    assert not local.retrieval.rerank.enabled and settings.retrieval.rerank.enabled
+    assert (query, top_k, kwargs) == ("q", 3, {"filters": None, "image": None})
+
+
 class _Redis(RedisBackend):
     """不真连的 Redis：`available`/`reason` 可指定，其余走父类的降级路径。"""
 

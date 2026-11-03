@@ -180,6 +180,7 @@ def _reorder(
             chunk=chunks[index].chunk,
             score=score,
             channel="rerank",
+            score_kind="rerank",
             rank=rank,
             sources=chunks[index].sources,
         )

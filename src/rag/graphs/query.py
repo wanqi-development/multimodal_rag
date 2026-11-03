@@ -195,8 +195,8 @@ def build_query_graph(
             ranked.append(hits)
             for row in channel_stats:
                 stats.append(_tag(row, sub_query))
-        # 多个子查询的结果用**同一个 RRF** 合一次 —— 融合层本来就是这个职责，
-        # 多查询展开与多通道召回在数学上没有区别。
+        # 多个子查询的结果用**同一个 RRF** 合一次；融合函数重新标 rrf，
+        # 不继承子查询已成功重排的 score_kind。LLM grade 仍独立判断资料充分性。
         merged = (
             rrf_fuse(ranked, k=settings.retrieval.fusion.k)
             if len(ranked) > 1

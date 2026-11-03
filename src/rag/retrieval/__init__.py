@@ -72,6 +72,7 @@ def build_retriever(
             "调用方要用 providers.build_reranker(settings) 建一个传进来，"
             "或者把 retrieval.rerank.enabled 关掉。"
         )
+    reranker = reranker if cfg.rerank.enabled else None
     enabled = [item for item in cfg.channels if item.enabled]
     if not enabled:  # 配置校验也会拦，这里兜一层（settings 可能在代码里被改过）
         raise ValueError("retrieval.channels 里一路都没启用：检索没有数据源可用")

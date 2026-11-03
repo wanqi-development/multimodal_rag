@@ -316,6 +316,25 @@ def test_the_channel_applies_filters_after_fetching() -> None:
     assert hits == [] and len(kept) == 2
 
 
+def test_neo4j_old_protocol_is_supported_by_shared_service(monkeypatch):
+    from rag.config.schema import Settings
+    from rag.service import retrieval
+
+    plugin = GraphRetriever(
+        _FakeIndex(),
+        _FakeStore(["flink"], [_edge("d1:0001", 1)]),
+        GraphChannelConfig(),
+    )
+    monkeypatch.setattr(retrieval, "build_retriever", lambda *a, **kw: plugin)
+    settings = Settings()
+    settings.retrieval.rerank.enabled = False
+    result = asyncio.run(
+        retrieval.RetrievalService(settings, None, None, None, None).retrieve("q", 3)
+    )
+    assert result.chunks[0].chunk.chunk_id == "d1:0001"
+    assert result.score_kind == "unknown" and result.rerank_status == "disabled"
+
+
 def test_the_neo4j_type_comes_from_the_plugin_not_the_core() -> None:
     """**图谱通道是插件**（2026-10-08 搬出去的）：核心的内置类型里没有 `neo4j`，
     它是按 entry point 找到 `rag_channel_neo4j` 才装得起来的。

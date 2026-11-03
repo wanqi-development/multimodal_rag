@@ -217,18 +217,17 @@ class Components:
         image: Any = None,
     ) -> tuple[list[ScoredChunk], list[ChannelStats]]:
         self._require("embedding")
-        from rag.retrieval import build_retriever, configured_hyde
+        from rag.service.retrieval import RetrievalService
 
         local = self._local(channels, rerank)
-        retriever = build_retriever(
+        result = await RetrievalService(
             local,
             self.index,
             self.heavy.embedder,
             self.heavy.reranker,
-            hyde=configured_hyde(local, self.heavy.chat),
-        )
-        hits = await retriever.retrieve(query, top_k, filters=filters or None, image=image)
-        return hits, getattr(retriever, "last_stats", [])
+            self.heavy.chat,
+        ).retrieve(query, top_k, filters=filters or None, image=image)
+        return result.chunks, result.stats
 
     async def answer(self, body) -> dict[str, Any]:
         """一次完整问答；流式与非流式共用 AnswerEngine 的检索预检。"""

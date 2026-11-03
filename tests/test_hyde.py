@@ -121,6 +121,66 @@ def test_hyde_generation_failure_falls_back_to_original_query() -> None:
     assert any(stat.channel == "hyde" and stat.error for stat in retriever.last_stats)
 
 
+@pytest.mark.parametrize("mode", ["ok", "error", "empty", "leg_error", "image"])
+@pytest.mark.parametrize("rerank_mode", ["ok", "error", "empty", "disabled"])
+def test_hyde_atomic_status_on_every_branch(mode, rerank_mode) -> None:
+    original = _Retriever([_hit("a", 0.03).model_copy(update={"score_kind": "rrf"})])
+    hypothetical = _Retriever([_hit("b", 0.02)])
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("故障注入")
+
+    if mode == "leg_error":
+        hypothetical.retrieve = broken
+
+    async def generate(question):
+        if mode == "error":
+            raise RuntimeError("生成失败")
+        return "" if mode == "empty" else "假设"
+
+    class Reranker(_Reranker):
+        async def rerank(self, query, hits, top_n):
+            self.calls += 1
+            if rerank_mode == "error":
+                raise RuntimeError("重排失败")
+            return [] if rerank_mode == "empty" else hits[:top_n]
+
+    reranker = Reranker()
+    retriever = HyDERetriever(
+        original,
+        hypothetical,
+        None if rerank_mode == "disabled" else reranker,
+        FusionConfig(),
+        generate=generate,
+    )
+    result = asyncio.run(
+        retriever.retrieve_result(
+            "问题",
+            5,
+            image=Path("q.png") if mode == "image" else None,
+        )
+    )
+    assert len(original.calls) == 1
+    assert reranker.calls == (0 if rerank_mode == "disabled" else 1)
+    assert (
+        result.rerank_status
+        == {
+            "disabled": "disabled",
+            "ok": "succeeded",
+            "error": "failed",
+            "empty": "failed",
+        }[rerank_mode]
+    )
+    assert result.score_kind == ("rerank" if rerank_mode == "ok" else "rrf")
+    codes = [item.code for item in result.degradations]
+    if mode in {"error", "leg_error"}:
+        assert "hyde_failed" in codes
+    if mode == "empty":
+        assert "hyde_empty" in codes
+    if rerank_mode in {"error", "empty"}:
+        assert ("rerank_failed" if rerank_mode == "error" else "rerank_empty") in codes
+
+
 def test_configured_hyde_is_none_when_switched_off() -> None:
     settings = SimpleNamespace(
         retrieval=SimpleNamespace(transform=SimpleNamespace(hyde=False, hyde_max_chars=600))

@@ -1,0 +1,137 @@
+"""公共接线：参数保真、旧插件兼容及每次调用的状态隔离。"""
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from rag.config.schema import ChannelConfig, Settings
+from rag.contracts import Chunk, RetrievalResult, ScoredChunk
+from rag.service.retrieval import RetrievalService, assess_relevance
+
+
+def _hit(kind="unknown", score=0.01):
+    return ScoredChunk(
+        chunk=Chunk(chunk_id="a", doc_id="d", text="正文"),
+        channel="legacy",
+        rank=0,
+        score=score,
+        score_kind=kind,
+    )
+
+
+@pytest.mark.parametrize("kind", ["unknown", "rrf", "weighted", "dense", "rerank"])
+@pytest.mark.parametrize("status", ["unknown", "disabled", "skipped", "failed", "succeeded"])
+@pytest.mark.parametrize("score", [0.1, 0.2, 0.8])
+def test_relevance_truth_table(kind, status, score):
+    result = RetrievalResult(
+        query="q", chunks=[_hit(kind, score)], score_kind=kind, rerank_status=status
+    )
+    expected = "unknown"
+    if kind == "rerank" and status == "succeeded":
+        expected = "relevant" if score >= 0.2 else "irrelevant"
+    assert assess_relevance(result, 0.2) == expected
+    assert assess_relevance(result.model_copy(update={"chunks": []}), 0.2) == "irrelevant"
+
+
+def test_relevance_uses_highest_score_not_first():
+    result = RetrievalResult(
+        query="q",
+        chunks=[_hit("rerank", 0.1), _hit("rerank", 0.8)],
+        score_kind="rerank",
+        rerank_status="succeeded",
+    )
+    assert assess_relevance(result, 0.2) == "relevant"
+
+
+def test_service_isolates_config_and_prefers_atomic_result(monkeypatch):
+    import rag.service.retrieval as module
+
+    settings = Settings()
+    settings.retrieval.channels = [
+        ChannelConfig(name="a", type="milvus"),
+        ChannelConfig(name="b", type="milvus"),
+    ]
+    components = [object() for _ in range(4)]
+    seen = []
+    summaries = []
+
+    class Atomic:
+        async def retrieve_result(self, query, top_k, **kwargs):
+            await asyncio.sleep(0)
+            return RetrievalResult(
+                query=query,
+                chunks=[_hit()],
+                rerank_status="failed" if query == "a" else "succeeded",
+            )
+
+        async def retrieve(self, *args, **kwargs):
+            raise AssertionError("不应使用旧投影")
+
+    def build(local, index, embedder, reranker, *, hyde):
+        seen.append((local, index, embedder, reranker, hyde))
+        return Atomic()
+
+    monkeypatch.setattr(module, "build_retriever", build)
+    monkeypatch.setattr(module, "configured_hyde", lambda local, chat: chat)
+    monkeypatch.setattr(module, "record_retrieval", lambda result, **kw: summaries.append(result))
+    service = RetrievalService(settings, *components)
+
+    async def run():
+        return await asyncio.gather(
+            service.retrieve("a", 3, channels=["a"], rerank=False),
+            service.retrieve("b", 4, channels=["b"]),
+        )
+
+    a, b = asyncio.run(run())
+    assert (a.query, a.rerank_status, b.query, b.rerank_status) == ("a", "failed", "b", "succeeded")
+    assert len(summaries) == 2
+    assert [c.enabled for c in seen[0][0].retrieval.channels] == [True, False]
+    assert [c.enabled for c in seen[1][0].retrieval.channels] == [False, True]
+    assert not seen[0][0].retrieval.rerank.enabled
+    assert settings.retrieval.rerank.enabled
+    assert all(c.enabled for c in settings.retrieval.channels)
+    assert list(seen[0][1:]) == components
+
+
+@pytest.mark.parametrize("kinds", [("dense", "rrf"), ("rerank", "unknown")])
+def test_mixed_legacy_scores_are_unknown(monkeypatch, kinds):
+    import rag.service.retrieval as module
+
+    class Legacy:
+        async def retrieve(self, *args, **kwargs):
+            return [_hit(kind) for kind in kinds]
+
+    monkeypatch.setattr(module, "build_retriever", lambda *a, **kw: Legacy())
+    result = asyncio.run(RetrievalService(Settings(), None, None, None, None).retrieve("q", 2))
+    assert result.score_kind == "unknown" and result.rerank_status == "unknown"
+    assert assess_relevance(result, 0.2) == "unknown"
+
+
+def test_legacy_plugin_parameters_and_errors(monkeypatch):
+    import rag.service.retrieval as module
+
+    seen = []
+
+    class Legacy:
+        @property
+        def last_stats(self):
+            raise AssertionError("不可读取共享状态")
+
+        async def retrieve(self, query, top_k, **kwargs):
+            seen.append((query, top_k, kwargs))
+            if query == "error":
+                raise RuntimeError("原异常")
+            return [_hit()]
+
+    monkeypatch.setattr(module, "build_retriever", lambda *a, **kw: Legacy())
+    settings = Settings()
+    settings.retrieval.rerank.enabled = False
+    service = RetrievalService(settings, object(), object(), None, None)
+    image = Path("q.png")
+    result = asyncio.run(service.retrieve("q", 3, filters={"x": 1}, image=image))
+    assert result.score_kind == "unknown"
+    assert result.rerank_status == "disabled"
+    assert seen == [("q", 3, {"filters": {"x": 1}, "image": image})]
+    with pytest.raises(RuntimeError, match="原异常"):
+        asyncio.run(service.retrieve("error", 3))
