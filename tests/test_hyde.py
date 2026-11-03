@@ -181,6 +181,80 @@ def test_hyde_atomic_status_on_every_branch(mode, rerank_mode) -> None:
         assert ("rerank_failed" if rerank_mode == "error" else "rerank_empty") in codes
 
 
+@pytest.mark.parametrize("query", ["", "问题"])
+def test_hyde_skipped_rerank_preserves_atomic_stats(query) -> None:
+    from rag.contracts import RetrievalResult
+
+    class Atomic(_Retriever):
+        async def retrieve_result(self, query, top_k, **kwargs):
+            await self.retrieve(query, top_k, **kwargs)
+            return RetrievalResult(query=query, chunks=self.hits, stats=self.last_stats)
+
+    hits = [] if query else [_hit("a", 0.03).model_copy(update={"score_kind": "rrf"})]
+    original = Atomic(hits)
+    hypothetical = Atomic([])
+    reranker = _Reranker()
+    generated = []
+
+    async def generate(question):
+        generated.append(question)
+        return "假设"
+
+    retriever = HyDERetriever(original, hypothetical, reranker, FusionConfig(), generate=generate)
+    result = asyncio.run(retriever.retrieve_result(query, 5))
+    assert result.rerank_status == "skipped"
+    assert result.score_kind == ("unknown" if query else "rrf")
+    assert reranker.calls == 0
+    assert len(original.calls) == 1
+    assert generated == ([query] if query else [])
+    assert result.stats == retriever.last_stats
+    assert result.stats[0].channel == "original:milvus"
+
+
+def test_hyde_concurrent_queries_keep_degradations_and_stats_isolated() -> None:
+    from rag.contracts import RetrievalDegradation, RetrievalResult
+
+    class Atomic(_Retriever):
+        @property
+        def last_stats(self):
+            raise AssertionError("新链路不读取共享状态")
+
+        @last_stats.setter
+        def last_stats(self, value):
+            pass
+
+        async def retrieve_result(self, query, top_k, **kwargs):
+            await asyncio.sleep(0)
+            return RetrievalResult(
+                query=query,
+                chunks=[_hit(query, 0.03).model_copy(update={"score_kind": "rrf"})],
+                stats=[ChannelStats(channel=query, candidates=1, kept=1)],
+                degradations=[
+                    RetrievalDegradation(stage="source", code="channel_failed", message="注入")
+                ]
+                if query == "bad"
+                else [],
+            )
+
+    async def generate(query):
+        await asyncio.sleep(0)
+        return "" if query == "bad" else "假设"
+
+    retriever = HyDERetriever(Atomic([]), Atomic([]), None, FusionConfig(), generate=generate)
+
+    async def run():
+        return await asyncio.gather(
+            retriever.retrieve_result("bad", 5), retriever.retrieve_result("ok", 5)
+        )
+
+    bad, ok = asyncio.run(run())
+    assert [item.code for item in bad.degradations] == ["channel_failed", "hyde_empty"]
+    assert not ok.degradations
+    assert bad.stats[0].channel == "original:bad"
+    assert ok.stats[0].channel == "original:ok"
+    assert bad.rerank_status == ok.rerank_status == "disabled"
+
+
 def test_configured_hyde_is_none_when_switched_off() -> None:
     settings = SimpleNamespace(
         retrieval=SimpleNamespace(transform=SimpleNamespace(hyde=False, hyde_max_chars=600))

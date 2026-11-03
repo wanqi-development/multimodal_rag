@@ -135,3 +135,61 @@ def test_legacy_plugin_parameters_and_errors(monkeypatch):
     assert seen == [("q", 3, {"filters": {"x": 1}, "image": image})]
     with pytest.raises(RuntimeError, match="原异常"):
         asyncio.run(service.retrieve("error", 3))
+
+
+@pytest.mark.parametrize("mode", ["ok", "error", "empty", "disabled", "channel_error"])
+def test_service_real_wiring_preserves_failure_semantics_and_one_summary(monkeypatch, mode):
+    import rag.retrieval as wiring
+    import rag.service.retrieval as module
+    from rag.retrieval.multichannel import RetrievalError
+
+    calls = []
+    summaries = []
+
+    class Channel:
+        name = "legacy"
+
+        async def retrieve(self, query, top_k, **kwargs):
+            if mode == "channel_error":
+                raise TimeoutError("注入通道故障")
+            return [_hit()]
+
+    class Reranker:
+        name = "reranker"
+
+        async def rerank(self, query, hits, top_n):
+            calls.append(query)
+            if mode == "error":
+                raise RuntimeError("注入重排故障")
+            return (
+                [] if mode == "empty" else [hit.model_copy(update={"score": 0.8}) for hit in hits]
+            )
+
+    settings = Settings()
+    settings.retrieval.channels = [
+        ChannelConfig(name="a", type="milvus"),
+        ChannelConfig(name="b", type="milvus"),
+    ]
+    monkeypatch.setattr(wiring, "build_channel", lambda *a: Channel())
+    monkeypatch.setattr(
+        module, "record_retrieval", lambda result, **kw: summaries.append((result, kw))
+    )
+    service = RetrievalService(settings, None, None, Reranker(), None)
+    if mode == "channel_error":
+        with pytest.raises(RetrievalError, match="全部失败"):
+            asyncio.run(service.retrieve("q", 3))
+        assert len(summaries) == 1
+        assert summaries[0][1] == {"error": "retrieval_failed"}
+        assert not calls
+        return
+
+    result = asyncio.run(service.retrieve("q", 3, rerank=mode != "disabled"))
+    assert len(summaries) == 1
+    assert summaries[0][0] is result
+    assert len(calls) == (0 if mode == "disabled" else 1)
+    assert settings.retrieval.rerank.enabled
+    assert result.score_kind == ("rerank" if mode == "ok" else "rrf")
+    assert result.rerank_status == (
+        "succeeded" if mode == "ok" else "disabled" if mode == "disabled" else "failed"
+    )
+    assert assess_relevance(result, 0.2) == ("relevant" if mode == "ok" else "unknown")
