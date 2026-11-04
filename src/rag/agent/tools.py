@@ -65,7 +65,7 @@ class WebSearchGate:
     corpus_unknown: bool = False
 
     def note_corpus_unknown(self) -> None:
-        """有候选但相关性未确认，不等同于无资料，也不授予联网权限。"""
+        """相关性未确认（有候选待核验或检索不完整），不授予联网权限。"""
         self.corpus_attempted = True
         self.corpus_unknown = True
 
@@ -91,7 +91,10 @@ class WebSearchGate:
                 "如果用户要求核对网络，仍须先取得明确联网授权。"
             )
         if self.corpus_unknown:
-            return "内部返回候选，相关性未确认。可继续取证；联网仍须先询问用户并取得明确授权。"
+            return (
+                "内部检索相关性未确认，可能有候选待核验或检索不完整。可继续取证；"
+                "联网仍须先询问用户并取得明确授权。"
+            )
         return "内部证据不足。先询问用户是否允许联网，用户确认后才能调用网络工具。"
 
 
@@ -103,7 +106,7 @@ def build_tools(
     gate: WebSearchGate | None = None,
 ) -> list[Any]:
     """建这一批工具。``heavy`` 里带着 embedder / reranker（**不在这里重建模型**）。"""
-    from rag.service.retrieval import RetrievalService, assess_relevance
+    from rag.service.retrieval import RetrievalService, UnknownChannelError, assess_relevance
 
     service = RetrievalService(
         settings,
@@ -120,10 +123,11 @@ def build_tools(
         modality: str | None = None,
         channels: list[str] | None = None,
     ) -> str:
-        if channels and not any(item.name in channels for item in settings.retrieval.channels):
-            return f"没有可用的检索通道：{', '.join(sorted(channels))}。"
         filters = {"modality": modality} if modality else None
-        result = await service.retrieve(query, top_k, filters=filters, channels=channels)
+        try:
+            result = await service.retrieve(query, top_k, filters=filters, channels=channels)
+        except UnknownChannelError as exc:
+            return f"检索通道参数错误：{exc}。"
         hits = result.chunks
         relevance = assess_relevance(result, settings.agent.web_min_corpus_score)
         best = max((float(hit.score) for hit in hits), default=0.0)
@@ -138,7 +142,11 @@ def build_tools(
             else ""
         )
         if not hits:
-            # 空结果与有候选但相关性未知分开描述。
+            if relevance == "unknown":
+                return (
+                    f"本次检索不完整：部分通道失败，不能确认是否有与「{query}」相关的内容。"
+                    "可重试或继续取证；联网仍需用户明确授权。"
+                ) + degradation
             return f"没有检索到与「{query}」相关的内容。" + degradation
         lines: list[str] = []
         for hit in hits:

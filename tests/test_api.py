@@ -10,6 +10,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from rag.api.app import Components, create_app
@@ -47,6 +49,40 @@ def test_components_search_adapts_service_without_exposing_internal_fields(monke
     local, query, top_k, kwargs = seen[0]
     assert not local.retrieval.rerank.enabled and settings.retrieval.rerank.enabled
     assert (query, top_k, kwargs) == ("q", 3, {"filters": None, "image": None})
+
+
+@pytest.mark.parametrize("channels", [["missing"], ["milvus", "missing"]])
+def test_components_map_unknown_channels_to_422(channels):
+    from rag.service.retrieval import UnknownChannelError, resolve_channels
+
+    settings = Settings()
+    components = Components(settings, Secrets(_env_file=None))
+    before = settings.model_dump()
+    with pytest.raises(UnknownChannelError) as expected:
+        resolve_channels(settings, channels)
+    with pytest.raises(HTTPException) as actual:
+        components._local(channels, False)
+    assert actual.value.status_code == 422
+    assert actual.value.detail == str(expected.value)
+    assert settings.model_dump() == before
+
+
+def test_components_channel_selection_uses_service_resolver(monkeypatch):
+    import rag.service.retrieval as module
+
+    settings = Settings()
+    components = Components(settings, Secrets(_env_file=None))
+    seen = []
+
+    def resolve(local, channels):
+        seen.append(channels)
+        return set()
+
+    monkeypatch.setattr(module, "resolve_channels", resolve)
+    local = components._local(["milvus"], False)
+    assert seen == [["milvus"]]
+    assert not any(item.enabled for item in local.retrieval.channels)
+    assert settings.retrieval.channels[0].enabled
 
 
 class _Redis(RedisBackend):

@@ -244,6 +244,32 @@ def test_document_and_relationship_search_use_separate_channels(
     assert [name for name, enabled in seen[1] if enabled] == ["kg"]
 
 
+def test_relationship_search_maps_service_unknown_channel_error(tmp_path, monkeypatch):
+    from rag.service.retrieval import UnknownChannelError, resolve_channels
+
+    retriever = _Retriever()
+    _patch_retriever(monkeypatch, retriever)
+    settings = _settings(tmp_path)
+    gate = WebSearchGate()
+    with pytest.raises(UnknownChannelError) as expected:
+        resolve_channels(settings, ["kg"])
+    out = asyncio.run(_tool(settings, "search_relationships", gate=gate).ainvoke({"query": "q"}))
+    assert str(expected.value) in out
+    assert "检索通道参数错误" in out
+    assert not retriever.calls
+    assert not gate.corpus_attempted and not gate.allowed
+
+
+def test_search_does_not_swallow_unrelated_value_errors(tmp_path, monkeypatch):
+    class Broken(_Retriever):
+        async def retrieve(self, *args, **kwargs):
+            raise ValueError("不是通道参数错误")
+
+    _patch_retriever(monkeypatch, Broken())
+    with pytest.raises(ValueError, match="不是通道参数错误"):
+        asyncio.run(_tool(_settings(tmp_path), "search_knowledge").ainvoke({"query": "q"}))
+
+
 def test_the_tool_list_covers_documents_graph_and_web(tmp_path: Path) -> None:
     """工具按证据来源分组；主 Agent 只直接拿网络工具，知识工具交给子 Agent。"""
     tools = build_tools(_settings(tmp_path), _Heavy(_Retriever([])), CitationRegistry())
@@ -587,6 +613,47 @@ def test_the_search_tools_report_to_the_gate(tmp_path: Path, monkeypatch) -> Non
     assert gate.corpus_attempted is True and gate.corpus_found is False
     assert gate.allowed is False, "查空也不能绕过用户授权"
     assert "询问用户" in gate.refusal()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_empty_multichannel_result_distinguishes_incomplete_search(
+    tmp_path, monkeypatch, failed, explicit
+):
+    import rag.retrieval as wiring
+
+    class Channel:
+        def __init__(self, name):
+            self.name = name
+
+        async def retrieve(self, *args, **kwargs):
+            if failed and self.name == "broken":
+                raise TimeoutError("注入通道故障")
+            return []
+
+    monkeypatch.setattr(wiring, "build_channel", lambda cfg, *a: Channel(cfg.name))
+    settings = _settings(tmp_path)
+    settings.retrieval.rerank.enabled = False
+    settings.retrieval.channels = [
+        ChannelConfig(name="ok", type="milvus"),
+        ChannelConfig(name="broken", type="milvus"),
+    ]
+    gate = WebSearchGate(explicit=explicit)
+    registry = CitationRegistry()
+    tools = {t.name: t for t in build_tools(settings, _Heavy(_Retriever()), registry, gate=gate)}
+    out = asyncio.run(tools["search_knowledge"].ainvoke({"query": "q"}))
+    assert gate.corpus_attempted and not gate.corpus_found
+    assert gate.corpus_unknown is failed
+    assert gate.allowed is explicit
+    if failed:
+        assert "检索不完整" in out and "不能确认" in out
+        assert "channel_failed" in out
+        assert "没有检索到" not in out
+        assert "检索不完整" in gate.refusal()
+        assert "返回候选" not in gate.refusal()
+    else:
+        assert "没有检索到" in out
+        assert "检索不完整" not in out
 
 
 def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> None:

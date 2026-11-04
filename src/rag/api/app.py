@@ -178,19 +178,15 @@ class Components:
 
     def _local(self, channels: list[str] | None, rerank: bool | None) -> Settings:
         """把这次请求的覆盖项落到一份**拷贝**上 —— 请求之间不能互相污染。"""
+        from rag.service.retrieval import UnknownChannelError, resolve_channels
+
         local = self.settings.model_copy(deep=True)
-        if channels:
-            # 语义：**列出来的那几路开、其余关**（名字取自 retrieval.channels[].name）
-            known = {item.name for item in local.retrieval.channels}
-            unknown = [name for name in channels if name not in known]
-            if unknown:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    f"未知的通道 {unknown}；配置里有 {sorted(known)}（见 retrieval.channels）",
-                )
-            wanted = set(channels)
-            for item in local.retrieval.channels:
-                item.enabled = item.name in wanted
+        try:
+            wanted = resolve_channels(local, channels)
+        except UnknownChannelError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        for item in local.retrieval.channels:
+            item.enabled = item.name in wanted
         if rerank is not None:
             local.retrieval.rerank.enabled = rerank
         return local
