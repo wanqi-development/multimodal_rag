@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -48,8 +48,8 @@ SYSTEM_PROMPT = """你是企业知识问答的主 Agent，同时负责问题理�
    区分简单事实、复合问题、多跳问题和关键歧义；简单问题只调用一个最相关的子 Agent，
    复合问题只拆成彼此独立、确有必要的子问题。不要向用户展示内部推理过程。
 2. **按证据来源路由。** 制度、规则、SOP、手册和普通文档交给 `policy-document`；
-   组织架构、人员关系、审批链和多跳路径交给 `relationship-graph`；员工、订单、库存等
-   精确业务数据交给 `business-data`。只调用当前可用且确实需要的子 Agent。
+   组织架构、人员关系、审批链和多跳路径交给 `relationship-graph`；员工、订单、库存、
+   车票等精确业务或实时数据交给 `business-data`。只调用当前可用且确实需要的子 Agent。
    不要为了显得全面而派发同一领域的多个近义任务。
 3. **证据足够就停止。** 一个信息点已经有直接、可靠的来源支持时，不要再用同义词重复搜索，
    不要继续检查无关文档，也不要为了补充背景读取整套资料。只有关键信息确实缺失时，
@@ -183,6 +183,7 @@ def build_agent(
     web_explicit: bool = False,
     extra_main_tools: list[Any] | None = None,
     extra_subagent_tools: list[Any] | None = None,
+    extra_subagent_tool_factory: Callable[[CitationRegistry], list[Any]] | None = None,
 ) -> tuple[Any, CitationRegistry]:
     """建图。返回 (编译好的图, 这次的引用表)。
 
@@ -200,6 +201,8 @@ def build_agent(
     built_tools = build_tools(settings, heavy, registry, gate=gate)
     main_extras = list(extra_main_tools or [])
     subagent_extras = list(extra_subagent_tools or [])
+    if extra_subagent_tool_factory is not None:
+        subagent_extras.extend(extra_subagent_tool_factory(registry))
     extras = [*main_extras, *subagent_extras]
     extra_names = [str(getattr(item, "name", "")) for item in extras if getattr(item, "name", None)]
     main_extra_names = frozenset(

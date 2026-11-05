@@ -9,7 +9,13 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from rag.config.schema import Settings
-from rag.contracts import AssembledContext, Chunk, ScoredChunk
+from rag.contracts import (
+    AssembledContext,
+    Chunk,
+    RetrievalDegradation,
+    RetrievalResult,
+    ScoredChunk,
+)
 from rag.graphs.answer import AnswerEngine
 from rag.graphs.verification import AnswerVerifier
 
@@ -113,6 +119,102 @@ def _patch_retriever(monkeypatch: pytest.MonkeyPatch, retriever: _Retriever) -> 
     import rag.service.retrieval
 
     monkeypatch.setattr(rag.service.retrieval, "build_retriever", lambda *a, **k: retriever)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("has_hits", [False, True])
+@pytest.mark.parametrize("code", [None, "channel_failed", "rerank_failed"])
+@pytest.mark.parametrize("judge_score", [0.2, 0.8])
+def test_retrieval_status_reaches_generation_and_verification(
+    monkeypatch, graph, has_hits, code, judge_score
+):
+    from rag.service.retrieval import RetrievalService
+
+    retrieval = RetrievalResult(
+        query="q",
+        chunks=[_hit()] if has_hits else [],
+        score_kind="rrf" if code == "rerank_failed" else "rerank",
+        rerank_status="failed" if code == "rerank_failed" else "succeeded",
+        degradations=(
+            [RetrievalDegradation(stage="b", code=code, message="内部异常不应进提示词")]
+            if code
+            else []
+        ),
+    )
+
+    async def retrieve(self, query, top_k, **kwargs):
+        return retrieval
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    checked = []
+
+    async def faithfulness(question, answer, contexts):
+        checked.append(contexts)
+        # Ragas 只能看到引用的语料，不能把运行提示或异常当作证据。
+        assert contexts == [_hit().chunk.text]
+        return judge_score
+
+    heavy = _Heavy(_Chat())
+    engine = AnswerEngine(
+        _settings(graph=graph),
+        object(),
+        heavy,
+        verifier=AnswerVerifier(threshold=0.5, timeout_s=1, faithfulness=faithfulness),
+    )
+    answer = asyncio.run(engine.answer("q", 5))
+
+    async def collect():
+        return [event async for event in engine.stream("q", 5)]
+
+    events = asyncio.run(collect())
+    assert len(checked) == (2 if has_hits else 0)
+    assert answer.verification is not None
+    supported = has_hits and judge_score >= 0.5
+    assert answer.verification["status"] == ("supported" if supported else "low")
+    assert answer.verification["score"] == (judge_score if has_hits else None)
+    assert answer.verification["can_search_web"] is not supported
+    assert set(answer.verification) == {"status", "score", "threshold", "message", "can_search_web"}
+    assert "内部异常" not in answer.verification["message"]
+    if not has_hits:
+        if code == "channel_failed":
+            assert "检索不完整" in answer.verification["message"]
+            assert "未能取得可核验资料" in answer.verification["message"]
+        else:
+            assert "没有检索到" in answer.verification["message"]
+        assert "是否允许联网搜索" in answer.verification["message"]
+    assert events[-2] == {"type": "verification", "verification": answer.verification}
+    assert events[-1]["verification"] == answer.verification
+    assert answer.score_kind == retrieval.score_kind
+    assert answer.rerank_status == retrieval.rerank_status
+    assert answer.degradations == retrieval.degradations
+    for context in heavy.generator.contexts:
+        assert context.score_kind == retrieval.score_kind
+        assert context.rerank_status == retrieval.rerank_status
+        assert context.degradations == retrieval.degradations
+        notice = context.retrieval_notice()
+        assert "内部异常" not in notice
+        if code:
+            assert "非语料证据，不可引用" in notice
+            assert f"score_kind={retrieval.score_kind}" in notice
+            if code == "channel_failed":
+                assert "部分检索通道失败" in notice
+                assert "不能断言语料中没有相关内容" in notice
+            else:
+                assert "重排失败" in notice
+        else:
+            assert not notice
+    # SSE 保持原字段集，不把内部状态加入 retrieval/done 事件。
+    assert set(events[0]) == {"type", "hits", "stats", "rounds", "grade", "mode"}
+    assert set(events[-1]) == {
+        "type",
+        "answer",
+        "citations",
+        "rounds",
+        "grade",
+        "mode",
+        "usage",
+        "verification",
+    }
 
 
 def test_plain_answer_and_stream_use_the_same_preparation(

@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ChatProviderConfig(BaseModel):
@@ -725,7 +726,7 @@ class ApiConfig(BaseModel):
     port: int = 8000
     workers: int = 1
     # 每分钟每个 key/IP 的请求上限；0 = 不限
-    rate_limit_per_min: int = 60
+    rate_limit_per_min: int = 120
     # 同时在跑的 ingest 任务数。重活（OCR/VLM/重排）与检索同进程争资源，
     # 默认只让一个 ingest 跑，避免把检索拖垮
     max_concurrent_ingest: int = 1
@@ -843,6 +844,55 @@ class AgentConfig(BaseModel):
     # 注意：这个判据只在**开了重排**时成立（关掉重排时分数是 RRF 的名次分，量纲不同、不可比）——
     # 关着重排时分数不可比，只记录语料是否查过。
     web_min_corpus_score: float = 0.2
+
+
+class McpServerConfig(BaseModel):
+    """一个只读 MCP 服务；当前只实现 Streamable HTTP。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # required=False：外部 MCP 挂掉时只卸载对应子 Agent，文档问答照常启动。
+    required: bool = False
+    transport: Literal["streamable_http"] = "streamable_http"
+    url: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    connect_timeout_s: float = Field(10.0, gt=0)
+    read_timeout_s: float = Field(45.0, gt=0)
+    # Agent 能看到的单个工具结果上限；超长时明确标记截断，避免车次大结果撑爆上下文。
+    max_output_chars: int = Field(30_000, ge=1_000, le=200_000)
+    # 空表示一个都不开放。只注册这里明确列出的只读工具。
+    allowed_tools: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def _unique_tools(cls, value: list[str]) -> list[str]:
+        clean = [str(item).strip() for item in value if str(item).strip()]
+        if len(clean) != len(set(clean)):
+            raise ValueError("allowed_tools 不能有重复项")
+        return clean
+
+    @model_validator(mode="after")
+    def _enabled_server_is_complete(self) -> McpServerConfig:
+        if self.enabled and not self.url.strip():
+            raise ValueError("启用 MCP 服务时必须配置 url")
+        return self
+
+
+class McpConfig(BaseModel):
+    """Agent 可用的 MCP 服务目录；连接配置与子 Agent 提示词分开维护。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    servers: dict[str, McpServerConfig] = Field(default_factory=dict)
+
+    @field_validator("servers")
+    @classmethod
+    def _valid_server_names(cls, value: dict[str, McpServerConfig]) -> dict[str, McpServerConfig]:
+        for name in value:
+            if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+                raise ValueError(f"MCP 服务名不合法：{name!r}")
+        return value
 
 
 class FileLogConfig(BaseModel):
@@ -1039,4 +1089,5 @@ class Settings(BaseModel):
     api: ApiConfig = Field(default_factory=ApiConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)

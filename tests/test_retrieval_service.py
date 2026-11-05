@@ -84,15 +84,21 @@ def test_empty_relevance_uses_channel_failure_code(code, expected):
 
 
 @pytest.mark.parametrize("score", [0.1, 0.8])
-def test_partial_channel_failure_preserves_confirmed_hit_relevance(score):
+@pytest.mark.parametrize("failed", [False, True])
+def test_partial_channel_failure_makes_hit_relevance_unknown(score, failed):
     result = RetrievalResult(
         query="q",
         chunks=[_hit("rerank", score)],
         score_kind="rerank",
         rerank_status="succeeded",
-        degradations=[RetrievalDegradation(stage="b", code="channel_failed", message="故障")],
+        degradations=(
+            [RetrievalDegradation(stage="b", code="channel_failed", message="故障")]
+            if failed
+            else []
+        ),
     )
-    assert assess_relevance(result, 0.2) == ("relevant" if score >= 0.2 else "irrelevant")
+    expected = "unknown" if failed else ("relevant" if score >= 0.2 else "irrelevant")
+    assert assess_relevance(result, 0.2) == expected
 
 
 def test_relevance_uses_highest_score_not_first():

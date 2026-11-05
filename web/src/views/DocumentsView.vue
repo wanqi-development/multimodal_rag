@@ -34,6 +34,7 @@ import {
 import ChunkReport from '../components/ChunkReport.vue'
 import FlowSteps, { type StepState } from '../components/FlowSteps.vue'
 import SourceView from '../components/SourceView.vue'
+import { unfiledDocuments } from '../document-selection'
 import {
   assignFolder,
   createFolder,
@@ -365,6 +366,8 @@ const treeRows = computed<TreeRow[]>(() => {
 
 const unfiled = computed(() => docsIn('').length)
 const visibleDocs = computed(() => docs.value.filter(matchesStageFilter))
+/** 全选只处理当前筛选下尚未归类的文档 —— 已归档的文档不能被批量移动意外带走。 */
+const unfiledVisibleDocs = computed(() => unfiledDocuments(visibleDocs.value))
 const showTree = computed(
   () => docs.value.length > 0 || folders.value.length > 0 || naming.value !== null,
 )
@@ -386,7 +389,7 @@ function setStageFilter(next: StageFilter): void {
 }
 
 function selectAllVisible(): void {
-  picked.value = new Set(visibleDocs.value.map((row) => row.doc_id))
+  picked.value = new Set(unfiledVisibleDocs.value.map((row) => row.doc_id))
 }
 
 function clearPicked(): void {
@@ -934,8 +937,13 @@ function onReviewKey(event: KeyboardEvent): void {
             </button>
           </div>
           <div class="filter-actions">
-            <button type="button" :disabled="!visibleDocs.length" @click="selectAllVisible">
-              全选当前结果
+            <button
+              type="button"
+              :disabled="!unfiledVisibleDocs.length"
+              title="只选择当前阶段筛选下尚未归入目录的文档"
+              @click="selectAllVisible"
+            >
+              全选未分类（{{ unfiledVisibleDocs.length }}）
             </button>
             <button type="button" :disabled="!picked.size" @click="clearPicked">取消全选</button>
           </div>

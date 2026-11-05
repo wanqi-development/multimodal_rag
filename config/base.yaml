@@ -451,7 +451,7 @@ api:
   workers: ${RAG_API_WORKERS:-1}
   # 每分钟每个 key/IP 的请求上限（0 = 不限）。有 Redis 时是**跨 worker 共享**的计数，
   # 没有就退回进程内（那种情况下每个 worker 各算各的）。
-  rate_limit_per_min: ${RAG_API_RATE_LIMIT:-60}
+  rate_limit_per_min: ${RAG_API_RATE_LIMIT:-120}
   # 同时在跑的 ingest 任务数：重活（OCR/VLM/重排）与检索同进程争资源，默认只让一个跑
   max_concurrent_ingest: 1
   # 对话页输入框能收的媒体上限（MB）。音频：前端录的是 16kHz 单声道 wav（≈32KB/s），
@@ -525,6 +525,28 @@ agent:
   # 实测（2026-10-05，bge-reranker-base）：语料内有答案 0.9985，语料外 0.0077 / 0.0978。
   # 只在开了重排时成立；关掉重排时分数是 RRF 名次分、不可比，只记录“查过”状态。
   web_min_corpus_score: 0.2
+
+mcp:
+  # 业务 MCP 地址与允许工具集中配置；子 Agent YAML 只引用规范化后的工具名。
+  # 默认关闭，避免没有本地测试服务时拖慢或阻塞启动。
+  servers:
+    railway:
+      enabled: ${RAG_MCP_RAILWAY_ENABLED:-false}
+      required: false
+      transport: streamable_http
+      url: "${RAG_MCP_RAILWAY_URL:-}"
+      headers: {}
+      connect_timeout_s: 10
+      read_timeout_s: 45
+      max_output_chars: 30000
+      allowed_tools:
+        - query-tickets
+        - query-ticket-price
+        - search-stations
+        - query-transfer
+        - get-train-route-stations
+        - get-train-no-by-train-code
+        - get-current-time
 
 observability:
   langsmith: false

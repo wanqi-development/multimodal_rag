@@ -40,7 +40,7 @@
   → 主 Agent 判断证据来源
       ├─ policy-document      → 制度/规则/SOP/普通文档
       ├─ relationship-graph   → 组织架构/人员关系/审批链/多跳路径
-      └─ business-data        → 公司业务 MCP 只读工具（未接入时禁用）
+      └─ business-data        → 12306 / 公司业务 MCP 只读工具
   → 子 Agent 返回 EvidenceResult
   → 主 Agent 融合证据、处理冲突、生成带引用答案
   → 内部证据不足时，询问用户是否允许联网
@@ -58,6 +58,11 @@
 业务集成通过两个作用域注入工具：`agent_main_tools` 只给主 Agent（例如公司自研搜索/抓取），
 `agent_subagent_tools` 只进入子 Agent 工具表（例如业务 MCP 查询）。两类工具都先在代码侧
 注册名称，再由 YAML 按名称引用，避免把 MCP 写能力暴露给主 Agent。
+
+MCP 连接配置集中在 `config/base.yaml` 的 `mcp.servers`，子 Agent YAML 只保存
+`mcp_server` 和规范化后的工具名。当前 `railway` 使用 Streamable HTTP，协议实测为
+MCP `2025-03-26`，无 Token；启动时发现工具，调用时按请求绑定 `EvidenceLedger`。
+外部服务非必需，连接失败时整份 `business-data` 不进入主 Agent 候选清单，其他能力照常启动。
 
 **核心设计原则：`contracts/` 是纯协议层，零第三方依赖。** 上层组件只依赖协议不依赖实现。换向量库、换 embedding 模型、加一路检索通道，都只动一个文件。
 
@@ -1595,7 +1600,7 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 | 主 Agent | 负责意图识别、子 Agent 选择、证据融合和最终答案。直接工具只有网络搜索和网页抓取（外加 workspace 文件工具）；知识检索交给子 Agent |
 | `policy-document` | 制度、规则、SOP、手册和普通文档；工具为 `search_knowledge` / `list_documents` / `get_section` |
 | `relationship-graph` | 组织架构、人员关系、审批链与多跳路径；工具为 `search_relationships` / `get_section`，只有 `kg` 通道启用时才加载 |
-| `business-data` | 员工、订单、库存等精确业务数据；通过公司业务 MCP 工具查询，不允许模型生成 SQL。MCP 未接入时文件保持禁用 |
+| `business-data` | 员工、订单、库存、车票等精确业务或实时数据；通过只读 MCP 工具查询，不允许模型生成 SQL。当前接入 12306 测试服务 |
 | 配置加载 | 每个子 Agent 一个 `config/agents/*.yaml`；启动时 Pydantic 严格校验并编译成 deepagents `SubAgent`，运行中不热加载。`mode` 固定为 `isolated`；`max_tool_calls` 配置独立预算 |
 | 工具策略 | 主 Agent 可见 `task`，但只接受 Registry 里的子 Agent；子 Agent 使用精确白名单，默认文件工具不可见。主/子工具按 namespace 分域计数，`EvidenceResult` 不占业务额；到预算后禁止继续调用但仍允许最终作答 |
 | CLI / API | `rag agent "问题" [--thread-id] [--no-writes]` / `rag agent --resume --thread-id <会话> --approve` / `POST /agent {message, thread_id, stream}` / `POST /agent/resume {thread_id, decisions}` |
@@ -1634,6 +1639,9 @@ found=True。这些记录均不代表事实已核验，也不自动放行网络�
    `AgentMiddleware`，模型请求阶段按允许列表裁掉工具，执行阶段再拒绝越权调用。后者防的是
    历史消息、缓存或模型幻觉绕过“它看不见”；两处共用同一个 `ToolPolicy`，测试覆盖编译后
    真实图，而不只检查传给 `create_deep_agent` 的参数。
+6. **MCP 分两层**（2026-11-03）：进程级 `McpRuntime` 负责启动发现和稳定工具目录；
+   请求级包装负责用户引用编号。工具结果统一登记为 `source_type=mcp`，带远程工具名、
+   参数和调用时间。`langchain-mcp-adapters` 固定 `mcp<2`，因为 0.2.x 仍依赖 FastMCP v1 API。
 
 ### 11.3 只读与多轮
 
@@ -2690,7 +2698,9 @@ Kafka 2.5 PDF 的 668 节里有不少），那种行显示 `—` 而不是 0；�
 
 页面补充（2026-11-02）：即使没有文档也可渲染目录树并新建空目录；支持按当前阶段筛选
 （已上传 / 已解析 / 已核对 / 已切分入库），筛选后点击整行多选，并提供“全选当前结果 /
-取消全选”。文档阶段徽标改为四个累计阶段，不再把“已切分”和“已入库”拆成两项。
+取消全选”。全选只作用于当前阶段筛选下尚未归入目录的文档，按钮同时显示可选项数；
+已归档文档不能被一次批量移动意外带走。文档阶段徽标改为四个累计阶段，不再把“已切分”
+和“已入库”拆成两项。
 
 **没做的**：拖目录改父子关系；跨目录的多归属；「只在某个目录里检索」（那是检索侧加过滤，与组织方式
 无关）；**并发写保护** —— 现在读-改-写没有锁，与 `_index.json` 一样只有一个进程在写，

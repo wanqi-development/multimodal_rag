@@ -12,11 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from rag.config.schema import Settings
-from rag.contracts import AssembledContext, ChannelStats, ScoredChunk
+from rag.contracts import AssembledContext, RetrievalResult
 from rag.usage import absorb_usage
 
 # 图要的四个外部依赖（见 graphs/query.py 的说明）
-RetrieveFn = Callable[..., Awaitable[tuple[list[ScoredChunk], list[ChannelStats]]]]
+RetrieveFn = Callable[..., Awaitable[RetrievalResult]]
 GenerateFn = Callable[[str, AssembledContext], Awaitable[str]]
 JsonFn = Callable[[str], Awaitable[str]]
 QueryNodes = tuple[RetrieveFn, JsonFn, JsonFn, GenerateFn]
@@ -96,14 +96,13 @@ def build_retrieve(heavy: Heavy) -> RetrieveFn:
         *,
         filters: dict[str, Any] | None = None,
         channels: list[str] | None = None,
-    ) -> tuple[list[ScoredChunk], list[ChannelStats]]:
-        result = await service.retrieve(
+    ) -> RetrievalResult:
+        return await service.retrieve(
             query,
             top_k,
             filters=filters or None,
             channels=channels,
         )
-        return result.chunks, result.stats
 
     return retrieve
 

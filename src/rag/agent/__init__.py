@@ -27,6 +27,7 @@ from rag.agent.build import (
     stream_agent,
     stream_resume,
 )
+from rag.agent.mcp import McpRuntime, McpRuntimeError
 from rag.agent.middleware import ToolPolicy, ToolPolicyMiddleware
 from rag.agent.registry import AgentRegistry, load_agent_registry
 from rag.agent.tools import CitationRegistry, WebSearchGate, build_tools
@@ -37,6 +38,8 @@ __all__ = [
     "AgentRegistry",
     "CitationRegistry",
     "EvidenceLedger",
+    "McpRuntime",
+    "McpRuntimeError",
     "ToolPolicy",
     "ToolPolicyMiddleware",
     "WebSearchGate",

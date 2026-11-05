@@ -31,7 +31,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from rag.config.schema import Settings
-from rag.contracts import AssembledContext, ChannelStats, Citation, ScoredChunk
+from rag.contracts import AssembledContext, ChannelStats, Citation, RetrievalResult, ScoredChunk
 from rag.retrieval import assemble, rrf_fuse
 
 # 计划里最多几条子查询。拆得越多，每次问答的 embedding 调用越多（按量计费），
@@ -72,9 +72,8 @@ GRADE_PROMPT = """你在判断「检索到的资料够不够回答用户的问�
 **只看资料与问题的相关性，不要预先回答问题**，也不要因为资料少就扣分 —— 少但切题
 就是高分。"""
 
-# 检索函数的形状：问题 + 条数 + 计划里的 filters/channels → 候选 + 账本。
-# 生产实现是 ``build_retriever`` 那一套；测试里换成替身就能把图跑起来（不连库）。
-RetrieveFn = Callable[..., Awaitable[tuple[list[ScoredChunk], list[ChannelStats]]]]
+# 检索返回同次调用的完整结果，不拆掉状态与降级信息。
+RetrieveFn = Callable[..., Awaitable[RetrievalResult]]
 JsonFn = Callable[[str], Awaitable[dict[str, Any]]]
 
 
@@ -89,6 +88,7 @@ class QueryState(TypedDict, total=False):
     hits: list[ScoredChunk]
     stats: list[ChannelStats]
     context: AssembledContext
+    retrieval: RetrievalResult
     grade: dict[str, Any]
     answer: str
     citations: list[Citation]
@@ -101,6 +101,7 @@ class QueryGraphResult(TypedDict):
     rounds: int
     stats: list[ChannelStats]
     grade: dict[str, Any]
+    retrieval: RetrievalResult
 
 
 class QueryPreparation(TypedDict):
@@ -108,6 +109,7 @@ class QueryPreparation(TypedDict):
 
     hits: list[ScoredChunk]
     context: AssembledContext
+    retrieval: RetrievalResult
     citations: list[Citation]
     rounds: int
     stats: list[ChannelStats]
@@ -183,18 +185,19 @@ def build_query_graph(
         queries = plan.get("sub_queries") or [state["question"]]
         filters = plan.get("filters") or None
         picked = plan.get("channels") or None
-        ranked: list[list[ScoredChunk]] = []
+        results: list[RetrievalResult] = []
         stats: list[ChannelStats] = []
         for sub_query in queries:
-            hits, channel_stats = await retrieve(
+            result = await retrieve(
                 sub_query or state["question"],
                 state["top_k"],
                 filters=filters,
                 channels=picked,
             )
-            ranked.append(hits)
-            for row in channel_stats:
+            results.append(result)
+            for row in result.stats:
                 stats.append(_tag(row, sub_query))
+        ranked = [result.chunks for result in results]
         # 多个子查询的结果用**同一个 RRF** 合一次；融合函数重新标 rrf，
         # 不继承子查询已成功重排的 score_kind。LLM grade 仍独立判断资料充分性。
         merged = (
@@ -202,16 +205,50 @@ def build_query_graph(
             if len(ranked) > 1
             else (ranked[0] if ranked else [])
         )
-        return {"hits": merged[: state["top_k"]], "stats": stats}
+        retrieval = results[0].model_copy(
+            update={
+                "query": state["question"],
+                "chunks": merged[: state["top_k"]],
+                "stats": stats,
+                "degradations": [item for result in results for item in result.degradations],
+            }
+        )
+        if len(results) > 1:
+            # 融合不再是重排分；任一腿重排失败仍要保留失败信号。
+            statuses = {result.rerank_status for result in results}
+            retrieval.score_kind = "rrf"
+            if "failed" in statuses:
+                retrieval.rerank_status = "failed"
+            else:
+                retrieval.rerank_status = next(iter(statuses)) if len(statuses) == 1 else "unknown"
+            retrieval.reranker = None
+        return {"hits": retrieval.chunks, "stats": stats, "retrieval": retrieval}
 
     async def grade_node(state: QueryState) -> QueryState:
         hits = state.get("hits") or []
         if not hits:
-            # 零召回不用问模型 —— 它只会把「没有资料」再判一遍，白花一次调用
-            return {"grade": {"score": 0.0, "missing": "一条都没召回到"}}
+            # 零召回不问模型；通道失败只说明本次检索不完整，不断言语料无资料。
+            incomplete = any(
+                item.code == "channel_failed" for item in state["retrieval"].degradations
+            )
+            missing = (
+                "检索不完整：部分检索通道失败，当前一条都没召回到"
+                if incomplete
+                else "一条都没召回到"
+            )
+            return {"grade": {"score": 0.0, "missing": missing}}
         if not state.get("question", "").strip():
             return {"grade": {"score": 1.0, "missing": ""}}
         context = _excerpt(hits)
+        status_context = AssembledContext(
+            text="",
+            score_kind=state["retrieval"].score_kind,
+            rerank_status=state["retrieval"].rerank_status,
+            degradations=state["retrieval"].degradations,
+        )
+        notice = status_context.retrieval_notice()
+        if notice:
+            context = f"{notice}\n\n{context}"
         raw = parse_json_object(
             await _json_text(
                 grade_llm, GRADE_PROMPT, f"问题：{state['question']}\n\n资料：\n{context}"
@@ -237,7 +274,7 @@ def build_query_graph(
         }
 
     async def assemble_node(state: QueryState) -> QueryState:
-        context = assemble(state.get("hits") or [], settings.retrieval.assemble.max_tokens)
+        context = assemble(state["retrieval"], settings.retrieval.assemble.max_tokens)
         return {"context": context, "citations": context.citations}
 
     graph = StateGraph(QueryState)
@@ -301,6 +338,7 @@ async def run_query_preflight(
     return QueryPreparation(
         hits=state.get("hits") or [],
         context=context,
+        retrieval=state["retrieval"],
         citations=context.citations,
         rounds=state.get("round", 0) + 1,
         stats=state.get("stats") or [],
@@ -323,6 +361,7 @@ async def run_query_graph(
         rounds=state.get("round", 0) + 1,
         stats=state.get("stats") or [],
         grade=state.get("grade") or {},
+        retrieval=state["retrieval"],
     )
 
 

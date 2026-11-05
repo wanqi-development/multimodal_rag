@@ -11,7 +11,14 @@ import json
 import pytest
 
 from rag.config.schema import Settings
-from rag.contracts import AssembledContext, ChannelStats, Chunk, ScoredChunk
+from rag.contracts import (
+    AssembledContext,
+    ChannelStats,
+    Chunk,
+    RetrievalDegradation,
+    RetrievalResult,
+    ScoredChunk,
+)
 from rag.graphs.query import (
     MAX_SUB_QUERIES,
     build_query_graph,
@@ -46,7 +53,9 @@ class _Retriever:
         )
         ids = self._rounds[index]
         stats = [ChannelStats(channel="hybrid:milvus:c", candidates=len(ids), kept=len(ids))]
-        return [_hit(chunk_id) for chunk_id in ids], stats
+        return RetrievalResult(
+            query=query, chunks=[_hit(chunk_id) for chunk_id in ids], stats=stats
+        )
 
 
 class _Json:
@@ -246,7 +255,9 @@ def test_multiple_sub_queries_are_fused_into_one_board() -> None:
 
 
 @pytest.mark.parametrize("sub_queries", [["甲"], ["甲", "乙"]])
-def test_query_graph_shared_wiring_preserves_tuple_and_refusion_semantics(monkeypatch, sub_queries):
+def test_query_graph_shared_wiring_preserves_result_and_refusion_semantics(
+    monkeypatch, sub_queries
+):
     from types import SimpleNamespace
 
     from rag.contracts import RetrievalResult
@@ -286,6 +297,52 @@ def test_query_graph_shared_wiring_preserves_tuple_and_refusion_semantics(monkey
     assert all(hit.score_kind == expected_kind for hit in result["hits"])
     assert len(result["stats"]) == len(sub_queries)
     assert len(grader.prompts) == 1, "检索相关性不能替代 QueryGraph 的资料充分性评估"
+
+
+@pytest.mark.parametrize("sub_queries", [["甲"], ["甲", "乙"]])
+@pytest.mark.parametrize("failed_rerank", [False, True])
+def test_query_graph_keeps_degradations_from_every_subquery(
+    monkeypatch, sub_queries, failed_rerank
+):
+    from types import SimpleNamespace
+
+    from rag.graphs.wiring import build_retrieve
+    from rag.service.retrieval import RetrievalService
+
+    settings = _settings(max_corrective_rounds=0)
+    heavy = SimpleNamespace(settings=settings, index=None, embedder=None, reranker=None, chat=None)
+    expected_degradations = []
+
+    async def retrieve(self, query, top_k, **kwargs):
+        degradation = RetrievalDegradation(stage=query, code="channel_failed", message="内部故障")
+        expected_degradations.append(degradation)
+        return RetrievalResult(
+            query=query,
+            chunks=[_hit(query)],
+            score_kind="rerank",
+            rerank_status="failed" if failed_rerank and query == "甲" else "succeeded",
+            degradations=[degradation],
+        )
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    grader = _Json({"score": 0.9})
+    graph = build_query_preflight(
+        settings,
+        retrieve=build_retrieve(heavy),
+        plan_llm=_Json({"sub_queries": sub_queries}),
+        grade_llm=grader,
+    )
+    result = asyncio.run(run_query_preflight(graph, "问题"))
+    retrieval = result["retrieval"]
+    context = result["context"]
+    assert retrieval.score_kind == ("rrf" if len(sub_queries) > 1 else "rerank")
+    assert retrieval.rerank_status == ("failed" if failed_rerank else "succeeded")
+    assert retrieval.degradations == expected_degradations
+    assert context.degradations == expected_degradations
+    assert context.score_kind == retrieval.score_kind
+    assert context.rerank_status == retrieval.rerank_status
+    assert "部分检索通道失败" in grader.prompts[0]
+    assert "不能断言语料中没有相关内容" in grader.prompts[0]
 
 
 def test_the_plan_filters_and_channels_reach_the_retriever() -> None:

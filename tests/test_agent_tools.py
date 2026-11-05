@@ -31,6 +31,8 @@ from rag.config.schema import (
     IngestConfig,
     IngestImagesConfig,
     IngestStagesConfig,
+    McpConfig,
+    McpServerConfig,
     Settings,
 )
 from rag.contracts import Chunk, RetrievalDegradation, RetrievalResult, ScoredChunk
@@ -826,6 +828,59 @@ def test_injected_tools_are_scoped_to_main_or_subagents(tmp_path: Path, monkeypa
     ).policy
     assert policy.allows("company_web_crawl")
     assert not policy.allows("mcp_order_lookup")
+
+
+def test_request_scoped_mcp_factory_loads_business_subagent_with_the_same_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict = {}
+    seen_registries: list[CitationRegistry] = []
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return "graph"
+
+    tool_names = [
+        "railway__query_tickets",
+        "railway__query_ticket_price",
+        "railway__search_stations",
+        "railway__query_transfer",
+        "railway__get_train_route_stations",
+        "railway__get_train_no_by_train_code",
+        "railway__get_current_time",
+    ]
+
+    def factory(registry: CitationRegistry) -> list[SimpleNamespace]:
+        seen_registries.append(registry)
+        return [SimpleNamespace(name=name) for name in tool_names]
+
+    import deepagents
+
+    monkeypatch.setattr(deepagents, "create_deep_agent", fake_create)
+    settings = _settings(tmp_path)
+    settings.mcp = McpConfig(
+        servers={
+            "railway": McpServerConfig(
+                enabled=True,
+                url="http://mcp.test/mcp",
+                allowed_tools=tool_names,
+            )
+        }
+    )
+    agents = load_agent_registry("config/agents")
+    graph, registry = build_agent(
+        settings,
+        _Heavy(_Retriever()),
+        agents=agents,
+        extra_subagent_tool_factory=factory,
+    )
+
+    assert graph == "graph"
+    assert seen_registries == [registry]
+    business = next(item for item in captured["subagents"] if item["name"] == "business-data")
+    assert [tool.name for tool in business["tools"]] == tool_names
+    assert "business-data" in captured["system_prompt"]
+    assert "railway__query_tickets" not in {tool.name for tool in captured["tools"]}
 
 
 def _env(method: str, data: Any, seq: int = 1) -> dict:

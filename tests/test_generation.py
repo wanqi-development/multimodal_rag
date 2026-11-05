@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from rag.contracts import AssembledContext, Citation
+from rag.contracts import AssembledContext, Citation, RetrievalDegradation
 from rag.providers import CitationGenerator, message_text
 from rag.providers.generator import NO_CONTEXT_REPLY, SYSTEM_PROMPT
 
@@ -26,6 +27,10 @@ class _RecordingModel:
         self.calls.append(list(messages))
         return AIMessage(self._reply)
 
+    async def astream(self, messages: list[Any], **kwargs: Any):
+        self.calls.append(list(messages))
+        yield AIMessage(self._reply)
+
 
 def _context(text: str = "[1] 来源：a.md\n甲") -> AssembledContext:
     return AssembledContext(
@@ -33,6 +38,41 @@ def _context(text: str = "[1] 来源：a.md\n甲") -> AssembledContext:
         citations=[Citation(index=1, chunk_id="c1", source_uri="a.md", snippet="甲")],
         tokens_estimate=8,
     )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("code", ["channel_failed", "rerank_failed"])
+@pytest.mark.parametrize("empty", [False, True])
+async def test_degraded_generation_uses_status_notice_not_no_material_claim(stream, code, empty):
+    model = _RecordingModel()
+    context = _context("" if empty else "[1] 来源：a.md\n甲")
+    context.score_kind = "rrf"
+    context.rerank_status = "failed" if code == "rerank_failed" else "succeeded"
+    context.degradations = [
+        RetrievalDegradation(stage="b", code=code, message="内部异常不应进入提示词")
+    ]
+    generator = CitationGenerator(model)
+    if stream:
+        answer = "".join([piece async for piece in generator.astream("q", context)])
+    else:
+        answer = await generator.generate("q", context)
+    if empty:
+        assert "检索不完整" in answer
+        assert "不能断言语料中没有相关内容" in answer
+        assert answer != NO_CONTEXT_REPLY
+        assert model.calls == []
+    else:
+        prompt = model.calls[0][1].content
+        assert context.text in prompt
+        assert "非语料证据，不可引用" in prompt
+        assert "score_kind=rrf" in prompt
+        assert f"rerank_status={context.rerank_status}" in prompt
+        assert "内部异常" not in prompt
+        if code == "channel_failed":
+            assert "部分检索通道失败" in prompt
+            assert "不能断言语料中没有相关内容" in prompt
+        else:
+            assert "重排失败" in prompt
 
 
 # ---- 空上下文 ----
