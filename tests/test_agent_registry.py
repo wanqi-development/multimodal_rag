@@ -11,7 +11,7 @@ import yaml
 from rag.agent.contracts import EvidenceResult
 from rag.agent.middleware import ToolCallBudgetMiddleware, ToolPolicyMiddleware
 from rag.agent.registry import load_agent_registry
-from rag.config.schema import Settings
+from rag.config.schema import McpConfig, McpServerConfig, Settings
 
 
 def _agent(
@@ -19,6 +19,8 @@ def _agent(
     name: str,
     *,
     tools: list[str] | None = None,
+    tools_optional: bool = False,
+    mcp_server: str | None = None,
     middleware: list[str] | None = None,
     channels: list[str] | None = None,
 ):
@@ -31,6 +33,8 @@ def _agent(
                 "enabled": True,
                 "system_prompt": f"你是 {name}。",
                 "tools": tools or [],
+                "tools_optional": tools_optional,
+                "mcp_server": mcp_server,
                 "middleware": middleware or [],
                 "model": "inherit",
                 "max_tool_calls": 4,
@@ -96,6 +100,51 @@ def test_enabled_agent_with_an_unknown_tool_fails_fast(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing_tool"):
         registry.build_subagents(Settings(), model=object(), tools={})
+
+
+def test_optional_external_agent_with_missing_tools_is_skipped(tmp_path: Path) -> None:
+    _agent(
+        tmp_path / "business.yaml",
+        "business",
+        tools=["railway__query_tickets"],
+        tools_optional=True,
+        mcp_server="railway",
+    )
+    registry = load_agent_registry(tmp_path)
+    settings = Settings(
+        mcp=McpConfig(
+            servers={
+                "railway": McpServerConfig(
+                    enabled=True,
+                    url="http://mcp.test/mcp",
+                    allowed_tools=["query-tickets"],
+                )
+            }
+        )
+    )
+
+    specs, names = registry.build_subagents(settings, model=object(), tools={})
+
+    assert specs == [] and names == ()
+
+
+def test_mcp_agent_is_skipped_when_its_server_is_not_configured(tmp_path: Path) -> None:
+    _agent(
+        tmp_path / "business.yaml",
+        "business",
+        tools=["railway__query_tickets"],
+        tools_optional=True,
+        mcp_server="railway",
+    )
+    registry = load_agent_registry(tmp_path)
+
+    specs, names = registry.build_subagents(
+        Settings(),
+        model=object(),
+        tools={"railway__query_tickets": SimpleNamespace(name="railway__query_tickets")},
+    )
+
+    assert specs == [] and names == ()
 
 
 def test_duplicate_agent_names_are_rejected(tmp_path: Path) -> None:

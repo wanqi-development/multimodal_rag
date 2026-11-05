@@ -100,6 +100,7 @@ async def health(components=Depends(get_components)) -> HealthResponse:
         not milvus.ok or not redis_ok or not pg_ok or any(not view.ok for view in models.values())
     )
     ingest_gate = getattr(components, "ingest_gate", None)
+    mcp_runtime = getattr(components, "mcp", None)
     from rag.storage import resolve_storage_backend
 
     vision_cache = resolve_storage_backend(
@@ -127,6 +128,11 @@ async def health(components=Depends(get_components)) -> HealthResponse:
             "job_store": "redis" if redis_available else "process",
             "chat_store": getattr(components.chats, "backend", "postgres"),
             "vision_cache": vision_cache,
+            "mcp": (
+                mcp_runtime.status()
+                if mcp_runtime is not None
+                else {"available": False, "servers": {}, "tools": []}
+            ),
         },
     )
 

@@ -8,6 +8,7 @@ import pytest
 
 from rag.config import load_settings
 from rag.config import settings as settings_module
+from rag.config.schema import McpConfig, McpServerConfig
 from rag.ingest import build_ocr
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -31,6 +32,21 @@ def test_base_config_loads() -> None:
     assert settings.providers.embedding.dim == 1024
     # collection 名带指纹：换模型、或换块表结构，都得换名字重建（Milvus 不能改 schema）
     assert settings.indexing.vector.collection == "rag_docker_single_v1"
+    assert settings.mcp.servers["railway"].enabled is False
+    assert len(settings.mcp.servers["railway"].allowed_tools) == 7
+
+
+def test_enabled_mcp_server_requires_a_url() -> None:
+    with pytest.raises(ValueError, match="必须配置 url"):
+        McpConfig(
+            servers={
+                "railway": McpServerConfig(
+                    enabled=True,
+                    url="",
+                    allowed_tools=["query-tickets"],
+                )
+            }
+        )
 
 
 def test_dev_profile_overrides_base() -> None:
@@ -55,6 +71,7 @@ def test_the_model_slots_exist_and_default_to_follow_the_existing_config() -> No
     settings = load_settings(profile="dev", directory=CONFIG_DIR)
 
     assert settings.models.backend == "sqlite", "默认 docker-single 是零中间件的单机档"
+    assert settings.api.rate_limit_per_min == 120
     assert settings.agent.agents_dir.endswith("config/agents")
     assert list(settings.models.slots) == [
         "chat.fast",

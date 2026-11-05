@@ -899,6 +899,7 @@ def agent(
             run_agent,
             save_registry,
         )
+        from rag.agent.mcp import McpRuntime
         from rag.graphs.wiring import build_heavy
         from rag.indexing import build_index
         from rag.persistence import build_persistence
@@ -931,6 +932,7 @@ def agent(
                 fg=typer.colors.RED,
             )
             raise typer.Exit(code=1)
+        mcp = await McpRuntime.start(settings.mcp)
         graph, registry = build_agent(
             settings,
             heavy,
@@ -938,6 +940,7 @@ def agent(
             store=persistence.store,
             workspace=default_workspace(settings),
             web_explicit=web,
+            extra_subagent_tool_factory=mcp.bind,
         )
         if resume:
             # 待批条数得从**图的状态**里读：人是在另一个进程里敲这条命令的，
@@ -955,6 +958,7 @@ def agent(
             result = await run_agent(graph, question or "", registry=registry, thread_id=thread_id)
         if result.status == "interrupted" and result.thread_id:
             await save_registry(persistence.store, result.thread_id, registry)
+        await mcp.close()
         await persistence.close()
         return result, pg_state
 

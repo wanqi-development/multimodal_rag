@@ -10,6 +10,10 @@ dependencies = [
     "langchain>=1.4,<2",
     "langchain-core>=1.6,<2",
     "langchain-classic>=1.0,<2",
+    # MCP → LangChain Tool 适配。**必须同时锁 mcp<2**：适配器 0.2.x 仍使用
+    # FastMCP v1 API，MCP 2.x 会把 mcp.server.fastmcp 移走，导入即失败。
+    "langchain-mcp-adapters>=0.2,<0.3",
+    "mcp>=1.9.2,<2",
     "langchain-text-splitters>=1.1,<2",
     "langgraph>=1.2,<2",
     "deepagents>=0.7,<0.8",

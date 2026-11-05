@@ -45,7 +45,7 @@ scripts\demo.cmd -DryRun         # 只看它要做什么，一个字都不写
 | 环节 | 做法，以及为什么 |
 |---|---|
 | 意图与工具面 | 主 Agent 自己担任 Supervisor：根据问题选择 `policy-document`、`relationship-graph`、`business-data` 三个专业子 Agent，并负责证据融合与最终生成。每个子 Agent 一个固定格式的 `config/agents/*.yaml`，系统提示词、工具与中间件都在同一文件里；启动时严格校验，生成 deepagents 原生 `SubAgent` |
-| 证据边界 | 制度/规则/SOP 走文档语义检索；组织架构、人员关系和审批链走图通道；员工、订单、库存等精确业务数据走公司业务 MCP 工具，**不让模型生成 SQL**。业务 MCP 未接入前 `business-data` 保持禁用 |
+| 证据边界 | 制度/规则/SOP 走文档语义检索；组织架构、人员关系和审批链走图通道；员工、订单、库存、车票等精确业务数据走只读 MCP 工具，**不让模型生成 SQL**。当前 `business-data` 已接入 12306 Streamable HTTP 测试服务，MCP 不可用时自动卸载该子 Agent |
 | 网络兜底 | 搜索与网页抓取都是主 Agent 的直接工具，共用 `WebSearchGate`。内部证据不足时先询问用户是否允许联网；只有用户明确授权后才执行，网页抓取复用 ingest 的 URL 安全校验 |
 | 工具策略与人在环（HITL） | 主 Agent 使用 `ToolPolicyMiddleware` + 独立工具预算；子 Agent 使用 YAML `tools` 精确白名单和 `max_tool_calls` 独立预算，默认文件工具不可见。主/子工具分域计数，`EvidenceResult` 不占额；到预算后禁止继续调用但保留最终作答 |
 | 流式 | SSE 实时下发 `status` / `token` / `tool` / `interrupt` / `done`；状态条说明 Agent 正在理解、规划、检索、整理还是生成，靠 `checkpoint_ns` 把子图 token 滤掉 |

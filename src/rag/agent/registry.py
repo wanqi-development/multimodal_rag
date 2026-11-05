@@ -43,6 +43,10 @@ class AgentDefinition(BaseModel):
     enabled: bool = True
     system_prompt: str = Field(min_length=1)
     tools: list[str] = Field(default_factory=list)
+    # 外部 MCP 服务可能暂时不可用。false 仍保持“写错工具名立即失败”；
+    # true 只用于可选外部数据面，缺工具时整份子 Agent 不加载并记 ERROR。
+    tools_optional: bool = False
+    mcp_server: str | None = None
     middleware: list[str] = Field(default_factory=list)
     model: Literal["inherit"] = "inherit"
     max_tool_calls: int = Field(6, ge=1)
@@ -55,6 +59,13 @@ class AgentDefinition(BaseModel):
     def _valid_name(cls, value: str) -> str:
         if not _NAME.fullmatch(value):
             raise ValueError("name 只能使用小写字母、数字和连字符，且必须以字母开头")
+        return value
+
+    @field_validator("mcp_server")
+    @classmethod
+    def _valid_mcp_server(cls, value: str | None) -> str | None:
+        if value is not None and not _NAME.fullmatch(value):
+            raise ValueError("mcp_server 只能使用小写字母、数字和连字符，且必须以字母开头")
         return value
 
     @field_validator("tools", "middleware", "requires_channels")
@@ -103,6 +114,15 @@ class AgentRegistry:
             if not item.enabled:
                 logger.info("子 Agent 已按配置禁用：%s", item.name)
                 continue
+            if item.mcp_server:
+                server = settings.mcp.servers.get(item.mcp_server)
+                if server is None or not server.enabled:
+                    logger.info(
+                        "子 Agent %s 暂不加载：MCP 服务 %s 未启用",
+                        item.name,
+                        item.mcp_server,
+                    )
+                    continue
             missing_channels = set(item.requires_channels) - channel_names
             if missing_channels:
                 logger.info(
@@ -113,6 +133,13 @@ class AgentRegistry:
                 continue
             missing_tools = set(item.tools) - set(tools)
             if missing_tools:
+                if item.tools_optional:
+                    logger.error(
+                        "子 Agent %s 暂不加载：缺少工具 %s",
+                        item.name,
+                        ", ".join(sorted(missing_tools)),
+                    )
+                    continue
                 raise ValueError(f"子 Agent {item.name} 引用了未注册工具：{sorted(missing_tools)}")
             missing_middleware = set(item.middleware) - set(middleware_specs)
             if missing_middleware:

@@ -63,6 +63,7 @@ class Components:
         self.heavy: Any = None
         self.persistence: Any = None
         self.agents: Any = None
+        self.mcp: Any = None
         # 由业务集成层注入：网络工具只在主 Agent；MCP 等业务工具只给子 Agent。
         self.agent_main_tools: list[Any] = []
         self.agent_subagent_tools: list[Any] = []
@@ -106,6 +107,9 @@ class Components:
             len(self.agents.definitions),
             len(self.agents.enabled()),
         )
+        from rag.agent.mcp import McpRuntime
+
+        self.mcp = await McpRuntime.start(self.settings.mcp)
         if profile in {"docker-single", "multiworker"}:
             from rag.storage import build_blob_store
 
@@ -167,6 +171,8 @@ class Components:
             await asyncio.gather(*self.background, return_exceptions=True)
         if self.persistence is not None:
             await self.persistence.close()
+        if self.mcp is not None:
+            await self.mcp.close()
         await self.redis.close()
 
     def track(self, task: asyncio.Task) -> None:
@@ -376,6 +382,7 @@ class Components:
             web_explicit=web_explicit,
             extra_main_tools=self.agent_main_tools,
             extra_subagent_tools=self.agent_subagent_tools,
+            extra_subagent_tool_factory=(self.mcp.bind if self.mcp is not None else None),
         )
 
     def _agent_persistence_check(self, thread_id: str | None) -> None:

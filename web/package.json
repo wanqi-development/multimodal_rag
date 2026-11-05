@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "test": "node --test --experimental-strip-types tests/outline-number.test.ts tests/document-selection.test.ts",
     "typecheck": "vue-tsc --noEmit",
     "test:outline": "node --test --experimental-strip-types tests/outline-number.test.ts",
     "preview": "vite preview"
