@@ -193,10 +193,12 @@ class AnswerEngine:
             for item in prepared.context.citations
             if item.source_type == "corpus" and item.chunk_id in by_id
         ]
-        notice = prepared.context.retrieval_notice()
-        if notice:
-            contexts.append(notice)
-        return await self.verifier.verify(question, answer, contexts)
+        retrieval_incomplete = any(
+            item.code == "channel_failed" for item in prepared.retrieval.degradations
+        )
+        return await self.verifier.verify(
+            question, answer, contexts, retrieval_incomplete=retrieval_incomplete
+        )
 
     async def _retrieve(
         self,

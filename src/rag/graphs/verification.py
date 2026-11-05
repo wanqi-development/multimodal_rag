@@ -29,7 +29,23 @@ class AnswerVerifier:
         self._faithfulness = faithfulness
         self._setup_error = setup_error
 
-    async def verify(self, question: str, answer: str, contexts: list[str]) -> dict[str, Any]:
+    async def verify(
+        self,
+        question: str,
+        answer: str,
+        contexts: list[str],
+        *,
+        retrieval_incomplete: bool = False,
+    ) -> dict[str, Any]:
+        """仅以真实语料核验；检索不完整且无证据时提示用户授权联网，不自动联网。"""
+        if retrieval_incomplete and not contexts:
+            return {
+                "status": "low",
+                "score": None,
+                "threshold": self.threshold,
+                "message": "本次检索不完整，未能取得可核验资料，是否允许联网搜索？",
+                "can_search_web": True,
+            }
         if not answer.strip():
             return {
                 "status": "low",
