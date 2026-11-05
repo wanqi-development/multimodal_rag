@@ -8,7 +8,16 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from rag.config.schema import Settings
-from rag.contracts import AssembledContext, ChannelStats, Citation, ScoredChunk
+from rag.contracts import (
+    AssembledContext,
+    ChannelStats,
+    Citation,
+    RerankStatus,
+    RetrievalDegradation,
+    RetrievalResult,
+    ScoredChunk,
+    ScoreKind,
+)
 from rag.graphs.query import build_query_preflight, run_query_preflight
 from rag.graphs.verification import AnswerVerifier
 from rag.graphs.wiring import build_json_caller
@@ -21,6 +30,7 @@ class PreparedAnswer(BaseModel):
     hits: list[ScoredChunk]
     stats: list[ChannelStats]
     context: AssembledContext
+    retrieval: RetrievalResult
     rounds: int = 1
     grade: dict[str, Any] = Field(default_factory=dict)
 
@@ -37,6 +47,9 @@ class AnswerRun(BaseModel):
     mode: str
     usage: dict[str, Any] | None = None
     verification: dict[str, Any] | None = None
+    score_kind: ScoreKind = "unknown"
+    rerank_status: RerankStatus = "unknown"
+    degradations: list[RetrievalDegradation] = Field(default_factory=list)
 
 
 class AnswerEngine:
@@ -68,12 +81,13 @@ class AnswerEngine:
         usage: dict[str, Any] | None = None,
     ) -> PreparedAnswer:
         if not self.settings.graph.enabled:
-            hits, stats = await self._retrieve(question, top_k, filters=filters)
+            retrieval = await self._retrieve(question, top_k, filters=filters)
             return PreparedAnswer(
                 mode="plain",
-                hits=hits,
-                stats=stats,
-                context=self._assemble(hits),
+                hits=retrieval.chunks,
+                stats=retrieval.stats,
+                context=self._assemble(retrieval),
+                retrieval=retrieval,
             )
 
         caller = build_json_caller(self.heavy, usage=usage)
@@ -91,6 +105,7 @@ class AnswerEngine:
             hits=result["hits"],
             stats=result["stats"],
             context=result["context"],
+            retrieval=result["retrieval"],
             rounds=result["rounds"],
             grade=result["grade"],
         )
@@ -121,6 +136,9 @@ class AnswerEngine:
             mode=prepared.mode,
             usage=usage or None,
             verification=verification,
+            score_kind=prepared.retrieval.score_kind,
+            rerank_status=prepared.retrieval.rerank_status,
+            degradations=prepared.retrieval.degradations,
         )
 
     async def stream(
@@ -175,6 +193,9 @@ class AnswerEngine:
             for item in prepared.context.citations
             if item.source_type == "corpus" and item.chunk_id in by_id
         ]
+        notice = prepared.context.retrieval_notice()
+        if notice:
+            contexts.append(notice)
         return await self.verifier.verify(question, answer, contexts)
 
     async def _retrieve(
@@ -184,22 +205,21 @@ class AnswerEngine:
         *,
         filters: dict[str, Any] | None = None,
         channels: list[str] | None = None,
-    ) -> tuple[list[ScoredChunk], list[ChannelStats]]:
+    ) -> RetrievalResult:
         from rag.service.retrieval import RetrievalService
 
-        result = await RetrievalService(
+        return await RetrievalService(
             self.settings,
             self.index,
             self.heavy.embedder,
             self.heavy.reranker,
             self.heavy.chat,
         ).retrieve(query, top_k, filters=filters, channels=channels)
-        return result.chunks, result.stats
 
-    def _assemble(self, hits: list[ScoredChunk]) -> AssembledContext:
+    def _assemble(self, retrieval: RetrievalResult) -> AssembledContext:
         from rag.retrieval import assemble
 
-        return assemble(hits, self.settings.retrieval.assemble.max_tokens)
+        return assemble(retrieval, self.settings.retrieval.assemble.max_tokens)
 
 
 def build_answer_engine(

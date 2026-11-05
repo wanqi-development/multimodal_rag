@@ -24,6 +24,86 @@ from rag.contracts import Citation
 from rag.deployment import apply_deployment_profile
 
 
+def test_components_answer_preserves_internal_status_without_public_response_fields(monkeypatch):
+    from types import SimpleNamespace
+
+    import rag.graphs.verification as verification
+    from rag.contracts import Chunk, RetrievalDegradation, RetrievalResult, ScoredChunk
+    from rag.service.retrieval import RetrievalService
+
+    settings = Settings()
+    settings.graph.enabled = False
+    components = Components(settings, Secrets(_env_file=None))
+    components.index = object()
+    contexts = []
+    result = RetrievalResult(
+        query="q",
+        chunks=[
+            ScoredChunk(
+                chunk=Chunk(chunk_id="c", doc_id="d", text="已有证据"),
+                score=0.9,
+                channel="a",
+                rank=0,
+            )
+        ],
+        score_kind="rerank",
+        rerank_status="succeeded",
+        degradations=[RetrievalDegradation(stage="b", code="channel_failed", message="故障")],
+    )
+
+    async def retrieve(self, query, top_k, **kwargs):
+        return result
+
+    async def generate(question, context, **kwargs):
+        contexts.append(context)
+        return "检索不完整 [1]"
+
+    async def stream(question, context, **kwargs):
+        yield await generate(question, context, **kwargs)
+
+    components.heavy = SimpleNamespace(
+        embedder=None,
+        reranker=None,
+        chat=None,
+        errors={},
+        generator=SimpleNamespace(generate=generate, astream=stream),
+    )
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    monkeypatch.setattr(verification, "build_answer_verifier", lambda *args: None)
+    body = SimpleNamespace(
+        channels=None,
+        rerank=None,
+        graph=False,
+        question="q",
+        top_k=3,
+        filters=None,
+        session_id=None,
+    )
+    answer = asyncio.run(components.answer(body))
+
+    async def collect():
+        return [event async for event in components.stream_answer(body)]
+
+    events = asyncio.run(collect())
+    assert len(contexts) == 2
+    assert all(context.degradations == result.degradations for context in contexts)
+    assert all("部分检索通道失败" in context.retrieval_notice() for context in contexts)
+    assert set(answer) == {
+        "answer",
+        "hits",
+        "stats",
+        "citations",
+        "rounds",
+        "grade",
+        "mode",
+        "usage",
+        "verification",
+        "session_id",
+    }
+    for event in events:
+        assert not {"score_kind", "rerank_status", "degradations", "retrieval"} & event.keys()
+
+
 def test_components_search_adapts_service_without_exposing_internal_fields(monkeypatch):
     from types import SimpleNamespace
 
