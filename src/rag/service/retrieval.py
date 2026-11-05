@@ -42,11 +42,11 @@ def resolve_channels(settings: Settings, channels: list[str] | None) -> set[str]
 def assess_relevance(result: RetrievalResult, threshold: float) -> Relevance:
     """只判断检索相关性，不代表答案充分、事实真实或联网授权。
 
-    零命中但存在通道失败时，检索不完整，不能断言语料无相关内容。
+    任何通道失败都代表检索不完整，无论候选分数高低均不能确认相关性。
     """
+    if any(item.code == "channel_failed" for item in result.degradations):
+        return "unknown"
     if not result.chunks:
-        if any(item.code == "channel_failed" for item in result.degradations):
-            return "unknown"
         return "irrelevant"
     if result.score_kind == "rerank" and result.rerank_status == "succeeded":
         return "relevant" if max(hit.score for hit in result.chunks) >= threshold else "irrelevant"

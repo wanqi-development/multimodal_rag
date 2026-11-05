@@ -28,6 +28,13 @@ USER_TEMPLATE = """资料：
 问题：{query}"""
 
 NO_CONTEXT_REPLY = "没有检索到相关资料，无法回答。"
+INCOMPLETE_CONTEXT_REPLY = "本次检索不完整，当前返回的资料不足以回答，不能断言语料中没有相关内容。"
+
+
+def _user_prompt(query: str, context: AssembledContext) -> str:
+    prompt = USER_TEMPLATE.format(context=context.text, query=query)
+    notice = context.retrieval_notice()
+    return f"{notice}\n\n{prompt}" if notice else prompt
 
 
 class CitationGenerator:
@@ -47,11 +54,11 @@ class CitationGenerator:
         """
         if not context.text.strip():
             # 一条都没召回到时还去问模型，只会换回一段看起来合理的幻觉
-            return NO_CONTEXT_REPLY
+            return INCOMPLETE_CONTEXT_REPLY if context.retrieval_notice() else NO_CONTEXT_REPLY
         reply = await self._model.ainvoke(
             [
                 SystemMessage(SYSTEM_PROMPT),
-                HumanMessage(USER_TEMPLATE.format(context=context.text, query=query)),
+                HumanMessage(_user_prompt(query, context)),
             ]
         )
         absorb_usage(usage, reply)
@@ -63,18 +70,18 @@ class CitationGenerator:
     ):
         """逐块产出答案文本（M4 的 SSE 用）。
 
-        **没有召回到任何资料时不流式**，直接产出那句「没有检索到相关资料」——
-        与 `generate` 同一个立场：没依据就不要让模型开口，流式也一样。
+        **没有召回到任何资料时不调用模型**；检索降级时说明检索不完整，
+        其他情况下沿用「没有检索到相关资料」。与 `generate` 一样，没依据就不让模型开口。
 
         为什么不做「先流式、最后再补引用」：引用编号是装配阶段生成的（`[n]`），
         模型在流里已经带着它们，所以 `done` 事件只需要把引用表一起交出去。
         """
         if not context.text.strip():
-            yield NO_CONTEXT_REPLY
+            yield INCOMPLETE_CONTEXT_REPLY if context.retrieval_notice() else NO_CONTEXT_REPLY
             return
         messages = [
             SystemMessage(SYSTEM_PROMPT),
-            HumanMessage(USER_TEMPLATE.format(context=context.text, query=query)),
+            HumanMessage(_user_prompt(query, context)),
         ]
         async for piece in self._model.astream(messages):
             absorb_usage(usage, piece)

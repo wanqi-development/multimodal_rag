@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from rag.contracts import AssembledContext, Citation, EvidenceLedger, ScoredChunk
+from rag.contracts import AssembledContext, Citation, EvidenceLedger, RetrievalResult, ScoredChunk
 
 # CJK 及全角标点：中文按 1 字 ≈ 1 token 估，拉丁文按 4 字符 ≈ 1 token。
 # 故意估高一点 —— 估低了会超模型窗口被静默截断，估高只是少放几条。
@@ -37,13 +37,16 @@ def _citation(index: int, scored: ScoredChunk) -> Citation:
     )
 
 
-def assemble(chunks: list[ScoredChunk], max_tokens: int) -> AssembledContext:
+def assemble(chunks: list[ScoredChunk] | RetrievalResult, max_tokens: int) -> AssembledContext:
     """按召回顺序吃进候选，去重并裁到预算内。
 
     候选顺序就是召回排序，所以「先到先得」意味着被丢掉的总是排得更靠后的。
     遇到超预算的条目是**跳过继续**而不是就此停止：一条长块不该让后面那些
-    放得下的块一起被浪费。
+    放得下的块一起被浪费。传入完整检索结果时保留状态，不将运行状态混入语料正文。
     """
+    result = chunks if isinstance(chunks, RetrievalResult) else None
+    if result is not None:
+        chunks = result.chunks
     seen: set[str] = set()
     picked: list[ScoredChunk] = []
     ledger = EvidenceLedger()
@@ -81,6 +84,9 @@ def assemble(chunks: list[ScoredChunk], max_tokens: int) -> AssembledContext:
         citations=ledger.records(),
         dropped=dropped,
         tokens_estimate=used,
+        score_kind=result.score_kind if result is not None else "unknown",
+        rerank_status=result.rerank_status if result is not None else "unknown",
+        degradations=result.degradations if result is not None else [],
     )
 
 

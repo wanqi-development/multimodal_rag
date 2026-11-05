@@ -9,7 +9,13 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from rag.config.schema import Settings
-from rag.contracts import AssembledContext, Chunk, ScoredChunk
+from rag.contracts import (
+    AssembledContext,
+    Chunk,
+    RetrievalDegradation,
+    RetrievalResult,
+    ScoredChunk,
+)
 from rag.graphs.answer import AnswerEngine
 from rag.graphs.verification import AnswerVerifier
 
@@ -113,6 +119,74 @@ def _patch_retriever(monkeypatch: pytest.MonkeyPatch, retriever: _Retriever) -> 
     import rag.service.retrieval
 
     monkeypatch.setattr(rag.service.retrieval, "build_retriever", lambda *a, **k: retriever)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("has_hits", [False, True])
+@pytest.mark.parametrize("code", ["channel_failed", "rerank_failed"])
+def test_retrieval_status_reaches_generation_and_verification(monkeypatch, graph, has_hits, code):
+    from rag.service.retrieval import RetrievalService
+
+    retrieval = RetrievalResult(
+        query="q",
+        chunks=[_hit()] if has_hits else [],
+        score_kind="rrf" if code == "rerank_failed" else "rerank",
+        rerank_status="failed" if code == "rerank_failed" else "succeeded",
+        degradations=[RetrievalDegradation(stage="b", code=code, message="内部异常不应进提示词")],
+    )
+
+    async def retrieve(self, query, top_k, **kwargs):
+        return retrieval
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    checked = []
+
+    async def faithfulness(question, answer, contexts):
+        checked.append(contexts)
+        assert contexts[:-1] == ([_hit().chunk.text] if has_hits else [])
+        assert "非语料证据，不可引用" in contexts[-1]
+        assert "内部异常" not in contexts[-1]
+        assert f"score_kind={retrieval.score_kind}" in contexts[-1]
+        if code == "channel_failed":
+            assert "部分检索通道失败" in contexts[-1]
+            assert "不能断言语料中没有相关内容" in contexts[-1]
+        else:
+            assert "重排失败" in contexts[-1]
+        return 0.8
+
+    heavy = _Heavy(_Chat())
+    engine = AnswerEngine(
+        _settings(graph=graph),
+        object(),
+        heavy,
+        verifier=AnswerVerifier(threshold=0.5, timeout_s=1, faithfulness=faithfulness),
+    )
+    answer = asyncio.run(engine.answer("q", 5))
+
+    async def collect():
+        return [event async for event in engine.stream("q", 5)]
+
+    events = asyncio.run(collect())
+    assert len(checked) == 2
+    assert answer.score_kind == retrieval.score_kind
+    assert answer.rerank_status == retrieval.rerank_status
+    assert answer.degradations == retrieval.degradations
+    for context in heavy.generator.contexts:
+        assert context.score_kind == retrieval.score_kind
+        assert context.rerank_status == retrieval.rerank_status
+        assert context.degradations == retrieval.degradations
+    # SSE 保持原字段集，不把内部状态加入 retrieval/done 事件。
+    assert set(events[0]) == {"type", "hits", "stats", "rounds", "grade", "mode"}
+    assert set(events[-1]) == {
+        "type",
+        "answer",
+        "citations",
+        "rounds",
+        "grade",
+        "mode",
+        "usage",
+        "verification",
+    }
 
 
 def test_plain_answer_and_stream_use_the_same_preparation(

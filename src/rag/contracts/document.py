@@ -281,3 +281,25 @@ class AssembledContext(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     dropped: int = 0
     tokens_estimate: int = 0
+    score_kind: ScoreKind = "unknown"
+    rerank_status: RerankStatus = "unknown"
+    degradations: list[RetrievalDegradation] = Field(default_factory=list)
+
+    def retrieval_notice(self) -> str:
+        """生成和核验共用的运行状态说明；不是语料证据，不含原始异常。"""
+        if not self.degradations and self.rerank_status != "failed":
+            return ""
+        notes = [
+            "检索运行状态（非语料证据，不可引用）：",
+            f"score_kind={self.score_kind}；rerank_status={self.rerank_status}。",
+        ]
+        if any(item.code == "channel_failed" for item in self.degradations):
+            notes.append(
+                "部分检索通道失败，本次检索不完整；无论候选分数高低或是否命中，"
+                "都不能断言语料中没有相关内容。只能依据已返回的资料回答，并说明检索不完整。"
+            )
+        if self.rerank_status == "failed":
+            notes.append("重排失败，候选分数不能用于确认相关性。")
+        if self.degradations:
+            notes.append("检索存在降级，已返回资料不代表完整检索结果，不得据此断言语料无相关内容。")
+        return "\n".join(notes)

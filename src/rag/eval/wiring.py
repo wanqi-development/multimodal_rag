@@ -15,11 +15,13 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from rag.contracts import ScoredChunk
+from rag.contracts import RetrievalResult, ScoredChunk
 from rag.eval.judge import AskFn
 
-RetrieveFn = Callable[[str, int], Awaitable[list[ScoredChunk]]]
-GenerateFn = Callable[[str, list[ScoredChunk]], Awaitable[tuple[str, list[dict[str, Any]]]]]
+RetrieveFn = Callable[[str, int], Awaitable[RetrievalResult]]
+GenerateFn = Callable[
+    [str, RetrievalResult | list[ScoredChunk]], Awaitable[tuple[str, list[dict[str, Any]]]]
+]
 
 
 def build_retrieve(settings: Any, heavy: Any) -> RetrieveFn:
@@ -28,8 +30,8 @@ def build_retrieve(settings: Any, heavy: Any) -> RetrieveFn:
 
     service = RetrievalService(settings, heavy.index, heavy.embedder, heavy.reranker, heavy.chat)
 
-    async def retrieve(question: str, top_k: int) -> list[ScoredChunk]:
-        return (await service.retrieve(question, top_k)).chunks
+    async def retrieve(question: str, top_k: int) -> RetrievalResult:
+        return await service.retrieve(question, top_k)
 
     return retrieve
 
@@ -40,9 +42,12 @@ def build_generate(settings: Any, heavy: Any) -> GenerateFn:
 
     max_tokens = settings.retrieval.assemble.max_tokens
 
-    async def generate(question: str, hits: list[ScoredChunk]) -> tuple[str, list[dict[str, Any]]]:
-        context = assemble(hits, max_tokens)
+    async def generate(
+        question: str, result: RetrievalResult | list[ScoredChunk]
+    ) -> tuple[str, list[dict[str, Any]]]:
+        context = assemble(result, max_tokens)
         answer = await heavy.generator.generate(question, context)
+        hits = result.chunks if isinstance(result, RetrievalResult) else result
         by_id = {hit.chunk.chunk_id: hit.chunk for hit in hits}
         citations = [
             {

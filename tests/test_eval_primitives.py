@@ -20,7 +20,7 @@ from rag.eval import (
 from rag.eval.judge import parse_verdict
 
 
-def test_eval_retrieve_is_a_list_projection_of_shared_service(monkeypatch):
+def test_eval_retrieve_preserves_shared_service_result(monkeypatch):
     from types import SimpleNamespace
 
     from rag.config.schema import Settings
@@ -37,8 +37,66 @@ def test_eval_retrieve_is_a_list_projection_of_shared_service(monkeypatch):
 
     monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
     heavy = SimpleNamespace(index=object(), embedder=object(), reranker=object(), chat=object())
-    assert asyncio.run(build_retrieve(settings, heavy)("q", 3)) == []
+    result = asyncio.run(build_retrieve(settings, heavy)("q", 3))
+    assert result.chunks == []
+    assert result.rerank_status == "failed"
     assert seen == [(settings, "q", 3)]
+
+
+@pytest.mark.parametrize("has_hits", [False, True])
+def test_eval_generation_preserves_degradations_and_full_citation_text(monkeypatch, has_hits):
+    from types import SimpleNamespace
+
+    from rag.config.schema import Settings
+    from rag.contracts import Chunk, RetrievalDegradation, RetrievalResult, ScoredChunk
+    from rag.eval.wiring import build_generate, build_retrieve
+    from rag.service.retrieval import RetrievalService
+
+    result = RetrievalResult(
+        query="q",
+        chunks=[
+            ScoredChunk(
+                chunk=Chunk(chunk_id="c", doc_id="d", text="全文证据"),
+                score=0.9,
+                channel="a",
+                rank=0,
+            )
+        ]
+        if has_hits
+        else [],
+        score_kind="rerank",
+        rerank_status="succeeded",
+        degradations=[RetrievalDegradation(stage="b", code="channel_failed", message="故障")],
+    )
+
+    async def retrieve(self, question, top_k):
+        return result
+
+    async def generate(question, context):
+        assert context.score_kind == "rerank"
+        assert context.rerank_status == "succeeded"
+        assert context.degradations == result.degradations
+        assert "部分检索通道失败" in context.retrieval_notice()
+        assert "不能断言语料中没有相关内容" in context.retrieval_notice()
+        return "答案 [1]" if has_hits else "检索不完整"
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    heavy = SimpleNamespace(
+        index=None,
+        embedder=None,
+        reranker=None,
+        chat=None,
+        generator=SimpleNamespace(generate=generate),
+    )
+    settings = Settings()
+
+    async def run():
+        retrieval = await build_retrieve(settings, heavy)("q", 3)
+        return await build_generate(settings, heavy)("q", retrieval)
+
+    answer, citations = asyncio.run(run())
+    assert answer == ("答案 [1]" if has_hits else "检索不完整")
+    assert [item["text"] for item in citations] == (["全文证据"] if has_hits else [])
 
 
 def test_recall_counts_only_within_k() -> None:
