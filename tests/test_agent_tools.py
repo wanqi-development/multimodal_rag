@@ -33,7 +33,7 @@ from rag.config.schema import (
     IngestStagesConfig,
     Settings,
 )
-from rag.contracts import Chunk, ScoredChunk
+from rag.contracts import Chunk, RetrievalDegradation, RetrievalResult, ScoredChunk
 
 
 def _hit(
@@ -71,6 +71,17 @@ class _Retriever:
         return self.hits[:top_k]
 
 
+class _RerankedRetriever(_Retriever):
+    async def retrieve_result(self, query, top_k, filters=None, image=None):
+        hits = await self.retrieve(query, top_k, filters=filters, image=image)
+        return RetrievalResult(
+            query=query,
+            chunks=[hit.model_copy(update={"score_kind": "rerank"}) for hit in hits],
+            score_kind="rerank",
+            rerank_status="succeeded",
+        )
+
+
 class _Heavy:
     def __init__(self, retriever: _Retriever) -> None:
         self.index = object()
@@ -93,10 +104,10 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def _patch_retriever(monkeypatch: pytest.MonkeyPatch, retriever: _Retriever) -> None:
-    """`build_tools` 内部 `from rag.retrieval import build_retriever` → 打社区的入口。"""
-    import rag.retrieval
+    """在共享服务的装配边界替换检索器。"""
+    import rag.service.retrieval
 
-    monkeypatch.setattr(rag.retrieval, "build_retriever", lambda *a, **k: retriever)
+    monkeypatch.setattr(rag.service.retrieval, "build_retriever", lambda *a, **k: retriever)
 
 
 def test_the_system_prompt_pins_evidence_safety_and_tool_usage() -> None:
@@ -213,9 +224,9 @@ def test_document_and_relationship_search_use_separate_channels(
         seen.append([(item.name, item.enabled) for item in local.retrieval.channels])
         return _Retriever([_hit()])
 
-    import rag.retrieval
+    import rag.service.retrieval
 
-    monkeypatch.setattr(rag.retrieval, "build_retriever", build)
+    monkeypatch.setattr(rag.service.retrieval, "build_retriever", build)
     settings = _settings(tmp_path)
     settings.retrieval.channels = [
         ChannelConfig(name="milvus", type="milvus", enabled=True),
@@ -231,6 +242,32 @@ def test_document_and_relationship_search_use_separate_channels(
 
     assert [name for name, enabled in seen[0] if enabled] == ["milvus"]
     assert [name for name, enabled in seen[1] if enabled] == ["kg"]
+
+
+def test_relationship_search_maps_service_unknown_channel_error(tmp_path, monkeypatch):
+    from rag.service.retrieval import UnknownChannelError, resolve_channels
+
+    retriever = _Retriever()
+    _patch_retriever(monkeypatch, retriever)
+    settings = _settings(tmp_path)
+    gate = WebSearchGate()
+    with pytest.raises(UnknownChannelError) as expected:
+        resolve_channels(settings, ["kg"])
+    out = asyncio.run(_tool(settings, "search_relationships", gate=gate).ainvoke({"query": "q"}))
+    assert str(expected.value) in out
+    assert "检索通道参数错误" in out
+    assert not retriever.calls
+    assert not gate.corpus_attempted and not gate.allowed
+
+
+def test_search_does_not_swallow_unrelated_value_errors(tmp_path, monkeypatch):
+    class Broken(_Retriever):
+        async def retrieve(self, *args, **kwargs):
+            raise ValueError("不是通道参数错误")
+
+    _patch_retriever(monkeypatch, Broken())
+    with pytest.raises(ValueError, match="不是通道参数错误"):
+        asyncio.run(_tool(_settings(tmp_path), "search_knowledge").ainvoke({"query": "q"}))
 
 
 def test_the_tool_list_covers_documents_graph_and_web(tmp_path: Path) -> None:
@@ -549,7 +586,8 @@ def test_the_gate_stays_shut_when_the_corpus_had_answers() -> None:
     gate.note_corpus(found=True)
 
     assert gate.allowed is False
-    assert "内部证据为准" in gate.refusal()
+    assert "已找到相关资料或读到原文" in gate.refusal()
+    assert "不代表事实已核验" in gate.refusal()
     # 空手而归之后又查到东西：状态是**或**关系，一旦有过就算有
     gate.note_corpus(found=False)
     assert gate.allowed is False
@@ -577,14 +615,51 @@ def test_the_search_tools_report_to_the_gate(tmp_path: Path, monkeypatch) -> Non
     assert "询问用户" in gate.refusal()
 
 
-def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> None:
-    """语义检索**永远**返回 top-k —— 判「语料里有没有」只能看分数。
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_empty_multichannel_result_distinguishes_incomplete_search(
+    tmp_path, monkeypatch, failed, explicit
+):
+    import rag.retrieval as wiring
 
-    实测（bge-reranker-base）：语料内有答案 0.9985，语料外 0.0077 / 0.0978。
-    这条钉住两件事：低分会触发联网询问，并且**把话说破**（不然模型会拿边角料硬答）。
-    """
+    class Channel:
+        def __init__(self, name):
+            self.name = name
+
+        async def retrieve(self, *args, **kwargs):
+            if failed and self.name == "broken":
+                raise TimeoutError("注入通道故障")
+            return []
+
+    monkeypatch.setattr(wiring, "build_channel", lambda cfg, *a: Channel(cfg.name))
+    settings = _settings(tmp_path)
+    settings.retrieval.rerank.enabled = False
+    settings.retrieval.channels = [
+        ChannelConfig(name="ok", type="milvus"),
+        ChannelConfig(name="broken", type="milvus"),
+    ]
+    gate = WebSearchGate(explicit=explicit)
+    registry = CitationRegistry()
+    tools = {t.name: t for t in build_tools(settings, _Heavy(_Retriever()), registry, gate=gate)}
+    out = asyncio.run(tools["search_knowledge"].ainvoke({"query": "q"}))
+    assert gate.corpus_attempted and not gate.corpus_found
+    assert gate.corpus_unknown is failed
+    assert gate.allowed is explicit
+    if failed:
+        assert "检索不完整" in out and "不能确认" in out
+        assert "channel_failed" in out
+        assert "没有检索到" not in out
+        assert "检索不完整" in gate.refusal()
+        assert "返回候选" not in gate.refusal()
+    else:
+        assert "没有检索到" in out
+        assert "检索不完整" not in out
+
+
+def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> None:
+    """仅成功重排的低分提示资料可能不足，仍需用户授权联网。"""
     gate = WebSearchGate()
-    retriever = _Retriever([_hit(text="毫不相干的内容")])
+    retriever = _RerankedRetriever([_hit(text="毫不相干的内容")])
     retriever.hits[0].score = 0.0077
     _patch_retriever(monkeypatch, retriever)
 
@@ -603,7 +678,7 @@ def test_low_scores_count_as_no_corpus_content(tmp_path: Path, monkeypatch) -> N
 
 def test_high_scores_keep_the_gate_shut(tmp_path: Path, monkeypatch) -> None:
     gate = WebSearchGate()
-    retriever = _Retriever([_hit(text="正好是答案")])
+    retriever = _RerankedRetriever([_hit(text="正好是答案")])
     retriever.hits[0].score = 0.99
     _patch_retriever(monkeypatch, retriever)
 
@@ -613,6 +688,43 @@ def test_high_scores_keep_the_gate_shut(tmp_path: Path, monkeypatch) -> None:
 
     assert gate.corpus_found is True and gate.allowed is False
     assert "最高分" not in out, "命中了就别絮叨"
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_unknown_candidates_never_become_confirmed_or_authorize_web(
+    tmp_path,
+    monkeypatch,
+    failed,
+    explicit,
+) -> None:
+    class Unknown(_Retriever):
+        async def retrieve_result(self, query, top_k, **kwargs):
+            return RetrievalResult(
+                query=query,
+                chunks=[_hit().model_copy(update={"score": 0.008, "score_kind": "rrf"})],
+                score_kind="rrf",
+                rerank_status="failed" if failed else "disabled",
+                degradations=[
+                    RetrievalDegradation(stage="rerank", code="rerank_failed", message="故障")
+                ]
+                if failed
+                else [],
+            )
+
+    _patch_retriever(monkeypatch, Unknown())
+    gate = WebSearchGate(explicit=explicit)
+    out = asyncio.run(
+        _tool(_settings(tmp_path), "search_knowledge", gate=gate).ainvoke({"query": "q"})
+    )
+    assert "返回候选，相关性未确认" in out
+    assert "最高分只有" not in out
+    assert ("rerank_failed" in out) == failed
+    assert not gate.corpus_found and gate.corpus_unknown
+    assert gate.allowed is explicit
+    assert "相关性未确认" in gate.refusal()
+    gate.note_corpus(found=True)
+    assert gate.corpus_found and gate.allowed is explicit
 
 
 def test_the_web_tool_obeys_the_gate(tmp_path: Path, monkeypatch) -> None:

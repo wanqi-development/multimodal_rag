@@ -9,9 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from rag.config.schema import FusionConfig
-from rag.contracts import ChannelStats, Reranker, Retriever, ScoredChunk
+from rag.contracts import (
+    ChannelStats,
+    Reranker,
+    RetrievalDegradation,
+    RetrievalResult,
+    Retriever,
+    ScoredChunk,
+)
 from rag.retrieval.fusion import rrf_fuse
-from rag.retrieval.multichannel import rerank_hits
+from rag.retrieval.multichannel import rerank_hits, result_from_rerank, retrieve_channel_result
 
 HydeFn = Callable[[str], Awaitable[str]]
 
@@ -78,107 +85,129 @@ class HyDERetriever:
         filters: dict[str, Any] | None = None,
         image: Path | None = None,
     ) -> list[ScoredChunk]:
-        if image is not None or not query.strip():
-            return await self._plain(query, top_k, filters=filters, image=image)
+        return (await self.retrieve_result(query, top_k, filters=filters, image=image)).chunks
 
-        pool = max(top_k, self._fusion.candidates_per_channel)
-        started = time.perf_counter()
-        original_task = asyncio.create_task(self._original.retrieve(query, pool, filters=filters))
-        try:
-            hypothetical_query = await self._generate(query)
-        except Exception as exc:  # noqa: BLE001 —— HyDE 只是增强，失败退回原查询
-            hits = await original_task
-            reranked, rerank_stat = await rerank_hits(query, hits, self._reranker, top_k)
-            self.last_stats = [
-                *_prefixed(self._original.last_stats, "original"),
-                ChannelStats(
-                    channel="hyde",
-                    candidates=0,
-                    kept=0,
-                    latency_ms=_ms(started),
-                    error=f"{type(exc).__name__}: {exc}（已退回原问题检索）",
-                ),
-                *([rerank_stat] if rerank_stat else []),
-            ]
-            return reranked[:top_k]
-
-        if not hypothetical_query.strip():
-            hits = await original_task
-            reranked, rerank_stat = await rerank_hits(query, hits, self._reranker, top_k)
-            self.last_stats = [
-                *_prefixed(self._original.last_stats, "original"),
-                ChannelStats(
-                    channel="hyde",
-                    candidates=0,
-                    kept=0,
-                    latency_ms=_ms(started),
-                    error="HyDE 返回空文本（已退回原问题检索）",
-                ),
-                *([rerank_stat] if rerank_stat else []),
-            ]
-            return reranked[:top_k]
-
-        hypothetical_task = asyncio.create_task(
-            self._hypothetical.retrieve(hypothetical_query, pool, filters=filters)
-        )
-        try:
-            original_hits, hypothetical_hits = await asyncio.gather(
-                original_task, hypothetical_task
-            )
-        except Exception as exc:  # noqa: BLE001 —— 假设腿失败时保留原查询结果
-            if original_task.done() and not original_task.cancelled():
-                original_hits = original_task.result()
-            else:
-                original_hits = await self._original.retrieve(query, pool, filters=filters)
-            reranked, rerank_stat = await rerank_hits(query, original_hits, self._reranker, top_k)
-            self.last_stats = [
-                *_prefixed(self._original.last_stats, "original"),
-                ChannelStats(
-                    channel="hyde",
-                    candidates=0,
-                    kept=0,
-                    latency_ms=_ms(started),
-                    error=f"{type(exc).__name__}: {exc}（已退回原问题检索）",
-                ),
-                *([rerank_stat] if rerank_stat else []),
-            ]
-            return reranked[:top_k]
-
-        fused = rrf_fuse(
-            [original_hits, hypothetical_hits],
-            k=self._fusion.k,
-            sources=["original", "hyde-query"],
-        )
-        reranked, rerank_stat = await rerank_hits(query, fused, self._reranker, top_k)
-        self.last_stats = [
-            *_prefixed(self._original.last_stats, "original"),
-            *_prefixed(self._hypothetical.last_stats, "hyde"),
-            ChannelStats(
-                channel="hyde-fusion",
-                candidates=len(original_hits) + len(hypothetical_hits),
-                kept=len(fused),
-                latency_ms=_ms(started),
-            ),
-            *([rerank_stat] if rerank_stat else []),
-        ]
-        return reranked[:top_k]
-
-    async def _plain(
+    async def retrieve_result(
         self,
         query: str,
         top_k: int,
-        *,
-        filters: dict[str, Any] | None,
-        image: Path | None,
-    ) -> list[ScoredChunk]:
+        filters: dict[str, Any] | None = None,
+        image: Path | None = None,
+    ) -> RetrievalResult:
         pool = max(top_k, self._fusion.candidates_per_channel)
-        hits = await self._original.retrieve(query, pool, filters=filters, image=image)
-        reranked, rerank_stat = await rerank_hits(query, hits, self._reranker, top_k)
-        self.last_stats = [
-            *_prefixed(self._original.last_stats, "original"),
-            *([rerank_stat] if rerank_stat else []),
+        if image is not None or not query.strip():
+            original = await retrieve_channel_result(
+                self._original,
+                query,
+                pool,
+                filters=filters,
+                image=image,
+            )
+            return await self._finish(
+                query,
+                top_k,
+                original.chunks,
+                _prefixed(original.stats, "original"),
+                original.degradations,
+            )
+
+        started = time.perf_counter()
+        original_task = asyncio.create_task(
+            retrieve_channel_result(self._original, query, pool, filters=filters)
+        )
+        code = ""
+        message = ""
+        try:
+            hypothetical_query = await self._generate(query)
+        except Exception as exc:  # noqa: BLE001 —— HyDE 只是增强，失败退回原查询
+            code = "hyde_failed"
+            message = f"{type(exc).__name__}: {exc}（已退回原问题检索）"
+        else:
+            if not hypothetical_query.strip():
+                code = "hyde_empty"
+                message = "HyDE 返回空文本（已退回原问题检索）"
+        if code:
+            original = await original_task
+            return await self._fallback(query, top_k, original, started, code, message)
+
+        hypothetical_task = asyncio.create_task(
+            retrieve_channel_result(self._hypothetical, hypothetical_query, pool, filters=filters)
+        )
+        # 等待两腿收束；原腿故障仍抛出，假设腿故障才回退，不重复召回。
+        original, hypothetical = await asyncio.gather(
+            original_task,
+            hypothetical_task,
+            return_exceptions=True,
+        )
+        if isinstance(original, BaseException):
+            raise original
+        if isinstance(hypothetical, BaseException):
+            if not isinstance(hypothetical, Exception):
+                raise hypothetical
+            return await self._fallback(
+                query,
+                top_k,
+                original,
+                started,
+                "hyde_failed",
+                f"{type(hypothetical).__name__}: {hypothetical}（已退回原问题检索）",
+            )
+        fused = rrf_fuse(
+            [original.chunks, hypothetical.chunks],
+            k=self._fusion.k,
+            sources=["original", "hyde-query"],
+        )
+        stats = [
+            *_prefixed(original.stats, "original"),
+            *_prefixed(hypothetical.stats, "hyde"),
+            ChannelStats(
+                channel="hyde-fusion",
+                candidates=len(original.chunks) + len(hypothetical.chunks),
+                kept=len(fused),
+                latency_ms=_ms(started),
+            ),
         ]
-        return reranked[:top_k]
+        return await self._finish(
+            query, top_k, fused, stats, [*original.degradations, *hypothetical.degradations]
+        )
+
+    async def _fallback(
+        self,
+        query: str,
+        top_k: int,
+        original: RetrievalResult,
+        started: float,
+        code: str,
+        message: str,
+    ) -> RetrievalResult:
+        return await self._finish(
+            query,
+            top_k,
+            original.chunks,
+            [
+                *_prefixed(original.stats, "original"),
+                ChannelStats(
+                    channel="hyde", candidates=0, kept=0, latency_ms=_ms(started), error=message
+                ),
+            ],
+            [
+                *original.degradations,
+                RetrievalDegradation(stage="hyde", code=code, message=message),
+            ],
+        )
+
+    async def _finish(
+        self,
+        query: str,
+        top_k: int,
+        hits: list[ScoredChunk],
+        stats: list[ChannelStats],
+        degradations: list[RetrievalDegradation],
+    ) -> RetrievalResult:
+        outcome = await rerank_hits(query, hits, self._reranker, top_k)
+        stats = [*stats, *([outcome.stat] if outcome.stat else [])]
+        self.last_stats = stats
+        return result_from_rerank(query, outcome, top_k, stats, degradations)
 
 
 def _prefixed(stats: list[ChannelStats], prefix: str) -> list[ChannelStats]:

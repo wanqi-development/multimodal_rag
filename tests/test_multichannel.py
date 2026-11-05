@@ -44,6 +44,76 @@ def _run(retriever: MultiChannelRetriever, query: str = "q", top_k: int = 10, **
     return asyncio.run(retriever.retrieve(query, top_k, **kw))
 
 
+@pytest.mark.parametrize(
+    ("mode", "query", "ids", "status", "kind", "codes"),
+    [
+        ("disabled", "q", ["a"], "disabled", "rrf", []),
+        ("ok", "q", ["a"], "succeeded", "rerank", []),
+        ("ok", "", ["a"], "skipped", "rrf", []),
+        ("ok", "q", [], "skipped", "unknown", []),
+        ("error", "q", ["a"], "failed", "rrf", ["rerank_failed"]),
+        ("empty", "q", ["a"], "failed", "rrf", ["rerank_empty"]),
+    ],
+)
+def test_atomic_execution_metadata(mode, query, ids, status, kind, codes) -> None:
+    class Reranker:
+        name = "test"
+
+        async def rerank(self, query, hits, top_n):
+            if mode == "error":
+                raise RuntimeError("故障注入")
+            return [] if mode == "empty" else hits[:top_n]
+
+    retriever = MultiChannelRetriever(
+        [_Channel("legacy", ids)],
+        FusionConfig(),
+        None if mode == "disabled" else Reranker(),
+    )
+    result = asyncio.run(retriever.retrieve_result(query, 5))
+    assert result.rerank_status == status
+    assert result.score_kind == kind
+    assert all(hit.score_kind == kind for hit in result.chunks)
+    assert [item.code for item in result.degradations] == codes
+    assert result.stats == retriever.last_stats
+
+
+def test_atomic_result_does_not_read_last_stats_between_concurrent_calls() -> None:
+    class Reranker:
+        name = "test"
+
+        async def rerank(self, query, hits, top_n):
+            await asyncio.sleep(0)
+            if query == "bad":
+                raise RuntimeError("注入")
+            return hits
+
+    retriever = MultiChannelRetriever([_Channel("a", ["x"])], FusionConfig(), Reranker())
+
+    async def run():
+        return await asyncio.gather(
+            retriever.retrieve_result("bad", 2),
+            retriever.retrieve_result("ok", 2),
+        )
+
+    bad, ok = asyncio.run(run())
+    assert (bad.score_kind, bad.rerank_status) == ("rrf", "failed")
+    assert (ok.score_kind, ok.rerank_status) == ("rerank", "succeeded")
+    assert bad.degradations and not ok.degradations
+    assert bad.stats[-1].error and ok.stats[-1].error is None
+
+
+def test_partial_failure_is_distinct_from_empty_recall() -> None:
+    retriever = MultiChannelRetriever(
+        [_Channel("ok", []), _Channel("broken", [], error=TimeoutError("注入"))],
+        FusionConfig(),
+    )
+    result = asyncio.run(retriever.retrieve_result("q", 5))
+    assert not result.chunks
+    assert [(item.stage, item.code) for item in result.degradations] == [
+        ("broken", "channel_failed")
+    ]
+
+
 def test_two_channels_are_fused_and_every_channel_is_accounted_for() -> None:
     hybrid = _Channel("hybrid:milvus:c", ["a", "b"])
     bm25 = _Channel("bm25:milvus:c", ["b"])

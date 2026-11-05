@@ -64,6 +64,8 @@ def build_retriever(
     检索层不 import providers（那是一大包 fastembed/torch），装配留给上层。
     ``retrieval.rerank.enabled`` 开着却没传 → **当场报错**，不静默跳过 ——
     「配了重排、实际没重排」是查不出效果的那种问题（与 image describe 同一个立场）。
+    ``retrieval.rerank.enabled`` 关闭时，即使传入 ``reranker`` 也会忽略它、不执行重排；
+    配置开关优先于注入对象，允许上层复用重对象并为单次请求显式关闭重排。
     """
     cfg = settings.retrieval
     if cfg.rerank.enabled and reranker is None:
@@ -72,6 +74,7 @@ def build_retriever(
             "调用方要用 providers.build_reranker(settings) 建一个传进来，"
             "或者把 retrieval.rerank.enabled 关掉。"
         )
+    reranker = reranker if cfg.rerank.enabled else None
     enabled = [item for item in cfg.channels if item.enabled]
     if not enabled:  # 配置校验也会拦，这里兜一层（settings 可能在代码里被改过）
         raise ValueError("retrieval.channels 里一路都没启用：检索没有数据源可用")

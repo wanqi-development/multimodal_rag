@@ -36,6 +36,33 @@ def _settings(*, on: bool, project: str = "multimodal_rag") -> Settings:
     return settings
 
 
+def test_retrieval_summary_is_once_and_redacted(monkeypatch) -> None:
+    from rag.contracts import RetrievalDegradation, RetrievalResult
+    from rag.obs import log
+
+    rows = []
+    monkeypatch.setattr(log, "_write", lambda kind, row: rows.append((kind, row)))
+    monkeypatch.setattr(log, "_CONTENT", False)
+    result = RetrievalResult(
+        query="不应落日志的原话",
+        score_kind="rrf",
+        rerank_status="failed",
+        degradations=[RetrievalDegradation(stage="rerank", code="rerank_empty", message="空")],
+    )
+    log.record_retrieval(result)
+    assert len(rows) == 1
+    kind, row = rows[0]
+    assert kind == "channel" and row["summary"]
+    assert row["query"] is None
+    assert row["query_hash"] == log.digest(result.query)
+    assert row["score_kind"] == "rrf" and row["rerank_status"] == "failed"
+    assert row["degradations"] == ["rerank_empty"]
+    assert result.query not in log.one_line(kind, row)
+    monkeypatch.setattr(log, "_CONTENT", True)
+    log.record_retrieval(result)
+    assert rows[-1][1]["query"] == result.query
+
+
 def test_tracing_stays_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LANGCHAIN_TRACING_V2", "leftover")
 

@@ -185,22 +185,16 @@ class AnswerEngine:
         filters: dict[str, Any] | None = None,
         channels: list[str] | None = None,
     ) -> tuple[list[ScoredChunk], list[ChannelStats]]:
-        from rag.retrieval import build_retriever, configured_hyde
+        from rag.service.retrieval import RetrievalService
 
-        local = self.settings.model_copy(deep=True)
-        if channels:
-            wanted = set(channels)
-            for item in local.retrieval.channels:
-                item.enabled = item.name in wanted
-        retriever = build_retriever(
-            local,
+        result = await RetrievalService(
+            self.settings,
             self.index,
             self.heavy.embedder,
             self.heavy.reranker,
-            hyde=configured_hyde(local, self.heavy.chat),
-        )
-        hits = await retriever.retrieve(query, top_k, filters=filters)
-        return hits, getattr(retriever, "last_stats", [])
+            self.heavy.chat,
+        ).retrieve(query, top_k, filters=filters, channels=channels)
+        return result.chunks, result.stats
 
     def _assemble(self, hits: list[ScoredChunk]) -> AssembledContext:
         from rag.retrieval import assemble

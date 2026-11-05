@@ -108,8 +108,9 @@ class MilvusHybridRetriever:
         if image is not None and not query.strip():
             # **纯图查询**：没有查询词，稀疏腿无事可做。硬走 hybrid 等于拿空串去请求
             # BM25 —— 那一路的结果要么空、要么没有意义，不如直接只走 dense。
-            return await self._index.search_dense(vector, top_k, filter_expr=filter_expr(filters))
-        return await self._index.search_hybrid(
+            hits = await self._index.search_dense(vector, top_k, filter_expr=filter_expr(filters))
+            return [hit.model_copy(update={"score_kind": "dense"}) for hit in hits]
+        hits = await self._index.search_hybrid(
             vector,
             query,
             top_k=top_k,
@@ -118,6 +119,7 @@ class MilvusHybridRetriever:
             ranker=self._ranker,
             filter_expr=filter_expr(filters),
         )
+        return [hit.model_copy(update={"score_kind": self._cfg.fusion.strategy}) for hit in hits]
 
 
 def build(

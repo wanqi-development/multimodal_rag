@@ -129,6 +129,13 @@ def one_line(kind: str, row: dict[str, Any]) -> str:
             f"状态={row.get('status')} token={row.get('tokens_in')}/{row.get('tokens_out')} "
             f"{_ms(row.get('duration_ms'))}"
         )
+    elif kind == "channel" and row.get("summary"):
+        query = row.get("query") or str(row.get("query_hash") or "")[:8]
+        line = (
+            f"{_flat(query, 60)} 检索摘要 分数={row.get('score_kind')} "
+            f"重排={row.get('rerank_status')} 命中={row.get('hit_count')} "
+            f"降级={','.join(row.get('degradations') or []) or '无'}"
+        )
     elif kind == "agent_llm":
         line = _llm_line(row)
     elif kind == "agent_tool":
@@ -421,6 +428,24 @@ def record_agent_run(
             "tokens_in": tokens[0],
             "tokens_out": tokens[1],
             "duration_ms": duration_ms,
+            "error": error,
+        },
+    )
+
+
+def record_retrieval(result: Any, *, error: str | None = None) -> None:
+    """最终结果一次一行；复用 channel 日志出口，不重复逐通道账本。"""
+    _write(
+        "channel",
+        {
+            "summary": True,
+            "query_hash": digest(result.query),
+            "query_chars": len(result.query),
+            "query": result.query if _CONTENT else None,
+            "score_kind": result.score_kind,
+            "rerank_status": result.rerank_status,
+            "degradations": [item.code for item in result.degradations],
+            "hit_count": len(result.chunks),
             "error": error,
         },
     )

@@ -63,6 +63,7 @@ def rrf_fuse(
             chunk=picked[key].chunk,
             score=score,
             channel="rrf",
+            score_kind="rrf",
             rank=rank,
             sources=origin[key],
         )

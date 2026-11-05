@@ -20,6 +20,27 @@ from rag.eval import (
 from rag.eval.judge import parse_verdict
 
 
+def test_eval_retrieve_is_a_list_projection_of_shared_service(monkeypatch):
+    from types import SimpleNamespace
+
+    from rag.config.schema import Settings
+    from rag.contracts import RetrievalResult
+    from rag.eval.wiring import build_retrieve
+    from rag.service.retrieval import RetrievalService
+
+    settings = Settings()
+    seen = []
+
+    async def retrieve(self, question, top_k):
+        seen.append((self._settings, question, top_k))
+        return RetrievalResult(query=question, rerank_status="failed")
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    heavy = SimpleNamespace(index=object(), embedder=object(), reranker=object(), chat=object())
+    assert asyncio.run(build_retrieve(settings, heavy)("q", 3)) == []
+    assert seen == [(settings, "q", 3)]
+
+
 def test_recall_counts_only_within_k() -> None:
     ranks = [1, 3, 0, 8]
 

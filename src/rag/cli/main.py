@@ -634,23 +634,21 @@ def search(
     async def _run() -> tuple[list[ScoredChunk], list]:
         from rag.graphs.wiring import build_heavy
         from rag.indexing import build_index
-        from rag.retrieval import build_retriever, configured_hyde
+        from rag.service.retrieval import RetrievalService
 
         index = build_index(settings)
         await _probe_milvus(index, settings)
         await index.ensure_ready()
         heavy = build_heavy(settings, index)
         _require(heavy, "embedding")
-        retriever = build_retriever(
+        result = await RetrievalService(
             settings,
             index,
             heavy.embedder,
             heavy.reranker,
-            hyde=configured_hyde(settings, heavy.chat),
-        )
-        hits = await retriever.retrieve(query, top_k, filters=filters or None, image=image)
-        # 账本挂在多通道检索器上；单路没有这一项，取不到就是空
-        return hits, getattr(retriever, "last_stats", [])
+            heavy.chat,
+        ).retrieve(query, top_k, filters=filters or None, image=image)
+        return result.chunks, result.stats
 
     hits, stats_rows = _run_async(_run(), settings)
     marks = [f"图 {image.name}"] if image is not None else []

@@ -1307,6 +1307,37 @@ chat 模型生成假设资料，与原问题双路召回，RRF 融合后用原�
 token 估算没有 tokenizer（不值得为估算引一个依赖）：CJK 码点约 1 token / 字，拉丁约 4 字符
 1 token，并且**故意估高** —— 估低了会超窗口被静默截断，估高只是少放几条。
 
+### 9.2.1 公共检索接线与分数契约
+
+`service/retrieval.py::RetrievalService` 是 Agent 工具、AnswerEngine、QueryGraph 接线、
+API 内部 search、CLI 与 eval 共用的业务入口。显式注入 Settings、index、embedder、
+reranker 和 chat；每次调用复制有效配置、选择通道和可选重排覆盖，再调用现有
+`configured_hyde` / `build_retriever`。重对象复用，检索器按调用创建，不增加缓存、
+模型调用、会话账本或编排状态，service 不反向依赖 `graphs.Heavy`。
+
+`ScoredChunk.score_kind` 由实际执行位置标注，不能凭 channel 名或分数大小推断：
+`rrf` 是名次融合分，`weighted` 是 Milvus 加权融合分，`dense` 是纯 dense 分，
+`rerank` 是成功重排分；旧构造、未提供元数据的插件默认 `unknown`。
+`RetrievalResult` 保留 query/chunks/stats，额外携带聚合 score_kind（混合类型为 unknown）、
+rerank_status（unknown/disabled/skipped/succeeded/failed）、可空 reranker 和
+stage/code/message 结构的 degradations。重排异常或空输出保留融合顺序与原分数类型，
+分别记录 `rerank_failed` / `rerank_empty`；部分通道失败记录 `channel_failed`，全通道失败
+仍抛异常，不伪装成零召回。HyDE 生成异常、空文本或假设腿失败记录 `hyde_failed` /
+`hyde_empty`，各分支均报告最终那一次重排状态，正常路径只重排一次。
+
+内置聚合器提供同次调用返回的 `retrieve_result`；旧 `retrieve` 仍投影为命中列表，
+`last_stats` 仅保留旧调用兼容，新路径不依赖共享的“上次状态”。第三方通道只需原有
+Retriever.retrieve 协议，无元数据时保持 unknown，插件异常不被服务伪装为空结果。
+每次服务调用在 channel 日志中增加一次最终摘要（query_hash、分数类型、实际重排状态、
+降级 code 和命中数），沿用内容脱敏开关，不重复逐通道账本，不改变数据库日志 schema。
+
+纯函数 `assess_relevance(result, threshold)` 只判断**检索相关性**：空结果为 irrelevant；
+非空且最终为 rerank + succeeded 时，最高分达到阈值才为 relevant，否则 irrelevant；
+其余非空一律 unknown。RRF 回退分不能套重排阈值。该判定既不代表答案充分，也不是
+引用或事实真实性核验；QueryGraph 的 LLM grade 仍独立评估资料充分性。多子查询再次
+RRF 后最终分数重标为 rrf，不继承子查询的 rerank 标签。阈值仍需针对重排模型单独评测。
+外部 HTTP/SSE/OpenAPI 不透传新增内部字段，也不恢复已删除的搜索或问答端点。
+
 ### 9.3 L2 融合（`retrieval/fusion.py` + `retrieval/multichannel.py`，2026-10-03）
 
 主通道与 `optional_channels` 一起跑，客户端合成一张榜：
@@ -1568,6 +1599,14 @@ START ─►（按文件 Send 派发）─┬─► [文件 A: 解析 → 闸门
 | 配置加载 | 每个子 Agent 一个 `config/agents/*.yaml`；启动时 Pydantic 严格校验并编译成 deepagents `SubAgent`，运行中不热加载。`mode` 固定为 `isolated`；`max_tool_calls` 配置独立预算 |
 | 工具策略 | 主 Agent 可见 `task`，但只接受 Registry 里的子 Agent；子 Agent 使用精确白名单，默认文件工具不可见。主/子工具按 namespace 分域计数，`EvidenceResult` 不占业务额；到预算后禁止继续调用但仍允许最终作答 |
 | CLI / API | `rag agent "问题" [--thread-id] [--no-writes]` / `rag agent --resume --thread-id <会话> --approve` / `POST /agent {message, thread_id, stream}` / `POST /agent/resume {thread_id, decisions}` |
+
+主/子 Agent 与 AnswerEngine/QueryGraph 保持**两套独立编排**，不互相嵌套、不增加路由器；
+共享的只有 §9.2.1 的检索服务接线。Agent 搜索工具保留原参数、片段格式和 EvidenceLedger
+编号方式：成功重排低分提示资料可能不足；unknown 明示“返回候选，相关性未确认”，
+降级时附稳定 code，不再把 RRF 分数与重排阈值比较。
+`WebSearchGate.explicit` 仍是唯一联网开关。unknown 记录检索已尝试，但不置 corpus_found、
+也不宣称已确认无资料；`note_corpus(found=...)` 保持兼容，`get_section` 读到原文仍记录
+found=True。这些记录均不代表事实已核验，也不自动放行网络。
 
 ### 11.2 三个关键决定
 

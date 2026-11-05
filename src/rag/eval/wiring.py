@@ -24,17 +24,12 @@ GenerateFn = Callable[[str, list[ScoredChunk]], Awaitable[tuple[str, list[dict[s
 
 def build_retrieve(settings: Any, heavy: Any) -> RetrieveFn:
     """检索闭包。**重对象来自 heavy**（embedder / reranker 只建一次，见 graphs/wiring 的教训）。"""
-    from rag.retrieval import build_retriever, configured_hyde
+    from rag.service.retrieval import RetrievalService
+
+    service = RetrievalService(settings, heavy.index, heavy.embedder, heavy.reranker, heavy.chat)
 
     async def retrieve(question: str, top_k: int) -> list[ScoredChunk]:
-        retriever = build_retriever(
-            settings,
-            heavy.index,
-            heavy.embedder,
-            heavy.reranker,
-            hyde=configured_hyde(settings, heavy.chat),
-        )
-        return await retriever.retrieve(question, top_k)
+        return (await service.retrieve(question, top_k)).chunks
 
     return retrieve
 

@@ -344,6 +344,79 @@ def test_a_reranker_alone_also_wraps_into_one_retriever() -> None:
     assert retriever.name == "multi[milvus,rerank:stub]"
 
 
+@pytest.mark.parametrize(
+    ("strategy", "query", "image", "expected"),
+    [
+        ("rrf", "q", None, "rrf"),
+        ("weighted", "q", None, "weighted"),
+        ("weighted", "", "q.png", "dense"),
+    ],
+)
+def test_milvus_channel_tags_executed_branch(strategy, query, image, expected):
+    import asyncio
+    from pathlib import Path
+
+    class Index:
+        name = "test"
+
+        async def search_dense(self, *args, **kwargs):
+            assert expected == "dense"
+            return [_hit("a", "正文", score=0.73)]
+
+        async def search_hybrid(self, *args, **kwargs):
+            assert expected != "dense"
+            return [_hit("a", "正文", score=0.73)]
+
+    class Embedder:
+        async def embed_query(self, *args):
+            return Embeddings(dense=[[1.0]])
+
+    retriever = MilvusHybridRetriever(Index(), Embedder(), _hybrid_cfg(strategy=strategy))
+    hits = asyncio.run(retriever.retrieve(query, 3, image=Path(image) if image else None))
+    assert hits[0].score_kind == expected
+    assert hits[0].score == 0.73 and hits[0].chunk.chunk_id == "a"
+
+
+def test_disabled_rerank_ignores_injected_provider() -> None:
+    settings = Settings()
+    settings.retrieval.rerank.enabled = False
+    retriever = build_retriever(settings, build_index(settings), _StubEmbedder(), _StubReranker())
+    assert isinstance(retriever, MilvusHybridRetriever)
+
+
+@pytest.mark.parametrize("hyde_enabled", [False, True])
+def test_disabled_rerank_never_calls_injected_provider(monkeypatch, hyde_enabled) -> None:
+    import asyncio
+
+    import rag.retrieval as module
+
+    class Channel:
+        name = "test"
+
+        async def retrieve(self, *args, **kwargs):
+            return [_hit("a", "正文", score=0.03).model_copy(update={"score_kind": "rrf"})]
+
+    class Reranker:
+        name = "must-not-run"
+
+        async def rerank(self, *args, **kwargs):
+            raise AssertionError("关闭重排后不得调用已注入 provider")
+
+    async def generate(query):
+        return "假设"
+
+    monkeypatch.setattr(module, "build_channel", lambda *args: Channel())
+    settings = Settings()
+    settings.retrieval.rerank.enabled = False
+    settings.retrieval.transform.hyde = hyde_enabled
+    retriever = build_retriever(settings, None, None, Reranker(), hyde=generate)
+    from rag.retrieval.multichannel import retrieve_channel_result
+
+    result = asyncio.run(retrieve_channel_result(retriever, "问题", 3))
+    assert result.chunks[0].score_kind == "rrf"
+    assert result.rerank_status == ("disabled" if hyde_enabled else "unknown")
+
+
 def test_embedder_registry_is_populated_by_providers_import() -> None:
     """providers/__init__ 里的 import 是注册的触发点，删了就没有 embedder 可用。"""
     import rag.providers  # noqa: F401

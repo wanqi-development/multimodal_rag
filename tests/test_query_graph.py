@@ -242,6 +242,50 @@ def test_multiple_sub_queries_are_fused_into_one_board() -> None:
 
     assert [call["query"] for call in retriever.calls] == ["甲", "乙"]
     assert {hit.chunk.chunk_id for hit in result["hits"]} == {"a", "b", "c"}
+    assert all(hit.score_kind == "rrf" for hit in result["hits"])
+
+
+@pytest.mark.parametrize("sub_queries", [["甲"], ["甲", "乙"]])
+def test_query_graph_shared_wiring_preserves_tuple_and_refusion_semantics(monkeypatch, sub_queries):
+    from types import SimpleNamespace
+
+    from rag.contracts import RetrievalResult
+    from rag.graphs.wiring import build_retrieve
+    from rag.service.retrieval import RetrievalService
+
+    settings = _settings()
+    heavy = SimpleNamespace(
+        settings=settings, index=object(), embedder=object(), reranker=object(), chat=object()
+    )
+    seen = []
+
+    async def retrieve(self, query, top_k, **kwargs):
+        assert self._settings is settings
+        seen.append((query, top_k, kwargs))
+        hit = _hit(query).model_copy(update={"score_kind": "rerank"})
+        return RetrievalResult(
+            query=query,
+            chunks=[hit],
+            stats=[ChannelStats(channel="reranker", candidates=1, kept=1)],
+            score_kind="rerank",
+            rerank_status="succeeded",
+        )
+
+    monkeypatch.setattr(RetrievalService, "retrieve", retrieve)
+    grader = _Json({"score": 0.9})
+    graph = _build(
+        settings,
+        build_retrieve(heavy),
+        _Json({"sub_queries": sub_queries, "channels": ["milvus"]}),
+        grader,
+        [],
+    )
+    result = asyncio.run(run_query_graph(graph, "问题", top_k=5))
+    assert seen == [(query, 5, {"filters": None, "channels": ["milvus"]}) for query in sub_queries]
+    expected_kind = "rerank" if len(sub_queries) == 1 else "rrf"
+    assert all(hit.score_kind == expected_kind for hit in result["hits"])
+    assert len(result["stats"]) == len(sub_queries)
+    assert len(grader.prompts) == 1, "检索相关性不能替代 QueryGraph 的资料充分性评估"
 
 
 def test_the_plan_filters_and_channels_reach_the_retriever() -> None:
